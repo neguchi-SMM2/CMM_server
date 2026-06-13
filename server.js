@@ -48,21 +48,42 @@ function randomCloud() {
   return CLOUD_VARS[Math.floor(Math.random() * CLOUD_VARS.length)];
 }
 
+// ─────────────────────────────────────────────
+// リクエスト解析
+// ─────────────────────────────────────────────
+
+/**
+ * ユーザーIDを先頭から読む（LenLen式）
+ * @returns {{ userId: string, next: number }}
+ */
 function parseUserId(s, pos = 0) {
   const { value, next } = decodeNum(s, pos);
   return { userId: String(value), next };
 }
 
+/**
+ * コマンドコードを読む（Len式）
+ */
 function parseCmd(s, pos) {
   const { value, next } = decodeNum(s, pos);
   return { cmd: value, next };
 }
 
+// ─────────────────────────────────────────────
+// レスポンス送信
+// ─────────────────────────────────────────────
+
+/**
+ * cloud変数に値をセットする（setter経由）
+ */
 async function sendCloud(setter, name, value) {
   await setter(name, String(value));
   await sleep(SEND_INTERVAL);
 }
 
+/**
+ * コース情報1件をエンコードして返す
+ */
 function encodeCourseInfo(row, index) {
   const clearRate = row.attempt_count > 0
     ? Math.round(row.clear_count / row.attempt_count * 10000) / 100
@@ -79,6 +100,9 @@ function encodeCourseInfo(row, index) {
     + encodeNum(row.posted_at);
 }
 
+/**
+ * コース一覧をcloud1〜8に分割して送信（1000文字制限）
+ */
 async function sendCourseList(setter, userId, cmd, rows) {
   const header = encodeNum(parseInt(userId)) + encodeNum(cmd);
   const maxLen = 1000;
@@ -101,6 +125,9 @@ async function sendCourseList(setter, userId, cmd, rows) {
   }
 }
 
+/**
+ * コースデータ（生データ）を分割して送信
+ */
 async function sendCourseData(setter, userId, stageData) {
   const headerBase = encodeNum(parseInt(userId)) + encodeNum(CMD.GET_COURSE);
   const maxLen = 1000;
@@ -118,16 +145,36 @@ async function sendCourseData(setter, userId, stageData) {
   await sendCloud(setter, randomCloud(), headerBase + encodeNum(0));
 }
 
+// ─────────────────────────────────────────────
+// コマンドハンドラ
+// ─────────────────────────────────────────────
+
+// デコード結果のバリデーションヘルパー
+function isValidNum(value) {
+  return typeof value === "number" && !isNaN(value) && isFinite(value);
+}
+function isValidStr(value) {
+  return typeof value === "string" && value.length > 0;
+}
+
 async function handleRequest(s, setter) {
   let pos = 0;
 
   // ユーザーID
   const { userId, next: p1 } = parseUserId(s, pos);
   pos = p1;
+  if (!userId || isNaN(parseInt(userId))) {
+    console.warn("⚠️ 不正なユーザーID:", userId);
+    return;
+  }
 
   // コマンドコード
   const { cmd, next: p2 } = parseCmd(s, pos);
   pos = p2;
+  if (!isValidNum(cmd)) {
+    console.warn("⚠️ 不正なコマンドコード:", cmd);
+    return;
+  }
 
   // ─── CMD=1: コース投稿 ───
   // コース投稿はcloud1〜8経由で別途受信するのでここでは処理しない
@@ -136,6 +183,10 @@ async function handleRequest(s, setter) {
   // ─── CMD=10〜14: コース取得 ───
   if (cmd === CMD.RANDOM || cmd === CMD.WEEKLY || cmd === CMD.ALL_TIME) {
     const { value: limit } = decodeNum(s, pos);
+    if (!isValidNum(limit) || limit <= 0) {
+      console.warn("⚠️ 不正なlimit:", limit);
+      return;
+    }
     let rows;
     if      (cmd === CMD.RANDOM)    rows = await db.getRandomCourses(limit);
     else if (cmd === CMD.WEEKLY)    rows = await db.getWeeklyRanking(limit);
@@ -146,6 +197,10 @@ async function handleRequest(s, setter) {
 
   if (cmd === CMD.SEARCH_ID) {
     const { value: courseId } = decodeAlphabet(s, pos);
+    if (!isValidStr(courseId)) {
+      console.warn("⚠️ 不正なcourseId:", courseId);
+      return;
+    }
     const rows = await db.searchByCourseId(courseId);
     await sendCourseList(setter, userId, cmd, rows);
     return;
@@ -154,7 +209,15 @@ async function handleRequest(s, setter) {
   if (cmd === CMD.SEARCH_AUTHOR) {
     const { value: author, next: p3 } = decodeAlphabet(s, pos);
     pos = p3;
+    if (!isValidStr(author)) {
+      console.warn("⚠️ 不正なauthor:", author);
+      return;
+    }
     const { value: limit } = decodeNum(s, pos);
+    if (!isValidNum(limit) || limit <= 0) {
+      console.warn("⚠️ 不正なlimit:", limit);
+      return;
+    }
     const rows = await db.searchByAuthor(author, limit);
     await sendCourseList(setter, userId, cmd, rows);
     return;
@@ -162,11 +225,14 @@ async function handleRequest(s, setter) {
 
   // ─── CMD=20〜23: 統計更新 ───
   if (cmd === CMD.LIKE || cmd === CMD.PLAY || cmd === CMD.ATTEMPT || cmd === CMD.CLEAR) {
-    // ユーザー名とコースIDを読む
-    // ユーザー名（alphabet）
     const { value: username, next: p3 } = decodeAlphabet(s, pos);
     pos = p3;
     const { value: courseId } = decodeAlphabet(s, pos);
+
+    if (!isValidStr(username) || !isValidStr(courseId)) {
+      console.warn("⚠️ 不正なusername/courseId:", username, courseId);
+      return;
+    }
 
     if (cmd === CMD.PLAY)    { await db.incrementPlay(courseId);    return; }
     if (cmd === CMD.ATTEMPT) { await db.incrementAttempt(courseId); return; }
@@ -175,7 +241,6 @@ async function handleRequest(s, setter) {
     if (cmd === CMD.LIKE) {
       const { alreadyLiked } = await db.addLike(userId, courseId);
       if (alreadyLiked) {
-        // すでにいいね済み → コマンドコード200で通知
         const res = encodeNum(parseInt(userId)) + encodeNum(200);
         await sendCloud(setter, randomCloud(), res);
       }
@@ -186,11 +251,17 @@ async function handleRequest(s, setter) {
   // ─── CMD=30: コースデータ取得 ───
   if (cmd === CMD.GET_COURSE) {
     const { value: courseId } = decodeAlphabet(s, pos);
+    if (!isValidStr(courseId)) {
+      console.warn("⚠️ 不正なcourseId:", courseId);
+      return;
+    }
     const row = await db.getCourseById(courseId);
-    if (!row) return; // コースが見つからない場合は無視
+    if (!row) return;
     await sendCourseData(setter, userId, row.stage_data);
     return;
   }
+
+  console.warn("⚠️ 未知のコマンドコード:", cmd);
 }
 
 // ─────────────────────────────────────────────
@@ -251,9 +322,9 @@ async function handleUploadChunk(s, setter) {
       for (let i = 1; i <= totalChunks; i++) stageData += buf.chunks.get(i);
 
       try {
-        await db.saveCourse(buf.title, buf.author, stageData);
-        // 投稿成功通知
-        const res = encodeNum(parseInt(userId)) + encodeNum(100);
+        const courseId = await db.saveCourse(buf.title, buf.author, stageData);
+        // 投稿成功通知（ユーザーID + 100 + コースID）
+        const res = encodeNum(parseInt(userId)) + encodeNum(100) + encodeAlphabet(courseId);
         await sendCloud(setter, randomCloud(), res);
       } catch (e) {
         console.error("コース保存失敗:", e.message);

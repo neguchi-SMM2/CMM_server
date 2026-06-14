@@ -1,4 +1,14 @@
 "use strict";
+/**
+ * マリオメーカー風ゲーム クラウド変数サーバー v3
+ * =====================================================
+ * 環境変数:
+ *   SCRATCH_USERNAME    Scratch ユーザー名
+ *   SCRATCH_PASSWORD    Scratch パスワード
+ *   SCRATCH_PROJECT_ID  プロジェクトID
+ *   DATABASE_URL        Supabase 接続文字列
+ *   PORT                ヘルスチェック用ポート (default: 3000)
+ */
 
 const WebSocket = require("ws");
 const http      = require("http");
@@ -131,18 +141,19 @@ async function sendCourseList(setter, userId, cmd, rows) {
 async function sendCourseData(setter, userId, stageData) {
   const headerBase = encodeNum(parseInt(userId)) + encodeNum(CMD.GET_COURSE);
   const maxLen = 1000;
-  // オーバーヘッド: headerBase + 何番目(最大2桁Len式) = headerBase.length + 2
-  const overhead = headerBase.length + 2;
+  // オーバーヘッド: headerBase + 分割回数(最大2桁Len式) + 何番目(最大2桁Len式)
+  const overhead = headerBase.length + 2 + 2;
   const chunkSize = maxLen - overhead;
 
   const totalChunks = Math.ceil(stageData.length / chunkSize);
+  const totalEnc = encodeNum(totalChunks);
   for (let i = 0; i < totalChunks; i++) {
     const seq = i + 1;
     const chunk = stageData.slice(i * chunkSize, (i + 1) * chunkSize);
-    await sendCloud(setter, randomCloud(), headerBase + encodeNum(seq) + chunk);
+    await sendCloud(setter, randomCloud(), headerBase + totalEnc + encodeNum(seq) + chunk);
   }
   // 終了合図（何番目=0）
-  await sendCloud(setter, randomCloud(), headerBase + encodeNum(0));
+  await sendCloud(setter, randomCloud(), headerBase + totalEnc + encodeNum(0));
 }
 
 // ─────────────────────────────────────────────
@@ -269,7 +280,7 @@ async function handleRequest(s, setter) {
 // ─────────────────────────────────────────────
 // Map<userId, { totalChunks, chunks: Map<seq, data>, timer, title?, author? }>
 const uploadBuffers = new Map();
-const UPLOAD_TIMEOUT = 3 * 60 * 1000; // 3分タイムアウト
+const UPLOAD_TIMEOUT = 60 * 1000; // 1分タイムアウト
 
 async function handleUploadChunk(s, setter) {
   let pos = 0;

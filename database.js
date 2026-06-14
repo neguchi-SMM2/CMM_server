@@ -43,7 +43,7 @@ async function initDB() {
   console.log("✅ DB初期化完了");
 }
 
-const COURSE_ID_CHARS = "ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789";
+const COURSE_ID_CHARS = "abcdefghijklmnopqrstuvwxyz0123456789";
 
 function generateCourseId() {
   const seg = () => Array.from(

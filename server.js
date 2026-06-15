@@ -488,7 +488,7 @@ class CloudManager {
         return Promise.resolve();
       };
 
-      ws.on("open", () => {
+      ws.on("open", async () => {
         ws.send(JSON.stringify({
           method: "handshake", user: "server-bot", project_id: PROJECT_ID
         }));

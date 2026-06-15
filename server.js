@@ -17,6 +17,8 @@ const { Session, Cloud } = require("scratchcloud");
 const db = require("./database");
 const {
   encodeNum, decodeNum,
+  encodeLen, decodeLen,
+  encodeLenLen, decodeLenLen,
   encodeAlphabet, decodeAlphabet,
   encodeText, decodeText,
 } = require("./encode");
@@ -67,7 +69,7 @@ function randomCloud() {
  * @returns {{ userId: string, next: number }}
  */
 function parseUserId(s, pos = 0) {
-  const { value, next } = decodeNum(s, pos);
+  const { value, next } = decodeLenLen(s, pos);
   return { userId: String(value), next };
 }
 
@@ -75,7 +77,7 @@ function parseUserId(s, pos = 0) {
  * コマンドコードを読む（Len式）
  */
 function parseCmd(s, pos) {
-  const { value, next } = decodeNum(s, pos);
+  const { value, next } = decodeLen(s, pos);
   return { cmd: value, next };
 }
 
@@ -114,7 +116,7 @@ function encodeCourseInfo(row, index) {
  * コース一覧をcloud1〜8に分割して送信（1000文字制限）
  */
 async function sendCourseList(setter, userId, cmd, rows) {
-  const header = encodeNum(parseInt(userId)) + encodeNum(cmd);
+  const header = encodeLenLen(parseInt(userId)) + encodeLen(cmd);
   const maxLen = 1000;
 
   let buffer = "";
@@ -139,21 +141,21 @@ async function sendCourseList(setter, userId, cmd, rows) {
  * コースデータ（生データ）を分割して送信
  */
 async function sendCourseData(setter, userId, stageData) {
-  const headerBase = encodeNum(parseInt(userId)) + encodeNum(CMD.GET_COURSE);
+  const headerBase = encodeLenLen(parseInt(userId)) + encodeLen(CMD.GET_COURSE);
   const maxLen = 1000;
   // オーバーヘッド: headerBase + 分割回数(最大2桁Len式) + 何番目(最大2桁Len式)
   const overhead = headerBase.length + 2 + 2;
   const chunkSize = maxLen - overhead;
 
   const totalChunks = Math.ceil(stageData.length / chunkSize);
-  const totalEnc = encodeNum(totalChunks);
+  const totalEnc = encodeLen(totalChunks);
   for (let i = 0; i < totalChunks; i++) {
     const seq = i + 1;
     const chunk = stageData.slice(i * chunkSize, (i + 1) * chunkSize);
-    await sendCloud(setter, randomCloud(), headerBase + totalEnc + encodeNum(seq) + chunk);
+    await sendCloud(setter, randomCloud(), headerBase + totalEnc + encodeLen(seq) + chunk);
   }
   // 終了合図（何番目=0）
-  await sendCloud(setter, randomCloud(), headerBase + totalEnc + encodeNum(0));
+  await sendCloud(setter, randomCloud(), headerBase + totalEnc + encodeLen(0));
 }
 
 // ─────────────────────────────────────────────
@@ -193,7 +195,7 @@ async function handleRequest(s, setter) {
 
   // ─── CMD=10〜14: コース取得 ───
   if (cmd === CMD.RANDOM || cmd === CMD.WEEKLY || cmd === CMD.ALL_TIME) {
-    const { value: limit } = decodeNum(s, pos);
+    const { value: limit } = decodeLen(s, pos);
     if (!isValidNum(limit) || limit <= 0) {
       console.warn("⚠️ 不正なlimit:", limit);
       return;
@@ -224,7 +226,7 @@ async function handleRequest(s, setter) {
       console.warn("⚠️ 不正なauthor:", author);
       return;
     }
-    const { value: limit } = decodeNum(s, pos);
+    const { value: limit } = decodeLen(s, pos);
     if (!isValidNum(limit) || limit <= 0) {
       console.warn("⚠️ 不正なlimit:", limit);
       return;
@@ -252,7 +254,7 @@ async function handleRequest(s, setter) {
     if (cmd === CMD.LIKE) {
       const { alreadyLiked } = await db.addLike(userId, courseId);
       if (alreadyLiked) {
-        const res = encodeNum(parseInt(userId)) + encodeNum(200);
+        const res = encodeLenLen(parseInt(userId)) + encodeLen(200);
         await sendCloud(setter, randomCloud(), res);
       }
       return;
@@ -294,12 +296,12 @@ async function handleUploadChunk(s, setter) {
   pos = p2;
   if (cmd !== CMD.UPLOAD) return;
 
-  // 分割回数
-  const { value: totalChunks, next: p3 } = decodeNum(s, pos);
+  // 分割回数（Len式）
+  const { value: totalChunks, next: p3 } = decodeLen(s, pos);
   pos = p3;
 
-  // 何番目か
-  const { value: seq, next: p4 } = decodeNum(s, pos);
+  // 何番目か（Len式）
+  const { value: seq, next: p4 } = decodeLen(s, pos);
   pos = p4;
 
   // バッファを取得または作成
@@ -333,19 +335,25 @@ async function handleUploadChunk(s, setter) {
       for (let i = 1; i <= totalChunks; i++) stageData += buf.chunks.get(i);
 
       try {
-        const courseId = await db.saveCourse(buf.title, buf.author, stageData);
-        // 投稿成功通知（ユーザーID + 100 + コースID）
-        const res = encodeNum(parseInt(userId)) + encodeNum(100) + encodeAlphabet(courseId);
-        await sendCloud(setter, randomCloud(), res);
+        const result = await db.saveCourse(buf.title, buf.author, stageData);
+        if (result.duplicate) {
+          // 重複コース通知（102）
+          const res = encodeLenLen(parseInt(userId)) + encodeLen(102);
+          await sendCloud(setter, randomCloud(), res);
+        } else {
+          // 投稿成功通知（ユーザーID + 100 + コースID）
+          const res = encodeLenLen(parseInt(userId)) + encodeLen(100) + encodeAlphabet(result.id);
+          await sendCloud(setter, randomCloud(), res);
+        }
       } catch (e) {
         console.error("コース保存失敗:", e.message);
         // 投稿失敗通知
-        const res = encodeNum(parseInt(userId)) + encodeNum(101);
+        const res = encodeLenLen(parseInt(userId)) + encodeLen(101);
         await sendCloud(setter, randomCloud(), res);
       }
     } else {
       // チャンク不足 → 失敗通知
-      const res = encodeNum(parseInt(userId)) + encodeNum(101);
+      const res = encodeLenLen(parseInt(userId)) + encodeLen(101);
       await sendCloud(setter, randomCloud(), res);
     }
   } else {
@@ -424,6 +432,14 @@ class CloudManager {
         return Promise.resolve();
       };
 
+      // 起動時にすべてのクラウド変数を0で初期化
+      console.log("🔄 クラウド変数を初期化中...");
+      for (const v of [...REQUEST_VARS, ...CLOUD_VARS]) {
+        await setter(v, "0");
+        await sleep(SEND_INTERVAL);
+      }
+      console.log("✅ クラウド変数初期化完了");
+
       // cloud1〜8 と request1〜2 を監視
       cloud.on("set", (name, value) => {
         const fullName = name.startsWith("☁ ") ? name : `☁ ${name}`;
@@ -480,6 +496,14 @@ class CloudManager {
         this.turbowarp.delay = 2000;
         this.turbowarp.isReconnecting = false;
         console.log("✅ TurboWarp Cloud 接続成功");
+
+        // 起動時にすべてのクラウド変数を0で初期化
+        console.log("🔄 TurboWarp クラウド変数を初期化中...");
+        for (const v of [...REQUEST_VARS, ...CLOUD_VARS]) {
+          await setter(v, "0");
+          await sleep(SEND_INTERVAL);
+        }
+        console.log("✅ TurboWarp クラウド変数初期化完了");
       });
 
       ws.on("message", raw => {

@@ -31,57 +31,102 @@ const TEXT_MAP = new Map();
 for (let i = 1; i < TEXT_LIST.length; i++) {
   if (TEXT_LIST[i]) TEXT_MAP.set(TEXT_LIST[i], i);
 }
-
-function encodeNum(value) {
+// ─────────────────────────────────────────────
+// 数値エンコード（LenLen + Len + data）
+// ─────────────────────────────────────────────
+ 
+/**
+ * 数値をエンコードする
+ * 負の場合は - を 0 に置き換えてエンコード
+ * @param {number|string} value
+ * @returns {string}
+ */
+/**
+ * Len式エンコード（コマンドコード・件数・何番目など）
+ * [Len(1桁)][data]
+ */
+function encodeLen(value) {
   let s = String(value);
   let negative = false;
-  if (s.startsWith("-")) {
-    negative = true;
-    s = s.slice(1);
-  }
+  if (s.startsWith("-")) { negative = true; s = s.slice(1); }
   const data = negative ? "0" + s : s;
-  const len = String(data.length);
-  const lenLen = String(len.length);
-  // lenが1桁ならlenLenは省略（lenLen=1は自明）
-  if (len.length === 1) {
-    return len + data;
-  }
-  return lenLen + len + data;
+  return String(data.length) + data;
 }
-function decodeNum(s, pos = 0) {
-
-  const firstDigit = parseInt(s[pos], 10);
-  let len, dataStart;
-
-  if (firstDigit >= 2) {
-    const potentialLenStr = s.slice(pos + 1, pos + 1 + firstDigit);
-    const potentialLen    = parseInt(potentialLenStr, 10);
-    // LenLen式の条件: Len>=10 かつ文字列に収まる
-    if (potentialLen >= 10 && (pos + 1 + firstDigit + potentialLen) <= s.length) {
-      len       = potentialLen;
-      dataStart = pos + 1 + firstDigit;
-    } else {
-      // Len式
-      len       = firstDigit;
-      dataStart = pos + 1;
-    }
-  } else {
-    // firstDigit=0 or 1 → Len式
-    len       = firstDigit;
-    dataStart = pos + 1;
-  }
-
+ 
+/**
+ * LenLen式エンコード（ユーザーIDなど桁数が大きい値）
+ * [LenLen][Len][data]
+ */
+function encodeLenLen(value) {
+  let s = String(value);
+  let negative = false;
+  if (s.startsWith("-")) { negative = true; s = s.slice(1); }
+  const data = negative ? "0" + s : s;
+  const lenStr = String(data.length);
+  const lenLen = String(lenStr.length);
+  return lenLen + lenStr + data;
+}
+ 
+/**
+ * 後方互換用（Len式）
+ */
+function encodeNum(value) { return encodeLen(value); }
+ 
+/**
+ * 数値をデコードする
+ * @param {string} s  エンコード済み文字列
+ * @param {number} pos 開始位置
+ * @returns {{ value: number, next: number }}
+ */
+/**
+ * Len式デコード（コマンドコード・件数・何番目など）
+ * [Len(1桁)][data]
+ */
+function decodeLen(s, pos = 0) {
+  const len = parseInt(s[pos], 10);
+  const dataStart = pos + 1;
   const data = s.slice(dataStart, dataStart + len);
   let value;
   if (data.length > 1 && data.startsWith("0")) {
-    // 負の数（先頭0は-の代替）
     value = -parseInt(data.slice(1), 10);
   } else {
     value = parseInt(data, 10);
   }
   return { value, next: dataStart + len };
 }
-
+ 
+/**
+ * LenLen式デコード（ユーザーIDなど）
+ * [LenLen][Len][data]
+ */
+function decodeLenLen(s, pos = 0) {
+  const lenLen = parseInt(s[pos], 10);
+  const len = parseInt(s.slice(pos + 1, pos + 1 + lenLen), 10);
+  const dataStart = pos + 1 + lenLen;
+  const data = s.slice(dataStart, dataStart + len);
+  let value;
+  if (data.length > 1 && data.startsWith("0")) {
+    value = -parseInt(data.slice(1), 10);
+  } else {
+    value = parseInt(data, 10);
+  }
+  return { value, next: dataStart + len };
+}
+ 
+/**
+ * 後方互換用（Len式）
+ */
+function decodeNum(s, pos = 0) { return decodeLen(s, pos); }
+ 
+// ─────────────────────────────────────────────
+// alphabetエンコード
+// ─────────────────────────────────────────────
+ 
+/**
+ * 文字列をalphabetエンコード
+ * @param {string} str
+ * @returns {string}
+ */
 function encodeAlphabet(str) {
   let digits = "";
   for (const ch of str) {
@@ -95,7 +140,13 @@ function encodeAlphabet(str) {
   if (len.length === 1) return len + digits;
   return lenLen + len + digits;
 }
-
+ 
+/**
+ * alphabetエンコードをデコード
+ * @param {string} s
+ * @param {number} pos
+ * @returns {{ value: string, next: number }}
+ */
 function decodeAlphabet(s, pos = 0) {
   // まず数値エンコード部分の長さを取得
   const firstDigit = parseInt(s[pos], 10);
@@ -118,7 +169,16 @@ function decodeAlphabet(s, pos = 0) {
   }
   return { value: result, next: dataStart + len };
 }
-
+ 
+// ─────────────────────────────────────────────
+// textエンコード
+// ─────────────────────────────────────────────
+ 
+/**
+ * 文字列をtextエンコード
+ * @param {string} str
+ * @returns {string}
+ */
 function encodeText(str) {
   let digits = "";
   for (const ch of str) {
@@ -131,7 +191,13 @@ function encodeText(str) {
   if (len.length === 1) return len + digits;
   return lenLen + len + digits;
 }
-
+ 
+/**
+ * textエンコードをデコード
+ * @param {string} s
+ * @param {number} pos
+ * @returns {{ value: string, next: number }}
+ */
 function decodeText(s, pos = 0) {
   const firstDigit = parseInt(s[pos], 10);
   let len, dataStart;
@@ -154,11 +220,14 @@ function decodeText(s, pos = 0) {
   }
   return { value: result, next: dataStart + len };
 }
-
+ 
 module.exports = {
   encodeNum, decodeNum,
+  encodeLen, decodeLen,
+  encodeLenLen, decodeLenLen,
   encodeAlphabet, decodeAlphabet,
   encodeText, decodeText,
   ALPHABET_LIST, ALPHABET_MAP,
   TEXT_LIST, TEXT_MAP,
 };
+ 

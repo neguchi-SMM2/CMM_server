@@ -254,7 +254,12 @@ async function handleRequest(s, setter) {
     if (cmd === CMD.LIKE) {
       const { alreadyLiked } = await db.addLike(userId, courseId);
       if (alreadyLiked) {
+        // いいね済み通知
         const res = encodeLenLen(parseInt(userId)) + encodeLen(200);
+        await sendCloud(setter, randomCloud(), res);
+      } else {
+        // いいね成功通知
+        const res = encodeLenLen(parseInt(userId)) + encodeLen(201);
         await sendCloud(setter, randomCloud(), res);
       }
       return;

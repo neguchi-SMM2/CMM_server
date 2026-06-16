@@ -252,7 +252,7 @@ async function handleRequest(s, setter) {
     if (cmd === CMD.CLEAR)   { await db.incrementClear(courseId);   return; }
 
     if (cmd === CMD.LIKE) {
-      const { alreadyLiked } = await db.addLike(userId, courseId);
+      const { alreadyLiked } = await db.addLike(username, courseId);
       if (alreadyLiked) {
         // いいね済み通知
         const res = encodeLenLen(parseInt(userId)) + encodeLen(200);

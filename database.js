@@ -34,9 +34,9 @@ async function initDB() {
 
     CREATE TABLE IF NOT EXISTS likes (
       id        SERIAL PRIMARY KEY,
-      user_id   TEXT   NOT NULL,
+      username  TEXT   NOT NULL,
       course_id TEXT   NOT NULL REFERENCES courses(id) ON DELETE CASCADE,
-      UNIQUE (user_id, course_id)
+      UNIQUE (username, course_id)
     );
 
     CREATE INDEX IF NOT EXISTS idx_courses_likes   ON courses(like_count DESC);
@@ -170,15 +170,15 @@ const LIKES_MAX = 50000; // likesテーブルの最大件数
  * いいね処理
  * @returns {{ alreadyLiked: boolean }}
  */
-async function addLike(userId, courseId) {
+async function addLike(username, courseId) {
   // すでにいいね済みか確認
   const { rows } = await pool.query(
-    "SELECT 1 FROM likes WHERE user_id=$1 AND course_id=$2", [userId, courseId]
+    "SELECT 1 FROM likes WHERE username=$1 AND course_id=$2", [username, courseId]
   );
   if (rows.length) return { alreadyLiked: true };
 
   await pool.query(
-    "INSERT INTO likes (user_id, course_id) VALUES ($1,$2)", [userId, courseId]
+    "INSERT INTO likes (username, course_id) VALUES ($1,$2)", [username, courseId]
   );
   await pool.query(
     `UPDATE courses SET like_count=like_count+1, weekly_likes=weekly_likes+1

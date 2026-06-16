@@ -1,4 +1,8 @@
 "use strict";
+/**
+ * DB層 - Supabase (PostgreSQL)
+ * 環境変数: DATABASE_URL
+ */
 
 const { Pool } = require("pg");
 const crypto   = require("crypto");
@@ -29,9 +33,10 @@ async function initDB() {
     );
 
     CREATE TABLE IF NOT EXISTS likes (
-      user_id   TEXT NOT NULL,
-      course_id TEXT NOT NULL REFERENCES courses(id) ON DELETE CASCADE,
-      PRIMARY KEY (user_id, course_id)
+      id        SERIAL PRIMARY KEY,
+      user_id   TEXT   NOT NULL,
+      course_id TEXT   NOT NULL REFERENCES courses(id) ON DELETE CASCADE,
+      UNIQUE (user_id, course_id)
     );
 
     CREATE INDEX IF NOT EXISTS idx_courses_likes   ON courses(like_count DESC);
@@ -43,6 +48,9 @@ async function initDB() {
   console.log("✅ DB初期化完了");
 }
 
+// ─────────────────────────────────────────────
+// コースID生成（A〜Z, 0〜9の3文字×3ブロック）
+// ─────────────────────────────────────────────
 const COURSE_ID_CHARS = "abcdefghijklmnopqrstuvwxyz0123456789";
 
 function generateCourseId() {
@@ -59,7 +67,16 @@ function minutesSince2000() {
   return Math.floor((Date.now() - epoch2000) / 60000);
 }
 
+// ─────────────────────────────────────────────
+// コース保存
+// ─────────────────────────────────────────────
 async function saveCourse(title, author, stageData) {
+  // 同一ステージデータの重複チェック
+  const { rows: dupRows } = await pool.query(
+    "SELECT 1 FROM courses WHERE stage_data=$1", [stageData]
+  );
+  if (dupRows.length) return { duplicate: true };
+
   // コースID衝突回避（最大5回リトライ）
   let id = generateCourseId();
   for (let i = 0; i < 5; i++) {
@@ -73,14 +90,20 @@ async function saveCourse(title, author, stageData) {
      VALUES ($1, $2, $3, $4, $5)`,
     [id, title, author, stageData, postedAt]
   );
-  return id;
+  return { id };
 }
 
+// ─────────────────────────────────────────────
+// コース取得
+// ─────────────────────────────────────────────
 async function getCourseById(id) {
   const { rows } = await pool.query("SELECT * FROM courses WHERE id=$1", [id]);
   return rows[0] || null;
 }
 
+// ─────────────────────────────────────────────
+// ランキング・検索
+// ─────────────────────────────────────────────
 const INFO_COLS = `id, title, author, like_count, play_count, attempt_count, clear_count, posted_at`;
 
 async function getRandomCourses(limit) {
@@ -120,6 +143,9 @@ async function searchByAuthor(author, limit) {
   return rows;
 }
 
+// ─────────────────────────────────────────────
+// 統計更新
+// ─────────────────────────────────────────────
 async function incrementPlay(courseId) {
   await pool.query(
     "UPDATE courses SET play_count=play_count+1 WHERE id=$1", [courseId]
@@ -137,6 +163,8 @@ async function incrementClear(courseId) {
     "UPDATE courses SET clear_count=clear_count+1 WHERE id=$1", [courseId]
   );
 }
+
+const LIKES_MAX = 50000; // likesテーブルの最大件数
 
 /**
  * いいね処理
@@ -156,6 +184,20 @@ async function addLike(userId, courseId) {
     `UPDATE courses SET like_count=like_count+1, weekly_likes=weekly_likes+1
      WHERE id=$1`, [courseId]
   );
+
+  // 5万件を超えたら古いものを削除
+  const { rows: countRows } = await pool.query("SELECT COUNT(*) FROM likes");
+  const count = parseInt(countRows[0].count, 10);
+  if (count > LIKES_MAX) {
+    const excess = count - LIKES_MAX;
+    await pool.query(
+      `DELETE FROM likes WHERE id IN (
+         SELECT id FROM likes ORDER BY id ASC LIMIT $1
+       )`, [excess]
+    );
+    console.log(`🗑️ 古いいいねを ${excess} 件削除しました`);
+  }
+
   return { alreadyLiked: false };
 }
 

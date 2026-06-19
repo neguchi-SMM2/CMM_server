@@ -440,8 +440,7 @@ class CloudManager {
       ws.on("message", raw => {
         try {
           const text = Buffer.isBuffer(raw) ? raw.toString("utf8") : raw;
-          for (const line of text.trim().split("
-")) {
+          for (const line of text.trim().split("")) {
             if (!line) continue;
             const data = JSON.parse(line);
             if (data.method === "set" && [...REQUEST_VARS, ...CLOUD_VARS].includes(data.name))

@@ -384,6 +384,13 @@ class CloudManager {
     await Promise.allSettled([this.connectScratch(), Promise.resolve(this.connectTurboWarp())]);
     this.scheduleWeeklyReset();
     const server = http.createServer((req, res) => {
+      // ★ 追加：/wake エンドポイント（即座に200を返す）
+      if (req.url === "/wake") {
+        res.writeHead(200, { "Content-Type": "text/plain" });
+        res.end("ok");
+        return;
+      }
+    
       res.writeHead(200, { "Content-Type": "application/json" });
       res.end(JSON.stringify({
         status:    "ok",

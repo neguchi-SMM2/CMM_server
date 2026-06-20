@@ -285,138 +285,40 @@ class CloudManager {
 
   async connectScratch() {
     if (this.scratch.conn || this.scratch.isReconnecting) return;
-  
     this.scratch.isReconnecting = true;
-  
     try {
-  
       console.log("🔄 Scratch Cloud 接続中...");
-  
-      const timeout = ms =>
-        new Promise((_, reject) =>
-          setTimeout(
-            () => reject(new Error("Scratch接続タイムアウト")),
-            ms
-          )
-        );
-  
-  
-      const session = await Promise.race([
-        Session.createAsync(USERNAME, PASSWORD),
-        timeout(20000)
-      ]);
-  
-  
-      const cloud = await Promise.race([
-        Cloud.createAsync(session, PROJECT_ID),
-        timeout(20000)
-      ]);
-  
-  
-      this.scratch.conn = cloud;
+      const timeout = ms => new Promise((_, r) => setTimeout(() => r(new Error("タイムアウト")), ms));
+      const session = await Promise.race([Session.createAsync(USERNAME, PASSWORD), timeout(15000)]);
+      const cloud   = await Promise.race([Cloud.createAsync(session, PROJECT_ID),  timeout(15000)]);
+      this.scratch.conn  = cloud;
       this.scratch.delay = 5000;
-  
-  
       console.log("✅ Scratch Cloud 接続成功");
-  
-  
-      const setter = async(name,value)=>{
-        try{
-          cloud.set(name,String(value));
-        }catch(e){
-          console.warn(
-            "⚠️ Scratch送信失敗:",
-            e.message
-          );
-        }
-      };
-  
-  
-      cloud.on("set",(name,value)=>{
-  
-        try{
-  
-          const fullName =
-            name.startsWith("☁ ")
-            ? name
-            : `☁ ${name}`;
-  
-  
-          if(
-            [...REQUEST_VARS,...CLOUD_VARS]
-            .includes(fullName)
-          ){
-            this.enqueue(
-              fullName,
-              value,
-              setter
-            );
-          }
-  
-        }catch(e){
-  
-          console.warn(
-            "⚠️ Scratch受信処理失敗:",
-            e.message
-          );
-  
-        }
-  
+      const setter = (name, value) => { cloud.set(name, String(value)); return Promise.resolve(); };
+      console.log("🔄 クラウド変数を初期化中...");
+      for (const v of [...REQUEST_VARS, ...CLOUD_VARS]) { await setter(v, "0"); await sleep(SEND_INTERVAL); }
+      console.log("✅ クラウド変数初期化完了");
+      cloud.on("set", (name, value) => {
+        const fullName = name.startsWith("☁ ") ? name : `☁ ${name}`;
+        if ([...REQUEST_VARS, ...CLOUD_VARS].includes(fullName)) this.enqueue(fullName, value, setter);
       });
-  
-  
-      cloud.on("close",()=>{
-  
-        console.warn("⚠️ Scratch切断");
-  
-        this.scratch.conn=null;
-  
+      cloud.on("close", () => { console.warn("⚠️ Scratch 切断"); this.scratch.conn = null; this.scheduleReconnect("scratch"); });
+      cloud.on("error", e => { console.error("❌ Scratch エラー:", e.message); this.scratch.conn = null; this.scheduleReconnect("scratch"); });
+    } catch (e) {
+      console.error("❌ Scratch 接続失敗:", e.message);
+      console.log("⚠️ Scratch接続をスキップ。TurboWarpのみで運用します。");
+      this.scratch.conn = null;
+      // Scratch接続失敗時は長めの間隔でリトライ
+      setTimeout(() => {
+        this.scratch.isReconnecting = false;
         this.scheduleReconnect("scratch");
-  
-      });
-  
-  
-      cloud.on("error",e=>{
-  
-        console.warn(
-          "⚠️ Scratch WebSocketエラー:",
-          e.message
-        );
-  
-        this.scratch.conn=null;
-  
-        this.scheduleReconnect("scratch");
-  
-      });
-  
-  
-    } catch(e){
-
-      console.error(
-        "❌ Scratch 接続失敗:",
-        e.message
-      );
-    
-      this.scratch.conn=null;
-    
-      this.scratch.delay =
-        Math.min(
-          this.scratch.delay * 1.5,
-          30000
-        );
-    
-      setTimeout(
-        ()=>this.connectScratch(),
-        this.scratch.delay
-      );
-      
+      }, 60000); // 1分後にリトライ
     } finally {
-  
-      this.scratch.isReconnecting=false;
-  
+      // isReconnectingはタイムアウト後にfalseにするのでここではリセットしない
+      // （二重接続防止のため）
     }
   }
-  
+
   connectTurboWarp() {
     if (this.turbowarp.conn?.readyState === WebSocket.OPEN || this.turbowarp.isReconnecting) return;
     this.turbowarp.isReconnecting = true;
@@ -440,7 +342,8 @@ class CloudManager {
       ws.on("message", raw => {
         try {
           const text = Buffer.isBuffer(raw) ? raw.toString("utf8") : raw;
-          for (const line of text.trim().split("")) {
+          for (const line of text.trim().split("
+")) {
             if (!line) continue;
             const data = JSON.parse(line);
             if (data.method === "set" && [...REQUEST_VARS, ...CLOUD_VARS].includes(data.name))
@@ -481,51 +384,42 @@ class CloudManager {
   }
 
   async start() {
-  
-    process.on("uncaughtException", e=>{
-      console.error("❌ uncaughtException:",e.message);
+    process.on("uncaughtException", e => {
+      console.error("❌ uncaughtException:", e.message);
+      // scratchcloudの内部エラーはサーバーを落とさず無視
     });
-    
-    process.on("unhandledRejection", e=>{
-      console.error("❌ unhandledRejection:",e);
-    });  
-  
+    process.on("unhandledRejection", e => {
+      console.error("❌ unhandledRejection:", e);
+    });
     await db.initDB();
-  
-  
-    const server = http.createServer((req,res)=>{
-  
-      if(req.url.startsWith("/wake")){
-        res.writeHead(200);
-        res.end("ok");
-        return;
-      }
-  
-      res.writeHead(200,{
-        "Content-Type":"application/json"
-      });
-  
-      res.end(JSON.stringify({
-        status:"ok",
-        scratch:this.scratch.conn ? "connected":"disconnected",
-        turbowarp:this.turbowarp.conn ? "connected":"disconnected",
-        uptime:process.uptime()
-      }));
-  
-    });
-  
-  
-    server.listen(PORT,()=>{
-      console.log("🌐 HTTP起動");
-    });
-  
-  
-    this.connectScratch();
-    this.connectTurboWarp();
-  
-  
+    await Promise.allSettled([this.connectScratch(), Promise.resolve(this.connectTurboWarp())]);
     this.scheduleWeeklyReset();
-  
+    const server = http.createServer((req, res) => {
+      res.writeHead(200, { "Content-Type": "application/json" });
+      res.end(JSON.stringify({
+        status:    "ok",
+        scratch:   !!this.scratch.conn ? "connected" : "disconnected",
+        turbowarp: this.turbowarp.conn?.readyState === WebSocket.OPEN ? "connected" : "disconnected",
+        queue:     this.queue.length,
+        uptime:    process.uptime(),
+      }));
+    });
+    server.listen(PORT, () => console.log(`🌐 ヘルスチェック: http://0.0.0.0:${PORT}`));
+    setInterval(() => {
+      const s = this.scratch.conn    ? "✅" : "❌";
+      const t = this.turbowarp.conn?.readyState === WebSocket.OPEN ? "✅" : "❌";
+      console.log(`💡 Health - Scratch:${s} TurboWarp:${t} Queue:${this.queue.length}`);
+    }, 5 * 60 * 1000);
+    const shutdown = () => {
+      console.log("🛑 シャットダウン...");
+      try { this.scratch.conn?.close();   } catch (_) {}
+      try { this.turbowarp.conn?.close(); } catch (_) {}
+      server.close();
+      db.pool.end();
+      process.exit(0);
+    };
+    process.on("SIGTERM", shutdown);
+    process.on("SIGINT",  shutdown);
     console.log("🚀 サーバー起動完了");
   }
 }

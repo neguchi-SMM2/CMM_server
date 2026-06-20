@@ -369,15 +369,15 @@ class CloudManager {
   }
 
   scheduleWeeklyReset() {
+    // 毎日00:00 JSTに7日以上前のいいねを削除
     const now  = new Date();
     const next = new Date(now);
     next.setHours(0, 0, 0, 0);
-    const daysUntilMonday = (1 - now.getDay() + 7) % 7 || 7;
-    next.setDate(next.getDate() + daysUntilMonday);
+    next.setDate(next.getDate() + 1);
     const ms = next - now;
-    console.log(`📅 週間リセット予定: ${next.toLocaleString("ja-JP")}`);
+    console.log(`📅 次回いいねクリーンアップ: ${next.toLocaleString("ja-JP")}`);
     setTimeout(async () => {
-      await db.resetWeeklyLikes().catch(e => console.error("週間リセット失敗:", e));
+      await db.deleteOldLikes().catch(e => console.error("いいねクリーンアップ失敗:", e));
       this.scheduleWeeklyReset();
     }, ms);
   }

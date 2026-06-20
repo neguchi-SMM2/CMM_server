@@ -28,22 +28,26 @@ async function initDB() {
       play_count    INT     NOT NULL DEFAULT 0,
       attempt_count INT     NOT NULL DEFAULT 0,
       clear_count   INT     NOT NULL DEFAULT 0,
-      like_count    INT     NOT NULL DEFAULT 0,
-      weekly_likes  INT     NOT NULL DEFAULT 0
+      like_count    INT     NOT NULL DEFAULT 0
     );
 
     CREATE TABLE IF NOT EXISTS likes (
-      id        SERIAL PRIMARY KEY,
-      username  TEXT   NOT NULL,
-      course_id TEXT   NOT NULL REFERENCES courses(id) ON DELETE CASCADE,
+      id         SERIAL  PRIMARY KEY,
+      username   TEXT    NOT NULL,
+      course_id  TEXT    NOT NULL REFERENCES courses(id) ON DELETE CASCADE,
+      created_at BIGINT  NOT NULL DEFAULT EXTRACT(EPOCH FROM NOW())::BIGINT,
       UNIQUE (username, course_id)
     );
+    -- 既存テーブルにcreated_atがなければ追加
+    ALTER TABLE likes ADD COLUMN IF NOT EXISTS
+      created_at BIGINT NOT NULL DEFAULT EXTRACT(EPOCH FROM NOW())::BIGINT;
 
     CREATE INDEX IF NOT EXISTS idx_courses_likes   ON courses(like_count DESC);
-    CREATE INDEX IF NOT EXISTS idx_courses_weekly  ON courses(weekly_likes DESC);
     CREATE INDEX IF NOT EXISTS idx_courses_posted  ON courses(posted_at DESC);
     CREATE INDEX IF NOT EXISTS idx_courses_author  ON courses(author);
     CREATE INDEX IF NOT EXISTS idx_courses_title   ON courses(title);
+    CREATE INDEX IF NOT EXISTS idx_likes_course    ON likes(course_id);
+    CREATE INDEX IF NOT EXISTS idx_likes_created   ON likes(created_at DESC);
   `);
   console.log("✅ DB初期化完了");
 }
@@ -114,11 +118,21 @@ async function getRandomCourses(limit) {
 }
 
 async function getWeeklyRanking(limit) {
-  // 1週間以内にいいねされたコース（weekly_likesを使用）
+  // 過去7日間（604800秒）のいいね数で集計
+  const since = Math.floor(Date.now() / 1000) - 7 * 24 * 60 * 60;
   const { rows } = await pool.query(
-    `SELECT ${INFO_COLS} FROM courses ORDER BY weekly_likes DESC LIMIT $1`, [limit]
+    `SELECT c.id, c.title, c.author, c.like_count, c.play_count,
+            c.attempt_count, c.clear_count, c.posted_at,
+            COUNT(l.id) AS weekly_count
+     FROM courses c
+     LEFT JOIN likes l ON l.course_id = c.id AND l.created_at >= $1
+     GROUP BY c.id
+     ORDER BY weekly_count DESC, c.like_count DESC
+     LIMIT $2`,
+    [since, limit]
   );
-  return rows;
+  // weekly_countをlike_countとして上書きしてencodeCourseInfoで使えるようにする
+  return rows.map(r => ({ ...r, like_count: parseInt(r.like_count), _weekly_count: parseInt(r.weekly_count) }));
 }
 
 async function getAllTimeRanking(limit) {
@@ -177,12 +191,13 @@ async function addLike(username, courseId) {
   );
   if (rows.length) return { alreadyLiked: true };
 
+  const now = Math.floor(Date.now() / 1000);
   await pool.query(
-    "INSERT INTO likes (username, course_id) VALUES ($1,$2)", [username, courseId]
+    "INSERT INTO likes (username, course_id, created_at) VALUES ($1,$2,$3)",
+    [username, courseId, now]
   );
   await pool.query(
-    `UPDATE courses SET like_count=like_count+1, weekly_likes=weekly_likes+1
-     WHERE id=$1`, [courseId]
+    "UPDATE courses SET like_count=like_count+1 WHERE id=$1", [courseId]
   );
 
   // 5万件を超えたら古いものを削除
@@ -201,10 +216,18 @@ async function addLike(username, courseId) {
   return { alreadyLiked: false };
 }
 
-// 週間いいねリセット（毎週月曜に呼ぶ）
+// 古いいいねの削除（7日以上前のものを定期削除してDBを軽量に保つ）
+async function deleteOldLikes() {
+  const cutoff = Math.floor(Date.now() / 1000) - 7 * 24 * 60 * 60;
+  const { rowCount } = await pool.query(
+    "DELETE FROM likes WHERE created_at < $1", [cutoff]
+  );
+  if (rowCount > 0) console.log(`🗑️ 古いいいねを ${rowCount} 件削除しました`);
+}
+
+// 後方互換用（scheduleWeeklyResetから呼ばれる）
 async function resetWeeklyLikes() {
-  await pool.query("UPDATE courses SET weekly_likes=0");
-  console.log("✅ 週間いいねリセット完了");
+  await deleteOldLikes();
 }
 
 module.exports = {
@@ -213,5 +236,5 @@ module.exports = {
   getRandomCourses, getWeeklyRanking, getAllTimeRanking,
   searchByCourseId, searchByAuthor,
   incrementPlay, incrementAttempt, incrementClear, addLike,
-  resetWeeklyLikes, minutesSince2000,
+  resetWeeklyLikes, deleteOldLikes, minutesSince2000,
 };

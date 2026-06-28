@@ -46,7 +46,7 @@ function sleep(ms) { return new Promise(r => setTimeout(r, ms)); }
 function randomCloud() { return CLOUD_VARS[Math.floor(Math.random() * CLOUD_VARS.length)]; }
 
 function parseUserId(s, pos = 0) {
-  const { value, next } = decodeLenLen(s, pos);
+  const { value, next } = decodeLen(s, pos);
   return { userId: String(value), next };
 }
 function parseCmd(s, pos) {
@@ -120,7 +120,7 @@ async function handleRequest(s, setter) {
 
   // CMD=10〜12: ランキング・ランダム
   if (cmd === CMD.RANDOM || cmd === CMD.WEEKLY || cmd === CMD.ALL_TIME) {
-    const { value: limit, next: p3 } = decodeLenLen(s, pos); pos = p3;
+    const { value: limit, next: p3 } = decodeLen(s, pos); pos = p3;
     if (!isValidNum(limit) || limit <= 0) { console.warn("⚠️ 不正なlimit:", limit); return; }
     let rows;
     if      (cmd === CMD.RANDOM)   rows = await db.getRandomCourses(limit);
@@ -147,7 +147,7 @@ async function handleRequest(s, setter) {
   if (cmd === CMD.SEARCH_AUTHOR) {
     const { value: author, next: p3 } = decodeAlphabet(s, pos); pos = p3;
     if (!isValidStr(author)) { console.warn("⚠️ 不正なauthor:", author); return; }
-    const { value: limit } = decodeLenLen(s, pos);
+    const { value: limit } = decodeLen(s, pos);
     if (!isValidNum(limit) || limit <= 0) { console.warn("⚠️ 不正なlimit:", limit); return; }
     const rows = await db.searchByAuthor(author, limit);
     if (!rows.length) {

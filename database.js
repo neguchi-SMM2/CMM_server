@@ -136,8 +136,10 @@ async function getWeeklyRanking(limit) {
 }
 
 async function getAllTimeRanking(limit) {
+  const safeLimit = parseInt(limit, 10);
+  if (!safeLimit || safeLimit <= 0) throw new Error(`不正なlimit: ${limit}`);
   const { rows } = await pool.query(
-    `SELECT ${INFO_COLS} FROM courses ORDER BY like_count DESC, play_count DESC LIMIT $1`
+    `SELECT ${INFO_COLS} FROM courses ORDER BY like_count DESC, play_count DESC LIMIT $1`, [safeLimit]
   );
   return rows;
 }

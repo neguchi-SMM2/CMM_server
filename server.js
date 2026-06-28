@@ -121,6 +121,7 @@ async function handleRequest(s, setter) {
   // CMD=10〜12: ランキング・ランダム
   if (cmd === CMD.RANDOM || cmd === CMD.WEEKLY || cmd === CMD.ALL_TIME) {
     const { value: limit } = decodeLen(s, pos);
+    console.log(`🔍 CMD=${cmd} limit=${limit} pos=${pos} s=${s}`); // デバッグ用
     if (!isValidNum(limit) || limit <= 0) { console.warn("⚠️ 不正なlimit:", limit); return; }
     let rows;
     if      (cmd === CMD.RANDOM)   rows = await db.getRandomCourses(limit);

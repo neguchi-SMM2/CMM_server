@@ -112,7 +112,7 @@ const INFO_COLS = `id, title, author, like_count, play_count, attempt_count, cle
 
 async function getRandomCourses(limit) {
   const { rows } = await pool.query(
-    `SELECT ${INFO_COLS} FROM courses ORDER BY RANDOM() LIMIT $1`, [limit]
+    `SELECT ${INFO_COLS} FROM courses ORDER BY posted_at + (RANDOM() * 1080) DESC LIMIT $1`, [limit]
   );
   return rows;
 }
@@ -127,7 +127,7 @@ async function getWeeklyRanking(limit) {
      FROM courses c
      LEFT JOIN likes l ON l.course_id = c.id AND l.created_at >= $1
      GROUP BY c.id
-     ORDER BY weekly_count DESC, c.like_count DESC
+     ORDER BY weekly_count DESC, c.like_count DESC, c.play_count DESC
      LIMIT $2`,
     [since, limit]
   );

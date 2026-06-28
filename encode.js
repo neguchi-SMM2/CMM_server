@@ -103,21 +103,13 @@ function encodeAlphabet(str) {
   }
   const len = String(digits.length);
   const lenLen = String(len.length);
-  if (len.length === 1) return len + digits;
-  return lenLen + len + digits;
+  return lenLen + len + digits;  // 常にLenLen式
 }
 
 function decodeAlphabet(s, pos = 0) {
-  const firstDigit = parseInt(s[pos], 10);
-  let len, dataStart;
-  const potentialLen = parseInt(s.slice(pos + 1, pos + 1 + firstDigit), 10);
-  if (String(potentialLen).length === firstDigit && firstDigit >= 2) {
-    len = potentialLen;
-    dataStart = pos + 1 + firstDigit;
-  } else {
-    len = firstDigit;
-    dataStart = pos + 1;
-  }
+  const lenLen = parseInt(s[pos], 10);
+  const len = parseInt(s.slice(pos + 1, pos + 1 + lenLen), 10);
+  const dataStart = pos + 1 + lenLen;
   const digits = s.slice(dataStart, dataStart + len);
   let result = "";
   for (let i = 0; i < digits.length; i += 2) {
@@ -142,21 +134,13 @@ function encodeText(str) {
   }
   const len = String(digits.length);
   const lenLen = String(len.length);
-  if (len.length === 1) return len + digits;
-  return lenLen + len + digits;
+  return lenLen + len + digits;  // 常にLenLen式
 }
 
 function decodeText(s, pos = 0) {
-  const firstDigit = parseInt(s[pos], 10);
-  let len, dataStart;
-  const potentialLen = parseInt(s.slice(pos + 1, pos + 1 + firstDigit), 10);
-  if (String(potentialLen).length === firstDigit && firstDigit >= 2) {
-    len = potentialLen;
-    dataStart = pos + 1 + firstDigit;
-  } else {
-    len = firstDigit;
-    dataStart = pos + 1;
-  }
+  const lenLen = parseInt(s[pos], 10);
+  const len = parseInt(s.slice(pos + 1, pos + 1 + lenLen), 10);
+  const dataStart = pos + 1 + lenLen;
   const digits = s.slice(dataStart, dataStart + len);
   let result = "";
   for (let i = 0; i < digits.length; i += 4) {

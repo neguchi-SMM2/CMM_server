@@ -120,8 +120,7 @@ async function handleRequest(s, setter) {
 
   // CMD=10〜12: ランキング・ランダム
   if (cmd === CMD.RANDOM || cmd === CMD.WEEKLY || cmd === CMD.ALL_TIME) {
-    const { value: limit } = decodeLen(s, pos);
-    console.log(`🔍 CMD=${cmd} limit=${limit} pos=${pos} s=${s}`); // デバッグ用
+    const { value: limit, next: p3 } = decodeLenLen(s, pos); pos = p3;
     if (!isValidNum(limit) || limit <= 0) { console.warn("⚠️ 不正なlimit:", limit); return; }
     let rows;
     if      (cmd === CMD.RANDOM)   rows = await db.getRandomCourses(limit);
@@ -148,7 +147,7 @@ async function handleRequest(s, setter) {
   if (cmd === CMD.SEARCH_AUTHOR) {
     const { value: author, next: p3 } = decodeAlphabet(s, pos); pos = p3;
     if (!isValidStr(author)) { console.warn("⚠️ 不正なauthor:", author); return; }
-    const { value: limit } = decodeLen(s, pos);
+    const { value: limit } = decodeLenLen(s, pos);
     if (!isValidNum(limit) || limit <= 0) { console.warn("⚠️ 不正なlimit:", limit); return; }
     const rows = await db.searchByAuthor(author, limit);
     if (!rows.length) {
@@ -309,14 +308,10 @@ class CloudManager {
       console.error("❌ Scratch 接続失敗:", e.message);
       console.log("⚠️ Scratch接続をスキップ。TurboWarpのみで運用します。");
       this.scratch.conn = null;
-      // Scratch接続失敗時は長めの間隔でリトライ
       setTimeout(() => {
         this.scratch.isReconnecting = false;
         this.scheduleReconnect("scratch");
-      }, 60000); // 1分後にリトライ
-    } finally {
-      // isReconnectingはタイムアウト後にfalseにするのでここではリセットしない
-      // （二重接続防止のため）
+      }, 60000);
     }
   }
 
@@ -370,7 +365,6 @@ class CloudManager {
   }
 
   scheduleWeeklyReset() {
-    // 毎日00:00 JSTに7日以上前のいいねを削除
     const now  = new Date();
     const next = new Date(now);
     next.setHours(0, 0, 0, 0);
@@ -386,7 +380,6 @@ class CloudManager {
   async start() {
     process.on("uncaughtException", e => {
       console.error("❌ uncaughtException:", e.message);
-      // scratchcloudの内部エラーはサーバーを落とさず無視
     });
     process.on("unhandledRejection", e => {
       console.error("❌ unhandledRejection:", e);

@@ -1,0 +1,124 @@
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>管理ページ</title>
+  <style>
+    * { box-sizing: border-box; margin: 0; padding: 0; }
+    body { font-family: 'Segoe UI', sans-serif; background: #0f172a; color: #e2e8f0; min-height: 100vh; padding: 2rem; }
+    h1 { font-size: 1.5rem; font-weight: 700; color: #f8fafc; margin-bottom: 2rem; border-bottom: 1px solid #334155; padding-bottom: 1rem; }
+    h2 { font-size: 1.1rem; font-weight: 600; color: #94a3b8; margin-bottom: 1rem; }
+    .cards { display: grid; grid-template-columns: repeat(auto-fit, minmax(340px, 1fr)); gap: 1.5rem; }
+    .card { background: #1e293b; border: 1px solid #334155; border-radius: 12px; padding: 1.5rem; }
+    label { display: block; font-size: 0.85rem; color: #94a3b8; margin-bottom: 0.4rem; margin-top: 1rem; }
+    label:first-of-type { margin-top: 0; }
+    input, select { width: 100%; padding: 0.6rem 0.8rem; border-radius: 8px; border: 1px solid #475569; background: #0f172a; color: #e2e8f0; font-size: 0.95rem; outline: none; transition: border 0.2s; }
+    input:focus, select:focus { border-color: #6366f1; }
+    button { margin-top: 1.25rem; width: 100%; padding: 0.7rem; border-radius: 8px; border: none; font-size: 0.95rem; font-weight: 600; cursor: pointer; transition: background 0.2s; }
+    .btn-danger { background: #dc2626; color: #fff; }
+    .btn-danger:hover { background: #b91c1c; }
+    .btn-warn { background: #d97706; color: #fff; }
+    .btn-warn:hover { background: #b45309; }
+    .msg { margin-top: 0.75rem; font-size: 0.85rem; padding: 0.5rem 0.75rem; border-radius: 6px; display: none; }
+    .msg.ok  { background: #14532d; color: #86efac; display: block; }
+    .msg.err { background: #7f1d1d; color: #fca5a5; display: block; }
+  </style>
+</head>
+<body>
+  <h1>🛡️ 管理ページ</h1>
+  <div class="cards">
+
+    <!-- コース削除 -->
+    <div class="card">
+      <h2>🗑️ コース削除 &amp; 通知</h2>
+      <label>コースID</label>
+      <input id="del-course-id" type="text" placeholder="xxx-xxx-xxx">
+      <label>削除理由</label>
+      <select id="del-reason">
+        <option value="401">401 - タイトル・作者名に個人情報</option>
+        <option value="402">402 - プロジェクト・ユーザーの宣伝</option>
+        <option value="403">403 - 過度ないいね要求</option>
+        <option value="404">404 - タイトル・作者名でやり取り</option>
+      </select>
+      <button class="btn-danger" onclick="deleteCourse()">削除して通知</button>
+      <div id="del-msg" class="msg"></div>
+    </div>
+
+    <!-- ユーザーBAN -->
+    <div class="card">
+      <h2>🔨 ユーザーBAN</h2>
+      <label>ユーザー名</label>
+      <input id="ban-username" type="text" placeholder="username">
+      <label>BAN期間</label>
+      <select id="ban-duration">
+        <option value="86400">1日</option>
+        <option value="259200">3日</option>
+        <option value="604800">7日</option>
+        <option value="1209600">14日</option>
+        <option value="2592000">30日</option>
+        <option value="31536000">365日</option>
+        <option value="9999999999">永久</option>
+      </select>
+      <button class="btn-warn" onclick="banUser()">BANして通知</button>
+      <div id="ban-msg" class="msg"></div>
+    </div>
+
+  </div>
+
+  <script>
+    function getAuth() {
+      const pass = sessionStorage.getItem("admin_pass");
+      if (!pass) return null;
+      return "Basic " + btoa("admin:" + pass);
+    }
+
+    async function apiFetch(path, body) {
+      let auth = getAuth();
+      if (!auth) {
+        const pass = prompt("管理パスワードを入力してください:");
+        if (!pass) return null;
+        sessionStorage.setItem("admin_pass", pass);
+        auth = "Basic " + btoa("admin:" + pass);
+      }
+      const res = await fetch(path, {
+        method: "POST",
+        headers: { "Content-Type": "application/json", "Authorization": auth },
+        body: JSON.stringify(body),
+      });
+      if (res.status === 401) {
+        sessionStorage.removeItem("admin_pass");
+        showMsg(body._msgId, "パスワードが違います", false);
+        return null;
+      }
+      return res.json();
+    }
+
+    function showMsg(id, text, ok) {
+      const el = document.getElementById(id);
+      el.textContent = text;
+      el.className = "msg " + (ok ? "ok" : "err");
+    }
+
+    async function deleteCourse() {
+      const courseId = document.getElementById("del-course-id").value.trim();
+      const reason   = parseInt(document.getElementById("del-reason").value);
+      if (!courseId) { showMsg("del-msg", "コースIDを入力してください", false); return; }
+      const data = await apiFetch("/api/delete-course", { courseId, reason, _msgId: "del-msg" });
+      if (!data) return;
+      if (data.ok) showMsg("del-msg", "削除し、通知を保存しました", true);
+      else showMsg("del-msg", data.error || "エラーが発生しました", false);
+    }
+
+    async function banUser() {
+      const username = document.getElementById("ban-username").value.trim();
+      const duration = document.getElementById("ban-duration").value;
+      if (!username) { showMsg("ban-msg", "ユーザー名を入力してください", false); return; }
+      const data = await apiFetch("/api/ban-user", { username, duration, _msgId: "ban-msg" });
+      if (!data) return;
+      if (data.ok) showMsg("ban-msg", "BANし、通知を保存しました", true);
+      else showMsg("ban-msg", data.error || "エラーが発生しました", false);
+    }
+  </script>
+</body>
+</html>

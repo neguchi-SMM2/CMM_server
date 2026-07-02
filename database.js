@@ -23,6 +23,7 @@ async function initDB() {
       id            TEXT    PRIMARY KEY,
       title         TEXT    NOT NULL,
       author        TEXT    NOT NULL,
+      username      TEXT    NOT NULL DEFAULT '',
       stage_data    TEXT    NOT NULL,
       posted_at     BIGINT  NOT NULL,
       play_count    INT     NOT NULL DEFAULT 0,
@@ -30,6 +31,7 @@ async function initDB() {
       clear_count   INT     NOT NULL DEFAULT 0,
       like_count    INT     NOT NULL DEFAULT 0
     );
+    ALTER TABLE courses ADD COLUMN IF NOT EXISTS username TEXT NOT NULL DEFAULT '';
 
     CREATE TABLE IF NOT EXISTS likes (
       id         SERIAL  PRIMARY KEY,
@@ -38,9 +40,18 @@ async function initDB() {
       created_at BIGINT  NOT NULL DEFAULT EXTRACT(EPOCH FROM NOW())::BIGINT,
       UNIQUE (username, course_id)
     );
-    -- 既存テーブルにcreated_atがなければ追加
     ALTER TABLE likes ADD COLUMN IF NOT EXISTS
       created_at BIGINT NOT NULL DEFAULT EXTRACT(EPOCH FROM NOW())::BIGINT;
+
+    CREATE TABLE IF NOT EXISTS notifications (
+      username   TEXT    PRIMARY KEY,
+      cmd        INT     NOT NULL
+    );
+
+    CREATE TABLE IF NOT EXISTS bans (
+      username   TEXT    PRIMARY KEY,
+      expires_at BIGINT  NOT NULL
+    );
 
     CREATE INDEX IF NOT EXISTS idx_courses_likes   ON courses(like_count DESC);
     CREATE INDEX IF NOT EXISTS idx_courses_posted  ON courses(posted_at DESC);
@@ -53,7 +64,7 @@ async function initDB() {
 }
 
 // ─────────────────────────────────────────────
-// コースID生成（A〜Z, 0〜9の3文字×3ブロック）
+// コースID生成（a〜z, 0〜9の3文字×3ブロック）
 // ─────────────────────────────────────────────
 const COURSE_ID_CHARS = "abcdefghijklmnopqrstuvwxyz0123456789";
 
@@ -74,7 +85,7 @@ function minutesSince2000() {
 // ─────────────────────────────────────────────
 // コース保存
 // ─────────────────────────────────────────────
-async function saveCourse(title, author, stageData) {
+async function saveCourse(title, author, username, stageData) {
   // 同一ステージデータの重複チェック
   const { rows: dupRows } = await pool.query(
     "SELECT 1 FROM courses WHERE stage_data=$1", [stageData]
@@ -90,9 +101,9 @@ async function saveCourse(title, author, stageData) {
   }
   const postedAt = minutesSince2000();
   await pool.query(
-    `INSERT INTO courses (id, title, author, stage_data, posted_at)
-     VALUES ($1, $2, $3, $4, $5)`,
-    [id, title, author, stageData, postedAt]
+    `INSERT INTO courses (id, title, author, username, stage_data, posted_at)
+     VALUES ($1, $2, $3, $4, $5, $6)`,
+    [id, title, author, username, stageData, postedAt]
   );
   return { id };
 }
@@ -112,13 +123,12 @@ const INFO_COLS = `id, title, author, like_count, play_count, attempt_count, cle
 
 async function getRandomCourses(limit) {
   const { rows } = await pool.query(
-    `SELECT ${INFO_COLS} FROM courses ORDER BY posted_at + (RANDOM() * 1080) DESC LIMIT $1`, [limit]
+    `SELECT ${INFO_COLS} FROM courses ORDER BY posted_at + (RANDOM() * 2880) DESC LIMIT $1`, [limit]
   );
   return rows;
 }
 
 async function getWeeklyRanking(limit) {
-  // 過去7日間（604800秒）のいいね数で集計
   const since = Math.floor(Date.now() / 1000) - 7 * 24 * 60 * 60;
   const { rows } = await pool.query(
     `SELECT c.id, c.title, c.author, c.like_count, c.play_count,
@@ -131,7 +141,6 @@ async function getWeeklyRanking(limit) {
      LIMIT $2`,
     [since, limit]
   );
-  // weekly_countをlike_countとして上書きしてencodeCourseInfoで使えるようにする
   return rows.map(r => ({ ...r, like_count: parseInt(r.like_count), _weekly_count: parseInt(r.weekly_count) }));
 }
 
@@ -178,14 +187,9 @@ async function incrementClear(courseId) {
   );
 }
 
-const LIKES_MAX = 50000; // likesテーブルの最大件数
+const LIKES_MAX = 50000;
 
-/**
- * いいね処理
- * @returns {{ alreadyLiked: boolean }}
- */
 async function addLike(username, courseId) {
-  // すでにいいね済みか確認
   const { rows } = await pool.query(
     "SELECT 1 FROM likes WHERE username=$1 AND course_id=$2", [username, courseId]
   );
@@ -200,7 +204,6 @@ async function addLike(username, courseId) {
     "UPDATE courses SET like_count=like_count+1 WHERE id=$1", [courseId]
   );
 
-  // 5万件を超えたら古いものを削除
   const { rows: countRows } = await pool.query("SELECT COUNT(*) FROM likes");
   const count = parseInt(countRows[0].count, 10);
   if (count > LIKES_MAX) {
@@ -216,7 +219,6 @@ async function addLike(username, courseId) {
   return { alreadyLiked: false };
 }
 
-// 古いいいねの削除（7日以上前のものを定期削除してDBを軽量に保つ）
 async function deleteOldLikes() {
   const cutoff = Math.floor(Date.now() / 1000) - 7 * 24 * 60 * 60;
   const { rowCount } = await pool.query(
@@ -225,9 +227,52 @@ async function deleteOldLikes() {
   if (rowCount > 0) console.log(`🗑️ 古いいいねを ${rowCount} 件削除しました`);
 }
 
-// 後方互換用（scheduleWeeklyResetから呼ばれる）
 async function resetWeeklyLikes() {
   await deleteOldLikes();
+}
+
+// ─────────────────────────────────────────────
+// 通知
+// ─────────────────────────────────────────────
+async function upsertNotification(username, cmd) {
+  await pool.query(
+    `INSERT INTO notifications (username, cmd) VALUES ($1, $2)
+     ON CONFLICT (username) DO UPDATE SET cmd = EXCLUDED.cmd`,
+    [username, cmd]
+  );
+}
+
+async function getAndDeleteNotification(username) {
+  const { rows } = await pool.query(
+    "DELETE FROM notifications WHERE username=$1 RETURNING cmd", [username]
+  );
+  return rows[0] || null;
+}
+
+// ─────────────────────────────────────────────
+// BAN
+// ─────────────────────────────────────────────
+async function banUser(username, expiresAt) {
+  await pool.query(
+    `INSERT INTO bans (username, expires_at) VALUES ($1, $2)
+     ON CONFLICT (username) DO UPDATE SET expires_at = EXCLUDED.expires_at`,
+    [username, expiresAt]
+  );
+}
+
+async function isUserBanned(username) {
+  const now = Math.floor(Date.now() / 1000);
+  const { rows } = await pool.query(
+    "SELECT 1 FROM bans WHERE username=$1 AND expires_at > $2", [username, now]
+  );
+  return rows.length > 0;
+}
+
+async function deleteCourse(courseId) {
+  const { rows } = await pool.query(
+    "DELETE FROM courses WHERE id=$1 RETURNING username", [courseId]
+  );
+  return rows[0] || null; // { username } or null
 }
 
 module.exports = {
@@ -237,4 +282,6 @@ module.exports = {
   searchByCourseId, searchByAuthor,
   incrementPlay, incrementAttempt, incrementClear, addLike,
   resetWeeklyLikes, deleteOldLikes, minutesSince2000,
+  upsertNotification, getAndDeleteNotification,
+  banUser, isUserBanned, deleteCourse,
 };

@@ -5,6 +5,8 @@
 
 const WebSocket = require("ws");
 const http      = require("http");
+const fs        = require("fs");
+const path      = require("path");
 const { Session, Cloud } = require("scratchcloud");
 
 const db = require("./database");
@@ -16,10 +18,11 @@ const {
   encodeText, decodeText,
 } = require("./encode");
 
-const USERNAME   = process.env.SCRATCH_USERNAME;
-const PASSWORD   = process.env.SCRATCH_PASSWORD;
-const PROJECT_ID = parseInt(process.env.SCRATCH_PROJECT_ID, 10);
-const PORT       = parseInt(process.env.PORT || "3000", 10);
+const USERNAME      = process.env.SCRATCH_USERNAME;
+const PASSWORD      = process.env.SCRATCH_PASSWORD;
+const PROJECT_ID    = parseInt(process.env.SCRATCH_PROJECT_ID, 10);
+const PORT          = parseInt(process.env.PORT || "3000", 10);
+const ADMIN_PASSWORD = process.env.ADMIN_PASSWORD || "";
 
 const REQUEST_VARS = ["☁ request1", "☁ request2"];
 const CLOUD_VARS   = [
@@ -39,6 +42,7 @@ const CMD = {
   ATTEMPT:      22,
   CLEAR:        23,
   GET_COURSE:   30,
+  GET_NOTIFY:   40,
 };
 
 const SEND_INTERVAL = 120;
@@ -120,7 +124,7 @@ async function handleRequest(s, setter) {
 
   // CMD=10〜12: ランキング・ランダム
   if (cmd === CMD.RANDOM || cmd === CMD.WEEKLY || cmd === CMD.ALL_TIME) {
-    const { value: limit } = decodeLen(s, pos);
+    const { value: limit, next: p3 } = decodeLen(s, pos); pos = p3;
     if (!isValidNum(limit) || limit <= 0) { console.warn("⚠️ 不正なlimit:", limit); return; }
     let rows;
     if      (cmd === CMD.RANDOM)   rows = await db.getRandomCourses(limit);
@@ -165,7 +169,7 @@ async function handleRequest(s, setter) {
     if (!isValidStr(username) || !isValidStr(courseId)) {
       console.warn("⚠️ 不正なusername/courseId:", username, courseId); return;
     }
-    if (cmd === CMD.PLAY)    { await db.incrementPlay(courseId); db.incrementAttempt(courseId); return; }
+    if (cmd === CMD.PLAY)    { await db.incrementPlay(courseId);    return; }
     if (cmd === CMD.ATTEMPT) { await db.incrementAttempt(courseId); return; }
     if (cmd === CMD.CLEAR)   { await db.incrementClear(courseId);   return; }
     if (cmd === CMD.LIKE) {
@@ -189,6 +193,19 @@ async function handleRequest(s, setter) {
     return;
   }
 
+  // CMD=40: 通知取得
+  if (cmd === CMD.GET_NOTIFY) {
+    const { value: username } = decodeAlphabet(s, pos);
+    if (!isValidStr(username)) { console.warn("⚠️ 不正なusername:", username); return; }
+    const notification = await db.getAndDeleteNotification(username);
+    if (notification) {
+      await sendCloud(setter, randomCloud(), encodeLenLen(parseInt(userId)) + encodeLen(notification.cmd));
+    } else {
+      await sendCloud(setter, randomCloud(), encodeLenLen(parseInt(userId)) + encodeLen(500));
+    }
+    return;
+  }
+
   console.warn("⚠️ 未知のコマンドコード:", cmd);
 }
 
@@ -200,18 +217,31 @@ async function handleUploadChunk(s, setter) {
   const { userId, next: p1 } = parseUserId(s, pos); pos = p1;
   const { cmd, next: p2 } = parseCmd(s, pos); pos = p2;
   if (cmd !== CMD.UPLOAD) return;
-  const { value: totalChunks, next: p3 } = decodeLen(s, pos); pos = p3;
-  const { value: seq, next: p4 } = decodeLen(s, pos); pos = p4;
+
+  // username取得
+  const { value: username, next: p3 } = decodeAlphabet(s, pos); pos = p3;
+  if (!isValidStr(username)) { console.warn("⚠️ 不正なusername:", username); return; }
+
+  // BANチェック
+  const banned = await db.isUserBanned(username);
+  if (banned) {
+    await sendCloud(setter, randomCloud(), encodeLenLen(parseInt(userId)) + encodeLen(103));
+    return;
+  }
+
+  const { value: totalChunks, next: p4 } = decodeLen(s, pos); pos = p4;
+  const { value: seq, next: p5 } = decodeLen(s, pos); pos = p5;
 
   if (!uploadBuffers.has(userId)) {
     const timer = setTimeout(() => uploadBuffers.delete(userId), UPLOAD_TIMEOUT);
-    uploadBuffers.set(userId, { totalChunks, chunks: new Map(), timer });
+    uploadBuffers.set(userId, { totalChunks, chunks: new Map(), timer, username });
   }
   const buf = uploadBuffers.get(userId);
   buf.totalChunks = totalChunks;
+  buf.username = username;
 
   if (seq === 0) {
-    const { value: title, next: p5 } = decodeText(s, pos); pos = p5;
+    const { value: title, next: p6 } = decodeText(s, pos); pos = p6;
     const { value: author } = decodeAlphabet(s, pos);
     buf.title  = title;
     buf.author = author;
@@ -227,7 +257,7 @@ async function handleUploadChunk(s, setter) {
       let stageData = "";
       for (let i = 1; i <= totalChunks; i++) stageData += buf.chunks.get(i);
       try {
-        const result = await db.saveCourse(buf.title, buf.author, stageData);
+        const result = await db.saveCourse(buf.title, buf.author, buf.username, stageData);
         if (result.duplicate) {
           await sendCloud(setter, randomCloud(), encodeLenLen(parseInt(userId)) + encodeLen(102));
         } else {
@@ -259,6 +289,85 @@ async function onMessage(name, value, setter) {
   } catch (e) {
     console.error(`❌ メッセージ処理エラー (${name}):`, e.message);
   }
+}
+
+// ─────────────────────────────────────────────
+// 管理ページ用APIハンドラ
+// ─────────────────────────────────────────────
+function checkAuth(req) {
+  const auth = req.headers["authorization"] || "";
+  const b64  = auth.replace(/^Basic /, "");
+  const decoded = Buffer.from(b64, "base64").toString("utf8");
+  const [, pass] = decoded.split(":");
+  return pass === ADMIN_PASSWORD;
+}
+
+async function handleManageAPI(req, res) {
+  if (!checkAuth(req)) {
+    res.writeHead(401, { "WWW-Authenticate": 'Basic realm="manage"', "Content-Type": "application/json" });
+    res.end(JSON.stringify({ error: "unauthorized" }));
+    return;
+  }
+
+  const url = new URL(req.url, `http://localhost`);
+  const pathname = url.pathname;
+
+  // POST /api/delete-course
+  if (req.method === "POST" && pathname === "/api/delete-course") {
+    let body = "";
+    req.on("data", d => body += d);
+    req.on("end", async () => {
+      try {
+        const { courseId, reason } = JSON.parse(body);
+        if (!courseId || !reason) {
+          res.writeHead(400, { "Content-Type": "application/json" });
+          res.end(JSON.stringify({ error: "courseId, reason は必須です" }));
+          return;
+        }
+        const deleted = await db.deleteCourse(courseId);
+        if (!deleted) {
+          res.writeHead(404, { "Content-Type": "application/json" });
+          res.end(JSON.stringify({ error: "コースが見つかりません" }));
+          return;
+        }
+        await db.upsertNotification(deleted.username, reason);
+        res.writeHead(200, { "Content-Type": "application/json" });
+        res.end(JSON.stringify({ ok: true }));
+      } catch (e) {
+        res.writeHead(500, { "Content-Type": "application/json" });
+        res.end(JSON.stringify({ error: e.message }));
+      }
+    });
+    return;
+  }
+
+  // POST /api/ban-user
+  if (req.method === "POST" && pathname === "/api/ban-user") {
+    let body = "";
+    req.on("data", d => body += d);
+    req.on("end", async () => {
+      try {
+        const { username, duration } = JSON.parse(body);
+        if (!username || !duration) {
+          res.writeHead(400, { "Content-Type": "application/json" });
+          res.end(JSON.stringify({ error: "username, duration は必須です" }));
+          return;
+        }
+        const expiresAt = Math.floor(Date.now() / 1000) + parseInt(duration, 10);
+        await db.banUser(username, expiresAt);
+        await db.upsertNotification(username, 400);
+        res.writeHead(200, { "Content-Type": "application/json" });
+        res.end(JSON.stringify({ ok: true }));
+      } catch (e) {
+        res.writeHead(500, { "Content-Type": "application/json" });
+        res.end(JSON.stringify({ error: e.message }));
+      }
+    });
+    return;
+  }
+
+  res.writeHead(404, { "Content-Type": "application/json" });
+  res.end(JSON.stringify({ error: "not found" }));
 }
 
 class CloudManager {
@@ -308,14 +417,10 @@ class CloudManager {
       console.error("❌ Scratch 接続失敗:", e.message);
       console.log("⚠️ Scratch接続をスキップ。TurboWarpのみで運用します。");
       this.scratch.conn = null;
-      // Scratch接続失敗時は長めの間隔でリトライ
       setTimeout(() => {
         this.scratch.isReconnecting = false;
         this.scheduleReconnect("scratch");
-      }, 60000); // 1分後にリトライ
-    } finally {
-      // isReconnectingはタイムアウト後にfalseにするのでここではリセットしない
-      // （二重接続防止のため）
+      }, 60000);
     }
   }
 
@@ -369,7 +474,6 @@ class CloudManager {
   }
 
   scheduleWeeklyReset() {
-    // 毎日00:00 JSTに7日以上前のいいねを削除
     const now  = new Date();
     const next = new Date(now);
     next.setHours(0, 0, 0, 0);
@@ -385,7 +489,6 @@ class CloudManager {
   async start() {
     process.on("uncaughtException", e => {
       console.error("❌ uncaughtException:", e.message);
-      // scratchcloudの内部エラーはサーバーを落とさず無視
     });
     process.on("unhandledRejection", e => {
       console.error("❌ unhandledRejection:", e);
@@ -393,7 +496,25 @@ class CloudManager {
     await db.initDB();
     await Promise.allSettled([this.connectScratch(), Promise.resolve(this.connectTurboWarp())]);
     this.scheduleWeeklyReset();
-    const server = http.createServer((req, res) => {
+
+    const server = http.createServer(async (req, res) => {
+      const url = new URL(req.url, `http://localhost`);
+
+      // 管理ページ HTML
+      if (url.pathname === "/manage") {
+        const html = fs.readFileSync(path.join(__dirname, "manage.html"), "utf8");
+        res.writeHead(200, { "Content-Type": "text/html; charset=utf-8" });
+        res.end(html);
+        return;
+      }
+
+      // 管理API
+      if (url.pathname.startsWith("/api/")) {
+        await handleManageAPI(req, res);
+        return;
+      }
+
+      // ヘルスチェック
       res.writeHead(200, { "Content-Type": "application/json" });
       res.end(JSON.stringify({
         status:    "ok",

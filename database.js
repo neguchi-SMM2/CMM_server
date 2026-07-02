@@ -137,7 +137,7 @@ async function getWeeklyRanking(limit) {
      FROM courses c
      LEFT JOIN likes l ON l.course_id = c.id AND l.created_at >= $1
      GROUP BY c.id
-     ORDER BY weekly_count DESC, c.like_count DESC, c.play_count DESC
+     ORDER BY weekly_count DESC, c.play_count DESC
      LIMIT $2`,
     [since, limit]
   );

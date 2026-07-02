@@ -26,12 +26,12 @@
   </style>
 </head>
 <body>
-  <h1>🛡️ 管理ページ</h1>
+  <h1>管理ページ</h1>
   <div class="cards">
 
     <!-- コース削除 -->
     <div class="card">
-      <h2>🗑️ コース削除 &amp; 通知</h2>
+      <h2>コース削除 &amp; 通知</h2>
       <label>コースID</label>
       <input id="del-course-id" type="text" placeholder="xxx-xxx-xxx">
       <label>削除理由</label>
@@ -47,11 +47,13 @@
 
     <!-- ユーザーBAN -->
     <div class="card">
-      <h2>🔨 ユーザーBAN</h2>
+      <h2>ユーザーBAN</h2>
       <label>ユーザー名</label>
       <input id="ban-username" type="text" placeholder="username">
       <label>BAN期間</label>
       <select id="ban-duration">
+        <option value="25200">7時間</option>
+        <option value="57600">16時間</option>
         <option value="86400">1日</option>
         <option value="259200">3日</option>
         <option value="604800">7日</option>

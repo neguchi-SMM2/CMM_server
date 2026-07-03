@@ -220,7 +220,7 @@ async function addLike(username, courseId) {
 }
 
 async function deleteOldLikes() {
-  const cutoff = Math.floor(Date.now() / 1000) - 7 * 24 * 60 * 60;
+  const cutoff = Math.floor(Date.now() / 1000) - 30 * 24 * 60 * 60;
   const { rowCount } = await pool.query(
     "DELETE FROM likes WHERE created_at < $1", [cutoff]
   );

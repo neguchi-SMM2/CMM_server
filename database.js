@@ -171,7 +171,7 @@ async function searchByAuthor(author, limit) {
 // ─────────────────────────────────────────────
 async function incrementPlay(courseId) {
   await pool.query(
-    "UPDATE courses SET play_count=play_count+1 WHERE id=$1", [courseId]
+    "UPDATE courses SET play_count=play_count+1 attempt_count=attempt_count+1 WHERE id=$1", [courseId]
   );
 }
 

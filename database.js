@@ -137,11 +137,11 @@ async function getWeeklyRanking(limit) {
      FROM courses c
      LEFT JOIN likes l ON l.course_id = c.id AND l.created_at >= $1
      GROUP BY c.id
-     ORDER BY weekly_count DESC, c.play_count DESC
+     ORDER BY weekly_count DESC, c.like_count DESC, c.play_count DESC
      LIMIT $2`,
     [since, limit]
   );
-  return rows.map(r => ({ ...r, like_count: parseInt(r.like_count), _weekly_count: parseInt(r.weekly_count) }));
+  return rows.map(r => ({ ...r, like_count: parseInt(r.weekly_count), total_like_count: parseInt(r.like_count) }));
 }
 
 async function getAllTimeRanking(limit) {
@@ -220,7 +220,7 @@ async function addLike(username, courseId) {
 }
 
 async function deleteOldLikes() {
-  const cutoff = Math.floor(Date.now() / 1000) - 30 * 24 * 60 * 60;
+  const cutoff = Math.floor(Date.now() / 1000) - 7 * 24 * 60 * 60;
   const { rowCount } = await pool.query(
     "DELETE FROM likes WHERE created_at < $1", [cutoff]
   );

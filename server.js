@@ -169,7 +169,7 @@ async function handleRequest(s, setter) {
     if (!isValidStr(username) || !isValidStr(courseId)) {
       console.warn("⚠️ 不正なusername/courseId:", username, courseId); return;
     }
-    if (cmd === CMD.PLAY)    { await db.incrementPlay(courseId); await db.incrementAttempt(courseId); return; }
+    if (cmd === CMD.PLAY)    { await db.incrementPlay(courseId);    return; }
     if (cmd === CMD.ATTEMPT) { await db.incrementAttempt(courseId); return; }
     if (cmd === CMD.CLEAR)   { await db.incrementClear(courseId);   return; }
     if (cmd === CMD.LIKE) {
@@ -474,16 +474,11 @@ class CloudManager {
   }
 
   scheduleWeeklyReset() {
-    const now  = new Date();
-    const next = new Date(now);
-    next.setHours(0, 0, 0, 0);
-    next.setDate(next.getDate() + 1);
-    const ms = next - now;
-    console.log(`📅 次回いいねクリーンアップ: ${next.toLocaleString("ja-JP")}`);
-    setTimeout(async () => {
+    setInterval(async () => {
       await db.deleteOldLikes().catch(e => console.error("いいねクリーンアップ失敗:", e));
-      this.scheduleWeeklyReset();
-    }, ms);
+      console.log("🗑️ いいねクリーンアップ実行");
+    }, 60 * 60 * 1000);
+    console.log("📅 いいねクリーンアップ: 1時間ごとに実行");
   }
 
   async start() {

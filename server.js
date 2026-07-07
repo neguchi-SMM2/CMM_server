@@ -43,6 +43,7 @@ const CMD = {
   CLEAR:        23,
   GET_COURSE:   30,
   GET_NOTIFY:   40,
+  BAN_USERNAME:600,
 };
 
 const SEND_INTERVAL = 120;
@@ -169,10 +170,15 @@ async function handleRequest(s, setter) {
     if (!isValidStr(username) || !isValidStr(courseId)) {
       console.warn("⚠️ 不正なusername/courseId:", username, courseId); return;
     }
-    if (cmd === CMD.PLAY)    { await db.incrementPlay(courseId); await db.incrementAttempt(courseId); return; }
+    if (cmd === CMD.PLAY)    { await db.incrementPlay(courseId);    return; }
     if (cmd === CMD.ATTEMPT) { await db.incrementAttempt(courseId); return; }
     if (cmd === CMD.CLEAR)   { await db.incrementClear(courseId);   return; }
     if (cmd === CMD.LIKE) {
+      const banned = await db.isUserBanned(username);
+      if (banned) {
+        await sendCloud(setter, randomCloud(), encodeLenLen(parseInt(userId)) + encodeLen(405));
+        return;
+      }
       const { alreadyLiked } = await db.addLike(username, courseId);
       if (alreadyLiked) {
         await sendCloud(setter, randomCloud(), encodeLenLen(parseInt(userId)) + encodeLen(200));
@@ -203,6 +209,16 @@ async function handleRequest(s, setter) {
     } else {
       await sendCloud(setter, randomCloud(), encodeLenLen(parseInt(userId)) + encodeLen(500));
     }
+    return;
+  }
+
+  // CMD=600: ユーザー名変更検知→自動BAN
+  if (cmd === CMD.BAN_USERNAME) {
+    const { value: username } = decodeAlphabet(s, pos);
+    if (!isValidStr(username)) { console.warn("⚠️ 不正なusername:", username); return; }
+    const expiresAt = Math.floor(Date.now() / 1000) + 30 * 24 * 60 * 60; // 30日BAN
+    await db.banUser(username, expiresAt);
+    console.log(`🔨 自動BAN: ${username}`);
     return;
   }
 

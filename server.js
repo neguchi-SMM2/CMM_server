@@ -216,7 +216,7 @@ async function handleRequest(s, setter) {
   if (cmd === CMD.BAN_USERNAME) {
     const { value: username } = decodeAlphabet(s, pos);
     if (!isValidStr(username)) { console.warn("⚠️ 不正なusername:", username); return; }
-    const expiresAt = Math.floor(Date.now() / 1000) + 30 * 24 * 60 * 60; // 30日BAN
+    const expiresAt = Math.floor(Date.now() / 1000) + 15 * 60; // 15分BAN
     await db.banUser(username, expiresAt);
     console.log(`🔨 自動BAN: ${username}`);
     return;

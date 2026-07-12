@@ -123,6 +123,8 @@ async function handleRequest(s, setter) {
   const { cmd, next: p2 } = parseCmd(s, pos); pos = p2;
   if (!isValidNum(cmd)) { console.warn("⚠️ 不正なコマンドコード:", cmd); return; }
 
+  console.log("📡 受信", cmd, userId)
+  
   // CMD=10〜12: ランキング・ランダム
   if (cmd === CMD.RANDOM || cmd === CMD.WEEKLY || cmd === CMD.ALL_TIME) {
     const { value: limit, next: p3 } = decodeLen(s, pos); pos = p3;

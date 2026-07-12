@@ -43,8 +43,8 @@ const CMD = {
   CLEAR:        23,
   GET_COURSE:   30,
   GET_NOTIFY:   40,
-  BAN_USERNAME:600,
   GET_STATS:    90,
+  BAN_USERNAME:600,
 };
 
 const SEND_INTERVAL = 120;
@@ -117,7 +117,7 @@ async function sendCourseData(setter, userId, stageData) {
 function isValidNum(value) { return typeof value === "number" && !isNaN(value) && isFinite(value); }
 function isValidStr(value) { return typeof value === "string" && value.length > 0; }
 
-async function handleRequest(s, setter, onlineUsers = 0) {
+async function handleRequest(s, setter, getOnlineUsers) {
   let pos = 0;
   const { userId, next: p1 } = parseUserId(s, pos); pos = p1;
   if (!userId || isNaN(parseInt(userId))) { console.warn("⚠️ 不正なユーザーID:", userId); return; }
@@ -224,7 +224,7 @@ async function handleRequest(s, setter, onlineUsers = 0) {
       + encodeLen(parseInt(stats.total_clears))
       + encodeLen(parseInt(stats.total_attempts))
       + encodeLen(parseInt(stats.weekly_courses))
-      + encodeLen(onlineUsers)
+      + encodeLen(getOnlineUsers())
       + (stats.latest_course_id ? encodeAlphabet(stats.latest_course_id) : encodeAlphabet("000-000-000"));
     await sendCloud(setter, randomCloud(), payload);
     return;
@@ -234,7 +234,7 @@ async function handleRequest(s, setter, onlineUsers = 0) {
   if (cmd === CMD.BAN_USERNAME) {
     const { value: username } = decodeAlphabet(s, pos);
     if (!isValidStr(username)) { console.warn("⚠️ 不正なusername:", username); return; }
-    const expiresAt = Math.floor(Date.now() / 1000) + 15 * 60; // 15分BAN
+    const expiresAt = Math.floor(Date.now() / 1000) + 15 * 60;
     await db.banUser(username, expiresAt);
     console.log(`🔨 自動BAN: ${username}`);
     return;
@@ -252,11 +252,9 @@ async function handleUploadChunk(s, setter) {
   const { cmd, next: p2 } = parseCmd(s, pos); pos = p2;
   if (cmd !== CMD.UPLOAD) return;
 
-  // username取得
   const { value: username, next: p3 } = decodeAlphabet(s, pos); pos = p3;
   if (!isValidStr(username)) { console.warn("⚠️ 不正なusername:", username); return; }
 
-  // BANチェック
   const banned = await db.isUserBanned(username);
   if (banned) {
     await sendCloud(setter, randomCloud(), encodeLenLen(parseInt(userId)) + encodeLen(103));
@@ -309,16 +307,17 @@ async function handleUploadChunk(s, setter) {
   }
 }
 
-async function onMessage(name, value, setter, onlineUsers = 0) {
+async function onMessage(name, value, setter, getOnlineUsers, trackUser) {
   const s = String(value);
   if (!s || s.length < 3) return;
   try {
     const { next: p1 } = parseUserId(s, 0);
     const { cmd }      = parseCmd(s, p1);
+    trackUser(s);
     if (cmd === CMD.UPLOAD) {
       await handleUploadChunk(s, setter);
     } else if (REQUEST_VARS.includes(name)) {
-      await handleRequest(s, setter, onlineUsers);
+      await handleRequest(s, setter, getOnlineUsers);
     }
   } catch (e) {
     console.error(`❌ メッセージ処理エラー (${name}):`, e.message);
@@ -410,7 +409,28 @@ class CloudManager {
     this.turbowarp  = { conn: null, isReconnecting: false, delay: 2000 };
     this.queue      = [];
     this.processing = false;
-    this.onlineUsers = 0;
+    this.recentUsers = new Map(); // username -> lastSeenAt(unixtime)
+  }
+
+  // 過去5分以内にリクエストを送ってきたユーザーを記録
+  trackUser(s) {
+    try {
+      const { next: p1 } = parseUserId(s, 0);
+      const { next: p2 } = parseCmd(s, p1);
+      const { value: username } = decodeAlphabet(s, p2);
+      if (isValidStr(username)) {
+        this.recentUsers.set(username, Math.floor(Date.now() / 1000));
+      }
+    } catch (_) {}
+  }
+
+  // 5分以内のユーザー数を返す
+  getOnlineUsers() {
+    const cutoff = Math.floor(Date.now() / 1000) - 5 * 60;
+    for (const [username, lastSeen] of this.recentUsers) {
+      if (lastSeen < cutoff) this.recentUsers.delete(username);
+    }
+    return this.recentUsers.size;
   }
 
   enqueue(name, value, setter) {
@@ -422,7 +442,11 @@ class CloudManager {
     this.processing = true;
     while (this.queue.length > 0) {
       const { name, value, setter } = this.queue.shift();
-      await onMessage(name, value, setter, this.onlineUsers);
+      await onMessage(
+        name, value, setter,
+        () => this.getOnlineUsers(),
+        (s) => this.trackUser(s)
+      );
     }
     this.processing = false;
   }
@@ -474,7 +498,6 @@ class CloudManager {
         this.turbowarp.conn  = ws;
         this.turbowarp.delay = 2000;
         this.turbowarp.isReconnecting = false;
-        this.onlineUsers++;
         console.log("✅ TurboWarp Cloud 接続成功");
         console.log("🔄 TurboWarp クラウド変数を初期化中...");
         for (const v of [...REQUEST_VARS, ...CLOUD_VARS]) { await setter(v, "0"); await sleep(SEND_INTERVAL); }
@@ -491,7 +514,7 @@ class CloudManager {
           }
         } catch (e) { console.warn("⚠️ TW メッセージ解析失敗:", e.message); }
       });
-      ws.on("close", () => { console.warn("⚠️ TurboWarp 切断"); this.turbowarp.conn = null; this.turbowarp.isReconnecting = false; this.onlineUsers = Math.max(0, this.onlineUsers - 1); this.scheduleReconnect("turbowarp"); });
+      ws.on("close", () => { console.warn("⚠️ TurboWarp 切断"); this.turbowarp.conn = null; this.turbowarp.isReconnecting = false; this.scheduleReconnect("turbowarp"); });
       ws.on("error", e => { console.error("❌ TurboWarp エラー:", e.message); this.turbowarp.conn = null; this.turbowarp.isReconnecting = false; this.scheduleReconnect("turbowarp"); });
     } catch (e) {
       console.error("❌ TurboWarp 接続作成失敗:", e.message);
@@ -552,6 +575,7 @@ class CloudManager {
         scratch:   !!this.scratch.conn ? "connected" : "disconnected",
         turbowarp: this.turbowarp.conn?.readyState === WebSocket.OPEN ? "connected" : "disconnected",
         queue:     this.queue.length,
+        onlineUsers: this.getOnlineUsers(),
         uptime:    process.uptime(),
       }));
     });
@@ -559,7 +583,7 @@ class CloudManager {
     setInterval(() => {
       const s = this.scratch.conn    ? "✅" : "❌";
       const t = this.turbowarp.conn?.readyState === WebSocket.OPEN ? "✅" : "❌";
-      console.log(`💡 Health - Scratch:${s} TurboWarp:${t} Queue:${this.queue.length}`);
+      console.log(`💡 Health - Scratch:${s} TurboWarp:${t} Queue:${this.queue.length} Online:${this.getOnlineUsers()}`);
     }, 5 * 60 * 1000);
     const shutdown = () => {
       console.log("🛑 シャットダウン...");

@@ -171,7 +171,7 @@ async function handleRequest(s, setter, onlineUsers = 0) {
     if (!isValidStr(username) || !isValidStr(courseId)) {
       console.warn("⚠️ 不正なusername/courseId:", username, courseId); return;
     }
-    if (cmd === CMD.PLAY)    { await db.incrementPlay(courseId);    return; }
+    if (cmd === CMD.PLAY)    { await db.incrementPlay(courseId); await db.incrementAttempt(courseId); return; }
     if (cmd === CMD.ATTEMPT) { await db.incrementAttempt(courseId); return; }
     if (cmd === CMD.CLEAR)   { await db.incrementClear(courseId);   return; }
     if (cmd === CMD.LIKE) {

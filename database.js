@@ -32,6 +32,7 @@ async function initDB() {
       like_count    INT     NOT NULL DEFAULT 0
     );
     ALTER TABLE courses ADD COLUMN IF NOT EXISTS username TEXT NOT NULL DEFAULT '';
+    ALTER TABLE courses ADD COLUMN IF NOT EXISTS ip_address TEXT;
 
     CREATE TABLE IF NOT EXISTS likes (
       id         SERIAL  PRIMARY KEY,
@@ -85,7 +86,7 @@ function minutesSince2000() {
 // ─────────────────────────────────────────────
 // コース保存
 // ─────────────────────────────────────────────
-async function saveCourse(title, author, username, stageData) {
+async function saveCourse(title, author, username, stageData, ipAddress = null) {
   // 同一ステージデータの重複チェック
   const { rows: dupRows } = await pool.query(
     "SELECT 1 FROM courses WHERE stage_data=$1", [stageData]
@@ -101,9 +102,9 @@ async function saveCourse(title, author, username, stageData) {
   }
   const postedAt = minutesSince2000();
   await pool.query(
-    `INSERT INTO courses (id, title, author, username, stage_data, posted_at)
-     VALUES ($1, $2, $3, $4, $5, $6)`,
-    [id, title, author, username, stageData, postedAt]
+    `INSERT INTO courses (id, title, author, username, stage_data, posted_at, ip_address)
+     VALUES ($1, $2, $3, $4, $5, $6, $7)`,
+    [id, title, author, username, stageData, postedAt, ipAddress || null]
   );
   return { id };
 }
@@ -253,19 +254,41 @@ async function getAndDeleteNotification(username) {
 // BAN
 // ─────────────────────────────────────────────
 async function banUser(username, expiresAt) {
+  // usernameをBAN
   await pool.query(
     `INSERT INTO bans (username, expires_at) VALUES ($1, $2)
      ON CONFLICT (username) DO UPDATE SET expires_at = EXCLUDED.expires_at`,
     [username, expiresAt]
   );
+  // そのユーザーが過去に投稿したコースのIPアドレスも全てBAN
+  const { rows: ipRows } = await pool.query(
+    "SELECT DISTINCT ip_address FROM courses WHERE username=$1 AND ip_address IS NOT NULL",
+    [username]
+  );
+  for (const { ip_address } of ipRows) {
+    await pool.query(
+      `INSERT INTO bans (username, expires_at) VALUES ($1, $2)
+       ON CONFLICT (username) DO UPDATE SET expires_at = EXCLUDED.expires_at`,
+      [ip_address, expiresAt]
+    );
+  }
 }
 
-async function isUserBanned(username) {
+async function isUserBanned(username, ipAddress = null) {
   const now = Math.floor(Date.now() / 1000);
+  // usernameチェック
   const { rows } = await pool.query(
     "SELECT 1 FROM bans WHERE username=$1 AND expires_at > $2", [username, now]
   );
-  return rows.length > 0;
+  if (rows.length > 0) return true;
+  // IPアドレスチェック
+  if (ipAddress) {
+    const { rows: ipRows } = await pool.query(
+      "SELECT 1 FROM bans WHERE username=$1 AND expires_at > $2", [ipAddress, now]
+    );
+    if (ipRows.length > 0) return true;
+  }
+  return false;
 }
 
 async function deleteCourse(courseId) {
@@ -273,6 +296,23 @@ async function deleteCourse(courseId) {
     "DELETE FROM courses WHERE id=$1 RETURNING username", [courseId]
   );
   return rows[0] || null; // { username } or null
+}
+
+async function getStats() {
+  // posted_atは2000年1月1日からの分数なので7日分は60*24*7=10080分
+  const weekAgo = minutesSince2000() - 10080;
+  const { rows } = await pool.query(`
+    SELECT
+      COUNT(*)                                          AS total_courses,
+      COALESCE(SUM(play_count), 0)                      AS total_plays,
+      COALESCE(SUM(like_count), 0)                      AS total_likes,
+      COALESCE(SUM(clear_count), 0)                     AS total_clears,
+      COALESCE(SUM(attempt_count), 0)                   AS total_attempts,
+      COUNT(*) FILTER (WHERE posted_at >= $1)           AS weekly_courses,
+      (SELECT id FROM courses ORDER BY posted_at DESC LIMIT 1) AS latest_course_id
+    FROM courses
+  `, [weekAgo]);
+  return rows[0];
 }
 
 module.exports = {
@@ -283,5 +323,5 @@ module.exports = {
   incrementPlay, incrementAttempt, incrementClear, addLike,
   resetWeeklyLikes, deleteOldLikes, minutesSince2000,
   upsertNotification, getAndDeleteNotification,
-  banUser, isUserBanned, deleteCourse,
+  banUser, isUserBanned, deleteCourse, getStats,
 };

@@ -44,6 +44,7 @@ const CMD = {
   GET_COURSE:   30,
   GET_NOTIFY:   40,
   BAN_USERNAME:600,
+  GET_STATS:    90,
 };
 
 const SEND_INTERVAL = 120;
@@ -116,15 +117,13 @@ async function sendCourseData(setter, userId, stageData) {
 function isValidNum(value) { return typeof value === "number" && !isNaN(value) && isFinite(value); }
 function isValidStr(value) { return typeof value === "string" && value.length > 0; }
 
-async function handleRequest(s, setter) {
+async function handleRequest(s, setter, onlineUsers = 0) {
   let pos = 0;
   const { userId, next: p1 } = parseUserId(s, pos); pos = p1;
   if (!userId || isNaN(parseInt(userId))) { console.warn("⚠️ 不正なユーザーID:", userId); return; }
   const { cmd, next: p2 } = parseCmd(s, pos); pos = p2;
   if (!isValidNum(cmd)) { console.warn("⚠️ 不正なコマンドコード:", cmd); return; }
 
-  console.log("📡 受信", cmd, userId)
-  
   // CMD=10〜12: ランキング・ランダム
   if (cmd === CMD.RANDOM || cmd === CMD.WEEKLY || cmd === CMD.ALL_TIME) {
     const { value: limit, next: p3 } = decodeLen(s, pos); pos = p3;
@@ -172,7 +171,7 @@ async function handleRequest(s, setter) {
     if (!isValidStr(username) || !isValidStr(courseId)) {
       console.warn("⚠️ 不正なusername/courseId:", username, courseId); return;
     }
-    if (cmd === CMD.PLAY)    { await db.incrementPlay(courseId); await db.incrementAttempt(courseId); return; }
+    if (cmd === CMD.PLAY)    { await db.incrementPlay(courseId);    return; }
     if (cmd === CMD.ATTEMPT) { await db.incrementAttempt(courseId); return; }
     if (cmd === CMD.CLEAR)   { await db.incrementClear(courseId);   return; }
     if (cmd === CMD.LIKE) {
@@ -211,6 +210,23 @@ async function handleRequest(s, setter) {
     } else {
       await sendCloud(setter, randomCloud(), encodeLenLen(parseInt(userId)) + encodeLen(500));
     }
+    return;
+  }
+
+  // CMD=90: 統計データ取得
+  if (cmd === CMD.GET_STATS) {
+    const stats = await db.getStats();
+    const payload = encodeLenLen(parseInt(userId))
+      + encodeLen(CMD.GET_STATS)
+      + encodeLen(parseInt(stats.total_courses))
+      + encodeLen(parseInt(stats.total_plays))
+      + encodeLen(parseInt(stats.total_likes))
+      + encodeLen(parseInt(stats.total_clears))
+      + encodeLen(parseInt(stats.total_attempts))
+      + encodeLen(parseInt(stats.weekly_courses))
+      + encodeLen(onlineUsers)
+      + (stats.latest_course_id ? encodeAlphabet(stats.latest_course_id) : encodeAlphabet("000-000-000"));
+    await sendCloud(setter, randomCloud(), payload);
     return;
   }
 
@@ -293,7 +309,7 @@ async function handleUploadChunk(s, setter) {
   }
 }
 
-async function onMessage(name, value, setter) {
+async function onMessage(name, value, setter, onlineUsers = 0) {
   const s = String(value);
   if (!s || s.length < 3) return;
   try {
@@ -302,7 +318,7 @@ async function onMessage(name, value, setter) {
     if (cmd === CMD.UPLOAD) {
       await handleUploadChunk(s, setter);
     } else if (REQUEST_VARS.includes(name)) {
-      await handleRequest(s, setter);
+      await handleRequest(s, setter, onlineUsers);
     }
   } catch (e) {
     console.error(`❌ メッセージ処理エラー (${name}):`, e.message);
@@ -394,6 +410,7 @@ class CloudManager {
     this.turbowarp  = { conn: null, isReconnecting: false, delay: 2000 };
     this.queue      = [];
     this.processing = false;
+    this.onlineUsers = 0;
   }
 
   enqueue(name, value, setter) {
@@ -405,7 +422,7 @@ class CloudManager {
     this.processing = true;
     while (this.queue.length > 0) {
       const { name, value, setter } = this.queue.shift();
-      await onMessage(name, value, setter);
+      await onMessage(name, value, setter, this.onlineUsers);
     }
     this.processing = false;
   }
@@ -457,6 +474,7 @@ class CloudManager {
         this.turbowarp.conn  = ws;
         this.turbowarp.delay = 2000;
         this.turbowarp.isReconnecting = false;
+        this.onlineUsers++;
         console.log("✅ TurboWarp Cloud 接続成功");
         console.log("🔄 TurboWarp クラウド変数を初期化中...");
         for (const v of [...REQUEST_VARS, ...CLOUD_VARS]) { await setter(v, "0"); await sleep(SEND_INTERVAL); }
@@ -473,7 +491,7 @@ class CloudManager {
           }
         } catch (e) { console.warn("⚠️ TW メッセージ解析失敗:", e.message); }
       });
-      ws.on("close", () => { console.warn("⚠️ TurboWarp 切断"); this.turbowarp.conn = null; this.turbowarp.isReconnecting = false; this.scheduleReconnect("turbowarp"); });
+      ws.on("close", () => { console.warn("⚠️ TurboWarp 切断"); this.turbowarp.conn = null; this.turbowarp.isReconnecting = false; this.onlineUsers = Math.max(0, this.onlineUsers - 1); this.scheduleReconnect("turbowarp"); });
       ws.on("error", e => { console.error("❌ TurboWarp エラー:", e.message); this.turbowarp.conn = null; this.turbowarp.isReconnecting = false; this.scheduleReconnect("turbowarp"); });
     } catch (e) {
       console.error("❌ TurboWarp 接続作成失敗:", e.message);

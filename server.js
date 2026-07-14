@@ -493,7 +493,7 @@ class CloudManager {
             if (!line) continue;
             const data = JSON.parse(line);
             if (data.method === "set" && [...REQUEST_VARS, ...CLOUD_VARS].includes(data.name)) {
-              console.log(`📨 TW受信 user=${data.user} name=${data.name}`);
+              console.log(`📨 TW受信 data=${JSON.stringify(data)}`);
               if (data.user) this.recentUsers.set(data.user, Math.floor(Date.now() / 1000));
               this.enqueue(data.name, data.value, setter);
             }

@@ -411,6 +411,24 @@ class CloudManager {
     this.recentUsers = new Map(); // username -> lastSeenAt(unixtime)
   }
 
+  // リクエストからusernameを取り出してrecentUsersに記録
+  trackUser(s) {
+    try {
+      const { next: p1 } = parseUserId(s, 0);
+      const { cmd, next: p2 } = parseCmd(s, p1);
+      // usernameが含まれるコマンドのみ処理
+      const cmdsWithUsername = [
+        CMD.LIKE, CMD.PLAY, CMD.ATTEMPT, CMD.CLEAR,
+        CMD.GET_NOTIFY, CMD.UPLOAD, CMD.BAN_USERNAME,
+      ];
+      if (!cmdsWithUsername.includes(cmd)) return;
+      const { value: username } = decodeAlphabet(s, p2);
+      if (isValidStr(username)) {
+        this.recentUsers.set(username, Math.floor(Date.now() / 1000));
+      }
+    } catch (_) {}
+  }
+
   // 5分以内のユーザー数を返す
   getOnlineUsers() {
     const cutoff = Math.floor(Date.now() / 1000) - 5 * 60;
@@ -429,6 +447,7 @@ class CloudManager {
     this.processing = true;
     while (this.queue.length > 0) {
       const { name, value, setter } = this.queue.shift();
+      this.trackUser(String(value));
       await onMessage(name, value, setter, () => this.getOnlineUsers());
     }
     this.processing = false;
@@ -493,8 +512,6 @@ class CloudManager {
             if (!line) continue;
             const data = JSON.parse(line);
             if (data.method === "set" && [...REQUEST_VARS, ...CLOUD_VARS].includes(data.name)) {
-              console.log(`📨 TW受信 data=${JSON.stringify(data)}`);
-              if (data.user) this.recentUsers.set(data.user, Math.floor(Date.now() / 1000));
               this.enqueue(data.name, data.value, setter);
             }
           }

@@ -414,11 +414,9 @@ class CloudManager {
   // 5分以内のユーザー数を返す
   getOnlineUsers() {
     const cutoff = Math.floor(Date.now() / 1000) - 5 * 60;
-    console.log(`👥 recentUsers件数: ${this.recentUsers.size}`, [...this.recentUsers.entries()]);
     for (const [username, lastSeen] of this.recentUsers) {
       if (lastSeen < cutoff) this.recentUsers.delete(username);
     }
-    console.log(`👥 5分以内のユーザー数: ${this.recentUsers.size}`);
     return this.recentUsers.size;
   }
 
@@ -495,6 +493,7 @@ class CloudManager {
             if (!line) continue;
             const data = JSON.parse(line);
             if (data.method === "set" && [...REQUEST_VARS, ...CLOUD_VARS].includes(data.name)) {
+              console.log(`📨 TW受信 user=${data.user} name=${data.name}`);
               if (data.user) this.recentUsers.set(data.user, Math.floor(Date.now() / 1000));
               this.enqueue(data.name, data.value, setter);
             }

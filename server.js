@@ -414,9 +414,11 @@ class CloudManager {
   // 5分以内のユーザー数を返す
   getOnlineUsers() {
     const cutoff = Math.floor(Date.now() / 1000) - 5 * 60;
+    console.log(`👥 recentUsers件数: ${this.recentUsers.size}`, [...this.recentUsers.entries()]);
     for (const [username, lastSeen] of this.recentUsers) {
       if (lastSeen < cutoff) this.recentUsers.delete(username);
     }
+    console.log(`👥 5分以内のユーザー数: ${this.recentUsers.size}`);
     return this.recentUsers.size;
   }
 

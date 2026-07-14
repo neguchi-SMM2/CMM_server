@@ -307,13 +307,12 @@ async function handleUploadChunk(s, setter) {
   }
 }
 
-async function onMessage(name, value, setter, getOnlineUsers, trackUser) {
+async function onMessage(name, value, setter, getOnlineUsers) {
   const s = String(value);
   if (!s || s.length < 3) return;
   try {
     const { next: p1 } = parseUserId(s, 0);
     const { cmd }      = parseCmd(s, p1);
-    trackUser(s);
     if (cmd === CMD.UPLOAD) {
       await handleUploadChunk(s, setter);
     } else if (REQUEST_VARS.includes(name)) {
@@ -412,18 +411,6 @@ class CloudManager {
     this.recentUsers = new Map(); // username -> lastSeenAt(unixtime)
   }
 
-  // 過去5分以内にリクエストを送ってきたユーザーを記録
-  trackUser(s) {
-    try {
-      const { next: p1 } = parseUserId(s, 0);
-      const { next: p2 } = parseCmd(s, p1);
-      const { value: username } = decodeAlphabet(s, p2);
-      if (isValidStr(username)) {
-        this.recentUsers.set(username, Math.floor(Date.now() / 1000));
-      }
-    } catch (_) {}
-  }
-
   // 5分以内のユーザー数を返す
   getOnlineUsers() {
     const cutoff = Math.floor(Date.now() / 1000) - 5 * 60;
@@ -442,11 +429,7 @@ class CloudManager {
     this.processing = true;
     while (this.queue.length > 0) {
       const { name, value, setter } = this.queue.shift();
-      await onMessage(
-        name, value, setter,
-        () => this.getOnlineUsers(),
-        (s) => this.trackUser(s)
-      );
+      await onMessage(name, value, setter, () => this.getOnlineUsers());
     }
     this.processing = false;
   }
@@ -509,8 +492,10 @@ class CloudManager {
           for (const line of text.trim().split("\n")) {
             if (!line) continue;
             const data = JSON.parse(line);
-            if (data.method === "set" && [...REQUEST_VARS, ...CLOUD_VARS].includes(data.name))
+            if (data.method === "set" && [...REQUEST_VARS, ...CLOUD_VARS].includes(data.name)) {
+              if (data.user) this.recentUsers.set(data.user, Math.floor(Date.now() / 1000));
               this.enqueue(data.name, data.value, setter);
+            }
           }
         } catch (e) { console.warn("⚠️ TW メッセージ解析失敗:", e.message); }
       });

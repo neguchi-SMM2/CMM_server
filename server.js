@@ -124,6 +124,29 @@ async function handleRequest(s, setter, getOnlineUsers) {
   const { cmd, next: p2 } = parseCmd(s, pos); pos = p2;
   if (!isValidNum(cmd)) { console.warn("⚠️ 不正なコマンドコード:", cmd); return; }
 
+  // 全コマンド共通: usernameを取得
+  let username;
+  try {
+    const { value, next } = decodeAlphabet(s, pos);
+    username = value;
+    pos = next;
+  } catch (e) {
+    // usernameのデコードに失敗した場合
+    if (cmd === CMD.GET_STATS) {
+      // CMD=90の旧式リクエスト
+      await sendCloud(setter, randomCloud(), encodeLenLen(parseInt(userId)) + encodeLen(407));
+      return;
+    }
+    console.warn("⚠️ usernameデコード失敗:", e.message); return;
+  }
+  if (!isValidStr(username)) {
+    if (cmd === CMD.GET_STATS) {
+      await sendCloud(setter, randomCloud(), encodeLenLen(parseInt(userId)) + encodeLen(407));
+      return;
+    }
+    console.warn("⚠️ 不正なusername:", username); return;
+  }
+
   // CMD=10〜12: ランキング・ランダム
   if (cmd === CMD.RANDOM || cmd === CMD.WEEKLY || cmd === CMD.ALL_TIME) {
     const { value: limit, next: p3 } = decodeLen(s, pos); pos = p3;
@@ -166,10 +189,9 @@ async function handleRequest(s, setter, getOnlineUsers) {
 
   // CMD=20〜23: 統計更新
   if (cmd === CMD.LIKE || cmd === CMD.PLAY || cmd === CMD.ATTEMPT || cmd === CMD.CLEAR) {
-    const { value: username, next: p3 } = decodeAlphabet(s, pos); pos = p3;
     const { value: courseId } = decodeAlphabet(s, pos);
-    if (!isValidStr(username) || !isValidStr(courseId)) {
-      console.warn("⚠️ 不正なusername/courseId:", username, courseId); return;
+    if (!isValidStr(courseId)) {
+      console.warn("⚠️ 不正なcourseId:", courseId); return;
     }
     if (cmd === CMD.PLAY)    { await db.incrementPlay(courseId); await db.incrementAttempt(courseId); return; }
     if (cmd === CMD.ATTEMPT) { await db.incrementAttempt(courseId); return; }
@@ -200,10 +222,8 @@ async function handleRequest(s, setter, getOnlineUsers) {
     return;
   }
 
-  // CMD=40: 通知取得
+  // CMD=40: 通知取得（usernameは共通部分で取得済み）
   if (cmd === CMD.GET_NOTIFY) {
-    const { value: username } = decodeAlphabet(s, pos);
-    if (!isValidStr(username)) { console.warn("⚠️ 不正なusername:", username); return; }
     const notification = await db.getAndDeleteNotification(username);
     if (notification) {
       await sendCloud(setter, randomCloud(), encodeLenLen(parseInt(userId)) + encodeLen(notification.cmd));
@@ -213,7 +233,7 @@ async function handleRequest(s, setter, getOnlineUsers) {
     return;
   }
 
-  // CMD=90: 統計データ取得
+  // CMD=90: 統計データ取得（usernameは共通部分で取得済み）
   if (cmd === CMD.GET_STATS) {
     const stats = await db.getStats();
     const payload = encodeLenLen(parseInt(userId))
@@ -230,10 +250,8 @@ async function handleRequest(s, setter, getOnlineUsers) {
     return;
   }
 
-  // CMD=600: ユーザー名変更検知→自動BAN
+  // CMD=600: ユーザー名変更検知→自動BAN（usernameは共通部分で取得済み）
   if (cmd === CMD.BAN_USERNAME) {
-    const { value: username } = decodeAlphabet(s, pos);
-    if (!isValidStr(username)) { console.warn("⚠️ 不正なusername:", username); return; }
     const expiresAt = Math.floor(Date.now() / 1000) + 15 * 60;
     await db.banUser(username, expiresAt);
     console.log(`🔨 自動BAN: ${username}`);
@@ -416,12 +434,13 @@ class CloudManager {
     try {
       const { next: p1 } = parseUserId(s, 0);
       const { cmd, next: p2 } = parseCmd(s, p1);
-      // usernameが含まれるコマンドのみ処理
-      const cmdsWithUsername = [
-        CMD.LIKE, CMD.PLAY, CMD.ATTEMPT, CMD.CLEAR,
-        CMD.GET_NOTIFY, CMD.UPLOAD, CMD.BAN_USERNAME,
-      ];
-      if (!cmdsWithUsername.includes(cmd)) return;
+      // UPLOADはCMD直後にusernameがあるので別処理
+      if (cmd === CMD.UPLOAD) {
+        const { value: username } = decodeAlphabet(s, p2);
+        if (isValidStr(username)) this.recentUsers.set(username, Math.floor(Date.now() / 1000));
+        return;
+      }
+      // その他のコマンドはCMD直後にusernameがある（新フォーマット）
       const { value: username } = decodeAlphabet(s, p2);
       if (isValidStr(username)) {
         this.recentUsers.set(username, Math.floor(Date.now() / 1000));

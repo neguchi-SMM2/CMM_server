@@ -550,7 +550,7 @@ class CloudManager {
     if (data.isReconnecting) return;
     const delay = Math.min(data.delay, 3600000);
     console.log(`⏰ ${mode} 再接続 ${delay}ms 後`);
-    data.delay = Math.min(data.delay * 1.5, 3600000);
+    data.delay = Math.min(data.delay * 3, 3600000);
     setTimeout(() => { if (mode === "scratch") this.connectScratch(); else this.connectTurboWarp(); }, delay);
   }
 

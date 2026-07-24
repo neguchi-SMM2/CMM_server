@@ -153,12 +153,33 @@ function decodeText(s, pos = 0) {
   return { value: result, next: dataStart + len };
 }
 
+// ─────────────────────────────────────────────
+// 日時変換（2000年からの分数 → YYYYMMDDHHmm の数値）
+// ─────────────────────────────────────────────
+
+/**
+ * minutesSince2000形式の値を、日本時間(JST, UTC+9)の
+ * 「年月日時分」を連結した数値(例: 202607231230)に変換する。
+ */
+function minutesToDateTimeInt(minutes) {
+  const epoch2000 = Date.UTC(2000, 0, 1, 0, 0, 0);
+  const ms = epoch2000 + minutes * 60000;
+  const jst = new Date(ms + 9 * 60 * 60 * 1000); // JSTオフセット適用
+  const y  = jst.getUTCFullYear();
+  const mo = String(jst.getUTCMonth() + 1).padStart(2, "0");
+  const d  = String(jst.getUTCDate()).padStart(2, "0");
+  const h  = String(jst.getUTCHours()).padStart(2, "0");
+  const mi = String(jst.getUTCMinutes()).padStart(2, "0");
+  return parseInt(`${y}${mo}${d}${h}${mi}`, 10);
+}
+
 module.exports = {
   encodeNum, decodeNum,
   encodeLen, decodeLen,
   encodeLenLen, decodeLenLen,
   encodeAlphabet, decodeAlphabet,
   encodeText, decodeText,
+  minutesToDateTimeInt,
   ALPHABET_LIST, ALPHABET_MAP,
   TEXT_LIST, TEXT_MAP,
 };

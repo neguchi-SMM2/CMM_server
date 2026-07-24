@@ -301,58 +301,26 @@ async function getMakerInfo(author) {
   };
 }
 
-// CMD=19: 公式職人一覧（ソートなし・登録順）
+// CMD=19: 公式職人一覧（ソートなし・登録順、CMD=16,17と同じフィールド構成）
 async function getOfficialMakers(limit) {
-  const since = Math.floor(Date.now() / 1000) - 7 * 24 * 60 * 60;
   const { rows } = await pool.query(
-    `WITH agg AS (
-       SELECT author,
-              COALESCE(SUM(like_count), 0) AS total_likes,
-              COALESCE(SUM(play_count), 0) AS total_plays,
-              COUNT(*)                     AS total_courses,
-              MAX(posted_at)               AS latest_posted_at
-       FROM courses
-       GROUP BY author
-     ),
-     ranked AS (
-       SELECT *,
-              RANK() OVER (ORDER BY total_likes DESC, total_plays DESC) AS all_time_rank
-       FROM agg
-     ),
-     weekly_agg AS (
-       SELECT c.author, COUNT(l.id) AS weekly_likes
-       FROM courses c
-       LEFT JOIN likes l ON l.course_id = c.id AND l.created_at >= $1
-       GROUP BY c.author
-     ),
-     weekly_ranked AS (
-       SELECT *,
-              RANK() OVER (ORDER BY weekly_likes DESC) AS weekly_rank
-       FROM weekly_agg
-     )
-     SELECT om.name                       AS author,
-            COALESCE(r.total_likes, 0)    AS total_likes,
-            COALESCE(r.total_plays, 0)    AS total_plays,
-            COALESCE(r.total_courses, 0)  AS total_courses,
-            r.all_time_rank,
-            wr.weekly_rank,
-            r.latest_posted_at,
-            om.added_at
+    `SELECT om.name                              AS author,
+            COALESCE(SUM(c.like_count), 0)        AS like_count,
+            COALESCE(SUM(c.play_count), 0)        AS play_count,
+            COALESCE(MAX(c.posted_at), 0)         AS latest_posted_at
      FROM official_makers om
-     LEFT JOIN ranked r         ON r.author = om.name
-     LEFT JOIN weekly_ranked wr ON wr.author = om.name
+     LEFT JOIN courses c ON c.author = om.name
+     GROUP BY om.name, om.added_at
      ORDER BY om.added_at ASC
-     LIMIT $2`,
-    [since, limit]
+     LIMIT $1`,
+    [limit]
   );
   return rows.map(r => ({
     author: r.author,
-    total_likes: parseInt(r.total_likes, 10),
-    total_plays: parseInt(r.total_plays, 10),
-    total_courses: parseInt(r.total_courses, 10),
-    all_time_rank: r.all_time_rank !== null ? parseInt(r.all_time_rank, 10) : 0,
-    weekly_rank: r.weekly_rank !== null ? parseInt(r.weekly_rank, 10) : 0,
-    latest_posted_at: r.latest_posted_at !== null ? parseInt(r.latest_posted_at, 10) : 0,
+    like_count: parseInt(r.like_count, 10),
+    play_count: parseInt(r.play_count, 10),
+    latest_posted_at: parseInt(r.latest_posted_at, 10),
+    is_official: true,
   }));
 }
 

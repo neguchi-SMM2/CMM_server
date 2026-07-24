@@ -261,13 +261,12 @@ async function handleRequest(s, setter, getOnlineUsers) {
     return;
   }
 
-  // CMD=19: 公式職人一覧
+  // CMD=19: 公式職人一覧（CMD=16,17と同じエンコード形式）
   if (cmd === CMD.OFFICIAL_MAKER) {
     const { value: limit } = decodeLen(s, pos);
     if (!isValidNum(limit) || limit <= 0) { console.warn("⚠️ 不正なlimit:", limit); return; }
     const rows = await db.getOfficialMakers(limit);
-    const items = rows.map(r => encodeMakerInfo(r));
-    await sendEncodedItems(setter, userId, cmd, items);
+    await sendMakerRankingList(setter, userId, cmd, rows);
     return;
   }
 

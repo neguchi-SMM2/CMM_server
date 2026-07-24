@@ -100,6 +100,15 @@ async function isOfficialMaker(name) {
   return rows.length > 0;
 }
 
+/** 指定したusernameが、過去にそのauthor名で（_temp無しで）投稿したことがあるか */
+async function hasPostedAsAuthor(author, username) {
+  const { rows } = await pool.query(
+    "SELECT 1 FROM courses WHERE author=$1 AND username=$2 LIMIT 1",
+    [author, username]
+  );
+  return rows.length > 0;
+}
+
 // ─────────────────────────────────────────────
 // コース保存
 // ─────────────────────────────────────────────
@@ -111,8 +120,15 @@ async function saveCourse(title, author, username, stageData, ipAddress = null) 
   if (dupRows.length) return { duplicate: true };
 
   // 作者名が公式ユーザー名と完全一致する場合、なりすまし防止のため "_temp" を付与
-  const official   = await isOfficialMaker(author);
-  const safeAuthor  = official ? `${author}_temp` : author;
+  // ただし、そのauthor名で過去に投稿実績がある(=本人とみなせる)usernameなら付与しない
+  let safeAuthor = author;
+  const official = await isOfficialMaker(author);
+  if (official) {
+    const alreadyPostedAsThis = await hasPostedAsAuthor(author, username);
+    if (!alreadyPostedAsThis) {
+      safeAuthor = `${author}_temp`;
+    }
+  }
 
   // コースID衝突回避（最大5回リトライ）
   let id = generateCourseId();
@@ -493,6 +509,6 @@ module.exports = {
   resetWeeklyLikes, deleteOldLikes, minutesSince2000,
   upsertNotification, getAndDeleteNotification,
   banUser, isUserBanned, deleteCourse, getStats,
-  isOfficialMaker,
+  isOfficialMaker, hasPostedAsAuthor,
   getMakerRankingWeek, getMakerRankingAllTime, getMakerInfo, getOfficialMakers,
 };

@@ -204,17 +204,29 @@ async function getNewArrivalCourses(limit) {
 async function getMakerRankingWeek(limit) {
   const since = Math.floor(Date.now() / 1000) - 7 * 24 * 60 * 60;
   const { rows } = await pool.query(
-    `SELECT c.author,
-            COUNT(l.id)                       AS like_count,
-            COALESCE(SUM(c.play_count), 0)    AS play_count,
-            MAX(c.posted_at)                  AS latest_posted_at,
+    `WITH course_agg AS (
+       SELECT author,
+              COALESCE(SUM(play_count), 0) AS play_count,
+              MAX(posted_at)               AS latest_posted_at
+       FROM courses
+       GROUP BY author
+     ),
+     weekly_likes AS (
+       SELECT c.author, COUNT(l.id) AS like_count
+       FROM courses c
+       LEFT JOIN likes l ON l.course_id = c.id AND l.created_at >= $1
+       GROUP BY c.author
+     )
+     SELECT ca.author,
+            COALESCE(wl.like_count, 0) AS like_count,
+            ca.play_count,
+            ca.latest_posted_at,
             EXISTS (
-              SELECT 1 FROM official_makers om WHERE om.name = c.author
-            )                                  AS is_official
-     FROM courses c
-     LEFT JOIN likes l ON l.course_id = c.id AND l.created_at >= $1
-     GROUP BY c.author
-     ORDER BY like_count DESC, play_count DESC
+              SELECT 1 FROM official_makers om WHERE om.name = ca.author
+            ) AS is_official
+     FROM course_agg ca
+     LEFT JOIN weekly_likes wl ON wl.author = ca.author
+     ORDER BY like_count DESC, ca.play_count DESC
      LIMIT $2`,
     [since, limit]
   );

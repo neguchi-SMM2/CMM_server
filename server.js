@@ -16,6 +16,7 @@ const {
   encodeLenLen, decodeLenLen,
   encodeAlphabet, decodeAlphabet,
   encodeText, decodeText,
+  minutesToDateTimeInt,
 } = require("./encode");
 
 const USERNAME      = process.env.SCRATCH_USERNAME;
@@ -31,20 +32,25 @@ const CLOUD_VARS   = [
 ];
 
 const CMD = {
-  UPLOAD:        1,
-  RANDOM:       10,
-  WEEKLY:       11,
-  ALL_TIME:     12,
-  SEARCH_ID:    13,
-  SEARCH_AUTHOR:14,
-  LIKE:         20,
-  PLAY:         21,
-  ATTEMPT:      22,
-  CLEAR:        23,
-  GET_COURSE:   30,
-  GET_NOTIFY:   40,
-  GET_STATS:    90,
-  BAN_USERNAME:600,
+  UPLOAD:          1,
+  RANDOM:         10,
+  WEEKLY:         11,
+  ALL_TIME:       12,
+  SEARCH_ID:      13,
+  SEARCH_AUTHOR:  14,
+  NEW_ARRIVAL:    15,
+  MAKER_RANK_WEEK:16,
+  MAKER_RANK_ALL: 17,
+  MAKER_INFO:     18,
+  OFFICIAL_MAKER: 19,
+  LIKE:           20,
+  PLAY:           21,
+  ATTEMPT:        22,
+  CLEAR:          23,
+  GET_COURSE:     30,
+  GET_NOTIFY:     40,
+  GET_STATS:      90,
+  BAN_USERNAME:  600,
 };
 
 const SEND_INTERVAL = 120;
@@ -65,6 +71,28 @@ async function sendCloud(setter, name, value) {
   await sleep(SEND_INTERVAL);
 }
 
+// ─────────────────────────────────────────────
+// 汎用: 複数件のエンコード済み文字列をmaxLenでチャンク分割して送信
+// ─────────────────────────────────────────────
+async function sendEncodedItems(setter, userId, cmd, items) {
+  const header = encodeLenLen(parseInt(userId)) + encodeLen(cmd);
+  const maxLen = 1000;
+  let buffer = "";
+  for (const item of items) {
+    if (buffer.length > 0 && (header + buffer + item).length > maxLen) {
+      await sendCloud(setter, randomCloud(), header + buffer);
+      buffer = "";
+    }
+    buffer += item;
+  }
+  if (buffer.length > 0) {
+    await sendCloud(setter, randomCloud(), header + buffer);
+  }
+}
+
+// ─────────────────────────────────────────────
+// コース情報エンコード（CMD=10,11,12,15共通）
+// ─────────────────────────────────────────────
 function encodeCourseInfo(row, index) {
   const clearRate = row.attempt_count > 0
     ? Math.round(row.clear_count / row.attempt_count * 10000) / 100
@@ -81,22 +109,42 @@ function encodeCourseInfo(row, index) {
 }
 
 async function sendCourseList(setter, userId, cmd, rows) {
-  const header = encodeLenLen(parseInt(userId)) + encodeLen(cmd);
-  const maxLen = 1000;
-  let buffer = "";
-  let courseIndex = 1;
-  for (const row of rows) {
-    const courseEncoded = encodeCourseInfo(row, courseIndex);
-    if (buffer.length > 0 && (header + buffer + courseEncoded).length > maxLen) {
-      await sendCloud(setter, randomCloud(), header + buffer);
-      buffer = "";
-    }
-    buffer += courseEncoded;
-    courseIndex++;
-  }
-  if (buffer.length > 0) {
-    await sendCloud(setter, randomCloud(), header + buffer);
-  }
+  const items = rows.map((row, i) => encodeCourseInfo(row, i + 1));
+  await sendEncodedItems(setter, userId, cmd, items);
+}
+
+// ─────────────────────────────────────────────
+// 職人ランキング行エンコード（CMD=16,17）
+// 何番目(len) + author(alphabet) + いいね数(len) + プレイ数(len)
+//   + 直近投稿日(lenlen, YYYYMMDDHHmm) + 公式ユーザー(len, 1/0)
+// ─────────────────────────────────────────────
+function encodeMakerRankRow(row, index) {
+  return encodeLen(index)
+    + encodeAlphabet(row.author)
+    + encodeLen(row.like_count)
+    + encodeLen(row.play_count)
+    + encodeLenLen(minutesToDateTimeInt(row.latest_posted_at))
+    + encodeLen(row.is_official ? 1 : 0);
+}
+
+async function sendMakerRankingList(setter, userId, cmd, rows) {
+  const items = rows.map((row, i) => encodeMakerRankRow(row, i + 1));
+  await sendEncodedItems(setter, userId, cmd, items);
+}
+
+// ─────────────────────────────────────────────
+// 職人情報エンコード（CMD=18単体 / CMD=19一覧の要素）
+// author(alphabet) + 総いいね数(len) + 総プレイ数(len) + 総投稿コース数(len)
+//   + 全体ランキング順位(len) + 週間ランキング順位(len) + 直近投稿日(lenlen, YYYYMMDDHHmm)
+// ─────────────────────────────────────────────
+function encodeMakerInfo(row) {
+  return encodeAlphabet(row.author)
+    + encodeLen(row.total_likes)
+    + encodeLen(row.total_plays)
+    + encodeLen(row.total_courses)
+    + encodeLen(row.all_time_rank)
+    + encodeLen(row.weekly_rank)
+    + encodeLenLen(minutesToDateTimeInt(row.latest_posted_at));
 }
 
 async function sendCourseData(setter, userId, stageData) {
@@ -147,14 +195,15 @@ async function handleRequest(s, setter, getOnlineUsers) {
     console.warn("⚠️ 不正なusername:", username); return;
   }
 
-  // CMD=10〜12: ランキング・ランダム
-  if (cmd === CMD.RANDOM || cmd === CMD.WEEKLY || cmd === CMD.ALL_TIME) {
+  // CMD=10〜12,15: ランキング・ランダム・新着
+  if (cmd === CMD.RANDOM || cmd === CMD.WEEKLY || cmd === CMD.ALL_TIME || cmd === CMD.NEW_ARRIVAL) {
     const { value: limit, next: p3 } = decodeLen(s, pos); pos = p3;
     if (!isValidNum(limit) || limit <= 0) { console.warn("⚠️ 不正なlimit:", limit); return; }
     let rows;
-    if      (cmd === CMD.RANDOM)   rows = await db.getRandomCourses(limit);
-    else if (cmd === CMD.WEEKLY)   rows = await db.getWeeklyRanking(limit);
-    else                           rows = await db.getAllTimeRanking(limit);
+    if      (cmd === CMD.RANDOM)      rows = await db.getRandomCourses(limit);
+    else if (cmd === CMD.WEEKLY)      rows = await db.getWeeklyRanking(limit);
+    else if (cmd === CMD.NEW_ARRIVAL) rows = await db.getNewArrivalCourses(limit);
+    else                               rows = await db.getAllTimeRanking(limit);
     await sendCourseList(setter, userId, cmd, rows);
     return;
   }
@@ -184,6 +233,41 @@ async function handleRequest(s, setter, getOnlineUsers) {
       return;
     }
     await sendCourseList(setter, userId, cmd, rows);
+    return;
+  }
+
+  // CMD=16,17: 職人ランキング（週間 / 累計）
+  if (cmd === CMD.MAKER_RANK_WEEK || cmd === CMD.MAKER_RANK_ALL) {
+    const { value: limit } = decodeLen(s, pos);
+    if (!isValidNum(limit) || limit <= 0) { console.warn("⚠️ 不正なlimit:", limit); return; }
+    const rows = cmd === CMD.MAKER_RANK_WEEK
+      ? await db.getMakerRankingWeek(limit)
+      : await db.getMakerRankingAllTime(limit);
+    await sendMakerRankingList(setter, userId, cmd, rows);
+    return;
+  }
+
+  // CMD=18: 職人情報（author指定）
+  if (cmd === CMD.MAKER_INFO) {
+    const { value: targetAuthor } = decodeAlphabet(s, pos);
+    if (!isValidStr(targetAuthor)) { console.warn("⚠️ 不正なauthor:", targetAuthor); return; }
+    const info = await db.getMakerInfo(targetAuthor);
+    if (!info) {
+      await sendCloud(setter, randomCloud(), encodeLenLen(parseInt(userId)) + encodeLen(300));
+      return;
+    }
+    const payload = encodeLenLen(parseInt(userId)) + encodeLen(CMD.MAKER_INFO) + encodeMakerInfo(info);
+    await sendCloud(setter, randomCloud(), payload);
+    return;
+  }
+
+  // CMD=19: 公式職人一覧
+  if (cmd === CMD.OFFICIAL_MAKER) {
+    const { value: limit } = decodeLen(s, pos);
+    if (!isValidNum(limit) || limit <= 0) { console.warn("⚠️ 不正なlimit:", limit); return; }
+    const rows = await db.getOfficialMakers(limit);
+    const items = rows.map(r => encodeMakerInfo(r));
+    await sendEncodedItems(setter, userId, cmd, items);
     return;
   }
 

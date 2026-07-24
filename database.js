@@ -54,6 +54,11 @@ async function initDB() {
       expires_at BIGINT  NOT NULL
     );
 
+    CREATE TABLE IF NOT EXISTS official_makers (
+      name       TEXT    PRIMARY KEY,
+      added_at   BIGINT  NOT NULL DEFAULT EXTRACT(EPOCH FROM NOW())::BIGINT
+    );
+
     CREATE INDEX IF NOT EXISTS idx_courses_likes   ON courses(like_count DESC);
     CREATE INDEX IF NOT EXISTS idx_courses_posted  ON courses(posted_at DESC);
     CREATE INDEX IF NOT EXISTS idx_courses_author  ON courses(author);
@@ -84,6 +89,18 @@ function minutesSince2000() {
 }
 
 // ─────────────────────────────────────────────
+// 公式ユーザー
+// ─────────────────────────────────────────────
+
+/** 指定した名前(author)が公式ユーザーとして登録されているか（完全一致） */
+async function isOfficialMaker(name) {
+  const { rows } = await pool.query(
+    "SELECT 1 FROM official_makers WHERE name=$1", [name]
+  );
+  return rows.length > 0;
+}
+
+// ─────────────────────────────────────────────
 // コース保存
 // ─────────────────────────────────────────────
 async function saveCourse(title, author, username, stageData, ipAddress = null) {
@@ -92,6 +109,10 @@ async function saveCourse(title, author, username, stageData, ipAddress = null) 
     "SELECT 1 FROM courses WHERE stage_data=$1", [stageData]
   );
   if (dupRows.length) return { duplicate: true };
+
+  // 作者名が公式ユーザー名と完全一致する場合、なりすまし防止のため "_temp" を付与
+  const official   = await isOfficialMaker(author);
+  const safeAuthor  = official ? `${author}_temp` : author;
 
   // コースID衝突回避（最大5回リトライ）
   let id = generateCourseId();
@@ -104,7 +125,7 @@ async function saveCourse(title, author, username, stageData, ipAddress = null) 
   await pool.query(
     `INSERT INTO courses (id, title, author, username, stage_data, posted_at, ip_address)
      VALUES ($1, $2, $3, $4, $5, $6, $7)`,
-    [id, title, author, username, stageData, postedAt, ipAddress || null]
+    [id, title, safeAuthor, username, stageData, postedAt, ipAddress || null]
   );
   return { id };
 }
@@ -165,6 +186,174 @@ async function searchByAuthor(author, limit) {
     [author, limit]
   );
   return rows;
+}
+
+// CMD=15: 新着コース（posted_at 降順）
+async function getNewArrivalCourses(limit) {
+  const { rows } = await pool.query(
+    `SELECT ${INFO_COLS} FROM courses ORDER BY posted_at DESC LIMIT $1`, [limit]
+  );
+  return rows;
+}
+
+// ─────────────────────────────────────────────
+// 職人（メーカー）ランキング・情報
+// ─────────────────────────────────────────────
+
+// CMD=16: 職人ランキング（週間いいね数）
+async function getMakerRankingWeek(limit) {
+  const since = Math.floor(Date.now() / 1000) - 7 * 24 * 60 * 60;
+  const { rows } = await pool.query(
+    `SELECT c.author,
+            COUNT(l.id)                       AS like_count,
+            COALESCE(SUM(c.play_count), 0)    AS play_count,
+            MAX(c.posted_at)                  AS latest_posted_at,
+            EXISTS (
+              SELECT 1 FROM official_makers om WHERE om.name = c.author
+            )                                  AS is_official
+     FROM courses c
+     LEFT JOIN likes l ON l.course_id = c.id AND l.created_at >= $1
+     GROUP BY c.author
+     ORDER BY like_count DESC, play_count DESC
+     LIMIT $2`,
+    [since, limit]
+  );
+  return rows.map(r => ({
+    author: r.author,
+    like_count: parseInt(r.like_count, 10),
+    play_count: parseInt(r.play_count, 10),
+    latest_posted_at: parseInt(r.latest_posted_at, 10),
+    is_official: r.is_official,
+  }));
+}
+
+// CMD=17: 職人ランキング（累計いいね数）
+async function getMakerRankingAllTime(limit) {
+  const { rows } = await pool.query(
+    `SELECT c.author,
+            COALESCE(SUM(c.like_count), 0)    AS like_count,
+            COALESCE(SUM(c.play_count), 0)    AS play_count,
+            MAX(c.posted_at)                  AS latest_posted_at,
+            EXISTS (
+              SELECT 1 FROM official_makers om WHERE om.name = c.author
+            )                                  AS is_official
+     FROM courses c
+     GROUP BY c.author
+     ORDER BY like_count DESC, play_count DESC
+     LIMIT $1`,
+    [limit]
+  );
+  return rows.map(r => ({
+    author: r.author,
+    like_count: parseInt(r.like_count, 10),
+    play_count: parseInt(r.play_count, 10),
+    latest_posted_at: parseInt(r.latest_posted_at, 10),
+    is_official: r.is_official,
+  }));
+}
+
+// CMD=18: 職人情報（author指定）
+async function getMakerInfo(author) {
+  const since = Math.floor(Date.now() / 1000) - 7 * 24 * 60 * 60;
+  const { rows } = await pool.query(
+    `WITH agg AS (
+       SELECT author,
+              COALESCE(SUM(like_count), 0) AS total_likes,
+              COALESCE(SUM(play_count), 0) AS total_plays,
+              COUNT(*)                     AS total_courses,
+              MAX(posted_at)               AS latest_posted_at
+       FROM courses
+       GROUP BY author
+     ),
+     ranked AS (
+       SELECT *,
+              RANK() OVER (ORDER BY total_likes DESC, total_plays DESC) AS all_time_rank
+       FROM agg
+     ),
+     weekly_agg AS (
+       SELECT c.author, COUNT(l.id) AS weekly_likes
+       FROM courses c
+       LEFT JOIN likes l ON l.course_id = c.id AND l.created_at >= $2
+       GROUP BY c.author
+     ),
+     weekly_ranked AS (
+       SELECT *,
+              RANK() OVER (ORDER BY weekly_likes DESC) AS weekly_rank
+       FROM weekly_agg
+     )
+     SELECT r.author, r.total_likes, r.total_plays, r.total_courses,
+            r.all_time_rank, r.latest_posted_at, wr.weekly_rank
+     FROM ranked r
+     JOIN weekly_ranked wr ON wr.author = r.author
+     WHERE r.author = $1`,
+    [author, since]
+  );
+  if (!rows.length) return null;
+  const r = rows[0];
+  return {
+    author: r.author,
+    total_likes: parseInt(r.total_likes, 10),
+    total_plays: parseInt(r.total_plays, 10),
+    total_courses: parseInt(r.total_courses, 10),
+    all_time_rank: parseInt(r.all_time_rank, 10),
+    weekly_rank: parseInt(r.weekly_rank, 10),
+    latest_posted_at: parseInt(r.latest_posted_at, 10),
+  };
+}
+
+// CMD=19: 公式職人一覧（ソートなし・登録順）
+async function getOfficialMakers(limit) {
+  const since = Math.floor(Date.now() / 1000) - 7 * 24 * 60 * 60;
+  const { rows } = await pool.query(
+    `WITH agg AS (
+       SELECT author,
+              COALESCE(SUM(like_count), 0) AS total_likes,
+              COALESCE(SUM(play_count), 0) AS total_plays,
+              COUNT(*)                     AS total_courses,
+              MAX(posted_at)               AS latest_posted_at
+       FROM courses
+       GROUP BY author
+     ),
+     ranked AS (
+       SELECT *,
+              RANK() OVER (ORDER BY total_likes DESC, total_plays DESC) AS all_time_rank
+       FROM agg
+     ),
+     weekly_agg AS (
+       SELECT c.author, COUNT(l.id) AS weekly_likes
+       FROM courses c
+       LEFT JOIN likes l ON l.course_id = c.id AND l.created_at >= $1
+       GROUP BY c.author
+     ),
+     weekly_ranked AS (
+       SELECT *,
+              RANK() OVER (ORDER BY weekly_likes DESC) AS weekly_rank
+       FROM weekly_agg
+     )
+     SELECT om.name                       AS author,
+            COALESCE(r.total_likes, 0)    AS total_likes,
+            COALESCE(r.total_plays, 0)    AS total_plays,
+            COALESCE(r.total_courses, 0)  AS total_courses,
+            r.all_time_rank,
+            wr.weekly_rank,
+            r.latest_posted_at,
+            om.added_at
+     FROM official_makers om
+     LEFT JOIN ranked r         ON r.author = om.name
+     LEFT JOIN weekly_ranked wr ON wr.author = om.name
+     ORDER BY om.added_at ASC
+     LIMIT $2`,
+    [since, limit]
+  );
+  return rows.map(r => ({
+    author: r.author,
+    total_likes: parseInt(r.total_likes, 10),
+    total_plays: parseInt(r.total_plays, 10),
+    total_courses: parseInt(r.total_courses, 10),
+    all_time_rank: r.all_time_rank !== null ? parseInt(r.all_time_rank, 10) : 0,
+    weekly_rank: r.weekly_rank !== null ? parseInt(r.weekly_rank, 10) : 0,
+    latest_posted_at: r.latest_posted_at !== null ? parseInt(r.latest_posted_at, 10) : 0,
+  }));
 }
 
 // ─────────────────────────────────────────────
@@ -319,9 +508,11 @@ module.exports = {
   initDB, pool,
   saveCourse, getCourseById,
   getRandomCourses, getWeeklyRanking, getAllTimeRanking,
-  searchByCourseId, searchByAuthor,
+  searchByCourseId, searchByAuthor, getNewArrivalCourses,
   incrementPlay, incrementAttempt, incrementClear, addLike,
   resetWeeklyLikes, deleteOldLikes, minutesSince2000,
   upsertNotification, getAndDeleteNotification,
   banUser, isUserBanned, deleteCourse, getStats,
+  isOfficialMaker,
+  getMakerRankingWeek, getMakerRankingAllTime, getMakerInfo, getOfficialMakers,
 };

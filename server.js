@@ -335,9 +335,13 @@ async function handleRequest(s, setter, getOnlineUsers) {
 
   // CMD=600: ユーザー名変更検知→自動BAN（usernameは共通部分で取得済み）
   if (cmd === CMD.BAN_USERNAME) {
-    const expiresAt = Math.floor(Date.now() / 1000) + 15 * 60;
-    await db.banUser(username, expiresAt);
-    console.log(`🔨 自動BAN: ${username}`);
+    // 既にBAN中の場合は期限を延長しない（繰り返し検知されても15分で確実に解除されるようにする）
+    const alreadyBanned = await db.isUserBanned(username);
+    if (!alreadyBanned) {
+      const expiresAt = Math.floor(Date.now() / 1000) + 15 * 60;
+      await db.banUser(username, expiresAt);
+      console.log(`🔨 自動BAN: ${username}`);
+    }
     return;
   }
 

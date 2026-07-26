@@ -285,6 +285,12 @@ async function handleRequest(s, setter, getOnlineUsers) {
         await sendCloud(setter, randomCloud(), encodeLenLen(parseInt(userId)) + encodeLen(405));
         return;
       }
+      // コース投稿者本人によるいいねは、既にいいね済みの場合と同じCMDを返して弾く
+      const course = await db.getCourseById(courseId);
+      if (course && course.username === username) {
+        await sendCloud(setter, randomCloud(), encodeLenLen(parseInt(userId)) + encodeLen(200));
+        return;
+      }
       const { alreadyLiked } = await db.addLike(username, courseId);
       if (alreadyLiked) {
         await sendCloud(setter, randomCloud(), encodeLenLen(parseInt(userId)) + encodeLen(200));

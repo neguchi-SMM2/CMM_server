@@ -59,6 +59,15 @@ async function initDB() {
       added_at   BIGINT  NOT NULL DEFAULT EXTRACT(EPOCH FROM NOW())::BIGINT
     );
 
+    CREATE TABLE IF NOT EXISTS announcements (
+      id         SERIAL  PRIMARY KEY,
+      title      TEXT    NOT NULL,
+      body       TEXT    NOT NULL,
+      created_at BIGINT  NOT NULL DEFAULT FLOOR(
+        (EXTRACT(EPOCH FROM NOW()) - EXTRACT(EPOCH FROM TIMESTAMP '2000-01-01 00:00:00 UTC')) / 60
+      )
+    );
+
     CREATE INDEX IF NOT EXISTS idx_courses_likes   ON courses(like_count DESC);
     CREATE INDEX IF NOT EXISTS idx_courses_posted  ON courses(posted_at DESC);
     CREATE INDEX IF NOT EXISTS idx_courses_author  ON courses(author);
@@ -161,7 +170,7 @@ const INFO_COLS = `id, title, author, like_count, play_count, attempt_count, cle
 
 async function getRandomCourses(limit) {
   const { rows } = await pool.query(
-    `SELECT ${INFO_COLS} FROM courses ORDER BY posted_at + (RANDOM() * 21600) DESC LIMIT $1`, [limit]
+    `SELECT ${INFO_COLS} FROM courses ORDER BY posted_at + (RANDOM() * 2880) DESC LIMIT $1`, [limit]
   );
   return rows;
 }
@@ -352,6 +361,14 @@ async function getOfficialMakers(limit) {
   }));
 }
 
+// CMD=91: 公式お知らせ（最新1件）
+async function getLatestAnnouncement() {
+  const { rows } = await pool.query(
+    "SELECT title, body, created_at FROM announcements ORDER BY created_at DESC LIMIT 1"
+  );
+  return rows[0] || null;
+}
+
 // ─────────────────────────────────────────────
 // 統計更新
 // ─────────────────────────────────────────────
@@ -511,4 +528,5 @@ module.exports = {
   banUser, isUserBanned, deleteCourse, getStats,
   isOfficialMaker, hasPostedAsAuthor,
   getMakerRankingWeek, getMakerRankingAllTime, getMakerInfo, getOfficialMakers,
+  getLatestAnnouncement,
 };

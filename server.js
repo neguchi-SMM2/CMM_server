@@ -50,6 +50,7 @@ const CMD = {
   GET_COURSE:     30,
   GET_NOTIFY:     40,
   GET_STATS:      90,
+  GET_ANNOUNCEMENT:91,
   BAN_USERNAME:  600,
 };
 
@@ -335,6 +336,22 @@ async function handleRequest(s, setter, getOnlineUsers) {
       + encodeLen(parseInt(stats.weekly_courses))
       + encodeLen(getOnlineUsers())
       + (stats.latest_course_id ? encodeAlphabet(stats.latest_course_id) : encodeAlphabet("000-000-000"));
+    await sendCloud(setter, randomCloud(), payload);
+    return;
+  }
+
+  // CMD=91: 公式お知らせ取得（usernameは共通部分で取得済み、長さ制限を設けず単発送信）
+  if (cmd === CMD.GET_ANNOUNCEMENT) {
+    const announcement = await db.getLatestAnnouncement();
+    if (!announcement) {
+      await sendCloud(setter, randomCloud(), encodeLenLen(parseInt(userId)) + encodeLen(300));
+      return;
+    }
+    const payload = encodeLenLen(parseInt(userId))
+      + encodeLen(CMD.GET_ANNOUNCEMENT)
+      + encodeText(announcement.title)
+      + encodeLenLen(minutesToDateTimeInt(announcement.created_at))
+      + encodeText(announcement.body);
     await sendCloud(setter, randomCloud(), payload);
     return;
   }

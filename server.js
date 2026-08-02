@@ -592,7 +592,7 @@ class CloudManager {
       const cloud   = await Promise.race([Cloud.createAsync(session, PROJECT_ID),  timeout(15000)]);
       this.scratch.conn  = cloud;
       this.scratch.delay = 5000;
-      cloud.setMaxListeners(20); // 再接続の積み重なりに対する保険（根本対策はremoveAllListeners側）
+      if (typeof cloud.setMaxListeners === "function") cloud.setMaxListeners(20); // 対応していれば保険として設定
       console.log("✅ Scratch Cloud 接続成功");
       const setter = (name, value) => { cloud.set(name, String(value)); return Promise.resolve(); };
       console.log("🔄 クラウド変数を初期化中...");
@@ -602,8 +602,18 @@ class CloudManager {
         const fullName = name.startsWith("☁ ") ? name : `☁ ${name}`;
         if ([...REQUEST_VARS, ...CLOUD_VARS].includes(fullName)) this.enqueue(fullName, value, setter);
       });
-      cloud.on("close", () => { console.warn("⚠️ Scratch 切断"); cloud.removeAllListeners(); this.scratch.conn = null; this.scheduleReconnect("scratch"); });
-      cloud.on("error", e => { console.error("❌ Scratch エラー:", e.message); cloud.removeAllListeners(); this.scratch.conn = null; this.scheduleReconnect("scratch"); });
+      cloud.on("close", () => {
+        console.warn("⚠️ Scratch 切断");
+        if (typeof cloud.removeAllListeners === "function") cloud.removeAllListeners();
+        this.scratch.conn = null;
+        this.scheduleReconnect("scratch");
+      });
+      cloud.on("error", e => {
+        console.error("❌ Scratch エラー:", e.message);
+        if (typeof cloud.removeAllListeners === "function") cloud.removeAllListeners();
+        this.scratch.conn = null;
+        this.scheduleReconnect("scratch");
+      });
     } catch (e) {
       console.error("❌ Scratch 接続失敗:", e.message);
       this.scratch.conn = null;

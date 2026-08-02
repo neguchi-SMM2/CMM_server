@@ -606,12 +606,10 @@ class CloudManager {
       cloud.on("error", e => { console.error("❌ Scratch エラー:", e.message); cloud.removeAllListeners(); this.scratch.conn = null; this.scheduleReconnect("scratch"); });
     } catch (e) {
       console.error("❌ Scratch 接続失敗:", e.message);
-      console.log("⚠️ Scratch接続をスキップ。TurboWarpのみで運用します。");
       this.scratch.conn = null;
-      setTimeout(() => {
-        this.scratch.isReconnecting = false;
-        this.scheduleReconnect("scratch");
-      }, 60000);
+      // 固定待機を挟まず、scheduleReconnectの指数バックオフ(5000ms→最大3600000ms)だけで再試行間隔を制御する
+      this.scratch.isReconnecting = false;
+      this.scheduleReconnect("scratch");
     }
   }
 

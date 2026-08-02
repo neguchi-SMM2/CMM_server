@@ -674,9 +674,9 @@ class CloudManager {
   }
 
   async start() {
-    process.on("uncaughtException", e => {
-      console.error("❌ uncaughtException:", e.message);
-    });
+    // process.on("uncaughtException", e => {
+    //   console.error("❌ uncaughtException:", e.message);
+    // });
     process.on("unhandledRejection", e => {
       console.error("❌ unhandledRejection:", e);
     });

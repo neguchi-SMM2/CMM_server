@@ -1,13 +1,14 @@
 "use strict";
 /**
  * マリオメーカー風ゲーム クラウド変数サーバー v3
+ * Scratch Cloud / TurboWarp Cloud ともに生WebSocketで直接接続する
  */
 
 const WebSocket = require("ws");
+const https     = require("https");
 const http      = require("http");
 const fs        = require("fs");
 const path      = require("path");
-const { Session, Cloud } = require("scratchcloud");
 
 const db = require("./database");
 const {
@@ -530,6 +531,68 @@ async function handleManageAPI(req, res) {
   res.end(JSON.stringify({ error: "not found" }));
 }
 
+// ─────────────────────────────────────────────
+// Scratch本家へのログイン（生WebSocket接続用のセッションID取得）
+// ─────────────────────────────────────────────
+function httpsRequest(options, body) {
+  return new Promise((resolve, reject) => {
+    const req = https.request(options, res => {
+      let data = "";
+      res.setEncoding("utf8");
+      res.on("data", chunk => { data += chunk; });
+      res.on("end", () => resolve({ statusCode: res.statusCode, headers: res.headers, body: data }));
+    });
+    req.on("error", reject);
+    if (body) req.write(body);
+    req.end();
+  });
+}
+
+async function scratchLogin(username, password) {
+  // 1. CSRFトークン取得
+  const csrfRes = await httpsRequest({
+    hostname: "scratch.mit.edu",
+    path: "/csrf_token/",
+    method: "GET",
+    headers: { "User-Agent": "MarioMakerServer/1.0" },
+  });
+  const csrfCookies = csrfRes.headers["set-cookie"] || [];
+  const csrfMatch = csrfCookies.map(c => c.match(/scratchcsrftoken=([^;]+)/)).find(Boolean);
+  if (!csrfMatch) throw new Error("CSRFトークン取得失敗");
+  const csrfToken = csrfMatch[1];
+
+  // 2. ログイン
+  const bodyStr = JSON.stringify({ username, password });
+  const loginRes = await httpsRequest({
+    hostname: "scratch.mit.edu",
+    path: "/login/",
+    method: "POST",
+    headers: {
+      "Content-Type": "application/json",
+      "Content-Length": Buffer.byteLength(bodyStr),
+      "X-CSRFToken": csrfToken,
+      "X-Requested-With": "XMLHttpRequest",
+      "Cookie": `scratchcsrftoken=${csrfToken}; scratchlanguage=en;`,
+      "Referer": "https://scratch.mit.edu",
+      "User-Agent": "MarioMakerServer/1.0",
+    },
+  }, bodyStr);
+
+  const loginCookies = loginRes.headers["set-cookie"] || [];
+  const sessionMatch = loginCookies.map(c => c.match(/scratchsessionsid="?([^;"]+)"?/)).find(Boolean);
+  if (!sessionMatch) {
+    throw new Error(`ログイン失敗(status ${loginRes.statusCode}): ${loginRes.body.slice(0, 200)}`);
+  }
+  return sessionMatch[1];
+}
+
+function withTimeout(promise, ms, label) {
+  return Promise.race([
+    promise,
+    new Promise((_, reject) => setTimeout(() => reject(new Error(`${label}タイムアウト`)), ms)),
+  ]);
+}
+
 class CloudManager {
   constructor() {
     this.scratch    = { conn: null, isReconnecting: false, delay: 5000 };
@@ -582,45 +645,80 @@ class CloudManager {
     this.processing = false;
   }
 
-  async connectScratch() {
-    if (this.scratch.conn || this.scratch.isReconnecting) return;
+  // Scratch Cloudへ生WebSocketで直接接続（scratchcloudライブラリは使用しない）
+  connectScratch() {
+    if (this.scratch.conn?.readyState === WebSocket.OPEN || this.scratch.isReconnecting) return;
     this.scratch.isReconnecting = true;
-    try {
-      console.log("🔄 Scratch Cloud 接続中...");
-      const timeout = ms => new Promise((_, r) => setTimeout(() => r(new Error("タイムアウト")), ms));
-      const session = await Promise.race([Session.createAsync(USERNAME, PASSWORD), timeout(15000)]);
-      const cloud   = await Promise.race([Cloud.createAsync(session, PROJECT_ID),  timeout(15000)]);
-      this.scratch.conn  = cloud;
-      this.scratch.delay = 5000;
-      if (typeof cloud.setMaxListeners === "function") cloud.setMaxListeners(20); // 対応していれば保険として設定
-      console.log("✅ Scratch Cloud 接続成功");
-      const setter = (name, value) => { cloud.set(name, String(value)); return Promise.resolve(); };
-      console.log("🔄 クラウド変数を初期化中...");
-      for (const v of [...REQUEST_VARS, ...CLOUD_VARS]) { await setter(v, "0"); await sleep(SEND_INTERVAL); }
-      console.log("✅ クラウド変数初期化完了");
-      cloud.on("set", (name, value) => {
-        const fullName = name.startsWith("☁ ") ? name : `☁ ${name}`;
-        if ([...REQUEST_VARS, ...CLOUD_VARS].includes(fullName)) this.enqueue(fullName, value, setter);
-      });
-      cloud.on("close", () => {
-        console.warn("⚠️ Scratch 切断");
-        if (typeof cloud.removeAllListeners === "function") cloud.removeAllListeners();
+    console.log("🔄 Scratch Cloud 接続中...");
+
+    withTimeout(scratchLogin(USERNAME, PASSWORD), 15000, "Scratchログイン")
+      .then(sessionId => {
+        const ws = new WebSocket("wss://clouddata.scratch.mit.edu", {
+          headers: {
+            Cookie: `scratchsessionsid=${sessionId};`,
+            Origin: "https://scratch.mit.edu",
+            "User-Agent": "MarioMakerServer/1.0",
+          },
+        });
+
+        const connectTimeout = setTimeout(() => {
+          console.error("❌ Scratch WebSocket接続タイムアウト");
+          ws.terminate();
+        }, 15000);
+
+        const setter = (name, value) => {
+          if (ws.readyState !== WebSocket.OPEN) return Promise.reject(new Error("Scratch切断"));
+          ws.send(JSON.stringify({ method: "set", name, value: String(value), user: USERNAME, project_id: PROJECT_ID }) + "\n");
+          return Promise.resolve();
+        };
+
+        ws.on("open", async () => {
+          clearTimeout(connectTimeout);
+          ws.send(JSON.stringify({ method: "handshake", user: USERNAME, project_id: PROJECT_ID }) + "\n");
+          this.scratch.conn  = ws;
+          this.scratch.delay = 5000;
+          this.scratch.isReconnecting = false;
+          console.log("✅ Scratch Cloud 接続成功（直接接続）");
+          console.log("🔄 Scratch クラウド変数を初期化中...");
+          for (const v of [...REQUEST_VARS, ...CLOUD_VARS]) { await setter(v, "0"); await sleep(SEND_INTERVAL); }
+          console.log("✅ Scratch クラウド変数初期化完了");
+        });
+
+        ws.on("message", raw => {
+          try {
+            const text = Buffer.isBuffer(raw) ? raw.toString("utf8") : raw;
+            for (const line of text.trim().split("\n")) {
+              if (!line) continue;
+              const data = JSON.parse(line);
+              if (data.method === "set" && [...REQUEST_VARS, ...CLOUD_VARS].includes(data.name)) {
+                this.enqueue(data.name, data.value, setter);
+              }
+            }
+          } catch (e) { console.warn("⚠️ Scratch メッセージ解析失敗:", e.message); }
+        });
+
+        ws.on("close", () => {
+          clearTimeout(connectTimeout);
+          console.warn("⚠️ Scratch 切断");
+          this.scratch.conn = null;
+          this.scratch.isReconnecting = false;
+          this.scheduleReconnect("scratch");
+        });
+
+        ws.on("error", e => {
+          clearTimeout(connectTimeout);
+          console.error("❌ Scratch エラー:", e.message);
+          this.scratch.conn = null;
+          this.scratch.isReconnecting = false;
+          this.scheduleReconnect("scratch");
+        });
+      })
+      .catch(e => {
+        console.error("❌ Scratch 接続失敗:", e.message);
         this.scratch.conn = null;
+        this.scratch.isReconnecting = false;
         this.scheduleReconnect("scratch");
       });
-      cloud.on("error", e => {
-        console.error("❌ Scratch エラー:", e.message);
-        if (typeof cloud.removeAllListeners === "function") cloud.removeAllListeners();
-        this.scratch.conn = null;
-        this.scheduleReconnect("scratch");
-      });
-    } catch (e) {
-      console.error("❌ Scratch 接続失敗:", e.message);
-      this.scratch.conn = null;
-      // 固定待機を挟まず、scheduleReconnectの指数バックオフ(5000ms→最大3600000ms)だけで再試行間隔を制御する
-      this.scratch.isReconnecting = false;
-      this.scheduleReconnect("scratch");
-    }
   }
 
   connectTurboWarp() {
@@ -682,9 +780,26 @@ class CloudManager {
   }
 
   async start() {
-    // process.on("uncaughtException", e => {
-    //   console.error("❌ uncaughtException:", e.message);
-    // });
+    // 同じ内容のuncaughtExceptionが連続する場合は間引いて出力する（ログの見やすさ対策）
+    let lastUncaughtMsg = null;
+    let uncaughtCount = 0;
+    let uncaughtLogTimer = null;
+    process.on("uncaughtException", e => {
+      if (e.message === lastUncaughtMsg) {
+        uncaughtCount++;
+        if (!uncaughtLogTimer) {
+          uncaughtLogTimer = setTimeout(() => {
+            console.error(`❌ uncaughtException（直近30秒で同内容が${uncaughtCount}回発生）: ${lastUncaughtMsg}`);
+            uncaughtCount = 0;
+            uncaughtLogTimer = null;
+          }, 30000);
+        }
+      } else {
+        lastUncaughtMsg = e.message;
+        uncaughtCount = 0;
+        console.error("❌ uncaughtException:", e.message);
+      }
+    });
     process.on("unhandledRejection", e => {
       console.error("❌ unhandledRejection:", e);
     });
@@ -713,7 +828,7 @@ class CloudManager {
       res.writeHead(200, { "Content-Type": "application/json" });
       res.end(JSON.stringify({
         status:    "ok",
-        scratch:   !!this.scratch.conn ? "connected" : "disconnected",
+        scratch:   this.scratch.conn?.readyState === WebSocket.OPEN ? "connected" : "disconnected",
         turbowarp: this.turbowarp.conn?.readyState === WebSocket.OPEN ? "connected" : "disconnected",
         queue:     this.queue.length,
         onlineUsers: this.getOnlineUsers(),
@@ -722,7 +837,7 @@ class CloudManager {
     });
     server.listen(PORT, () => console.log(`🌐 ヘルスチェック: http://0.0.0.0:${PORT}`));
     setInterval(() => {
-      const s = this.scratch.conn    ? "✅" : "❌";
+      const s = this.scratch.conn?.readyState === WebSocket.OPEN ? "✅" : "❌";
       const t = this.turbowarp.conn?.readyState === WebSocket.OPEN ? "✅" : "❌";
       console.log(`💡 Health - Scratch:${s} TurboWarp:${t} Queue:${this.queue.length} Online:${this.getOnlineUsers()}`);
     }, 5 * 60 * 1000);

@@ -293,6 +293,15 @@ async function handleRequest(s, setter, getOnlineUsers) {
         await sendCloud(setter, randomCloud(), encodeLenLen(parseInt(userId)) + encodeLen(200));
         return;
       }
+      // 同一usernameが同一author名のコースに30分間で3件以上いいねしていたら、30分経つまで弾く
+      if (course) {
+        const since = Math.floor(Date.now() / 1000) - 30 * 60;
+        const recentCount = await db.countRecentLikesForAuthor(username, course.author, since);
+        if (recentCount >= 3) {
+          await sendCloud(setter, randomCloud(), encodeLenLen(parseInt(userId)) + encodeLen(202));
+          return;
+        }
+      }
       const { alreadyLiked } = await db.addLike(username, courseId);
       if (alreadyLiked) {
         await sendCloud(setter, randomCloud(), encodeLenLen(parseInt(userId)) + encodeLen(200));

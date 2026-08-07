@@ -430,6 +430,17 @@ async function deleteOldLikes() {
   if (rowCount > 0) console.log(`🗑️ 古いいいねを ${rowCount} 件削除しました`);
 }
 
+/** 指定usernameが、直近sinceSeconds秒以内に同一author名のコースへ何件いいねしたか */
+async function countRecentLikesForAuthor(username, author, sinceTimestamp) {
+  const { rows } = await pool.query(
+    `SELECT COUNT(*) FROM likes l
+     JOIN courses c ON c.id = l.course_id
+     WHERE l.username = $1 AND c.author = $2 AND l.created_at >= $3`,
+    [username, author, sinceTimestamp]
+  );
+  return parseInt(rows[0].count, 10);
+}
+
 async function resetWeeklyLikes() {
   await deleteOldLikes();
 }
@@ -523,7 +534,7 @@ module.exports = {
   getRandomCourses, getWeeklyRanking, getAllTimeRanking,
   searchByCourseId, searchByAuthor, getNewArrivalCourses,
   incrementPlay, incrementAttempt, incrementClear, addLike,
-  resetWeeklyLikes, deleteOldLikes, minutesSince2000,
+  resetWeeklyLikes, deleteOldLikes, minutesSince2000, countRecentLikesForAuthor,
   upsertNotification, getAndDeleteNotification,
   banUser, isUserBanned, deleteCourse, getStats,
   isOfficialMaker, hasPostedAsAuthor,

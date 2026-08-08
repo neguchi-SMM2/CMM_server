@@ -639,6 +639,15 @@ class CloudManager {
     return this.recentUsers.size;
   }
 
+  // 5分以内のユーザー名一覧を返す
+  getOnlineUsernames() {
+    const cutoff = Math.floor(Date.now() / 1000) - 5 * 60;
+    for (const [username, lastSeen] of this.recentUsers) {
+      if (lastSeen < cutoff) this.recentUsers.delete(username);
+    }
+    return Array.from(this.recentUsers.keys());
+  }
+
   enqueue(name, value, setter) {
     this.queue.push({ name, value, setter });
     if (!this.processing) this.processQueue();
@@ -848,7 +857,7 @@ class CloudManager {
     setInterval(() => {
       const s = this.scratch.conn?.readyState === WebSocket.OPEN ? "✅" : "❌";
       const t = this.turbowarp.conn?.readyState === WebSocket.OPEN ? "✅" : "❌";
-      console.log(`💡 Health - Scratch:${s} TurboWarp:${t} Queue:${this.queue.length} Online:${this.getOnlineUsers()}`);
+      console.log(`💡 Health - Scratch:${s} TurboWarp:${t} Queue:${this.queue.length} Online:${this.getOnlineUsers()} onlineUser: ${this.getOnlineUsernames()}`);
     }, 5 * 60 * 1000);
     const shutdown = () => {
       console.log("🛑 シャットダウン...");

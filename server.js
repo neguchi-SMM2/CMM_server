@@ -850,6 +850,7 @@ class CloudManager {
         turbowarp: this.turbowarp.conn?.readyState === WebSocket.OPEN ? "connected" : "disconnected",
         queue:     this.queue.length,
         onlineUsers: this.getOnlineUsers(),
+        onlineUsernames: this.getOnlineUsernames(),
         uptime:    process.uptime(),
       }));
     });
@@ -857,7 +858,7 @@ class CloudManager {
     setInterval(() => {
       const s = this.scratch.conn?.readyState === WebSocket.OPEN ? "✅" : "❌";
       const t = this.turbowarp.conn?.readyState === WebSocket.OPEN ? "✅" : "❌";
-      console.log(`💡 Health - Scratch:${s} TurboWarp:${t} Queue:${this.queue.length} Online:${this.getOnlineUsers()} onlineUser: ${this.getOnlineUsernames()}`);
+      console.log(`💡 Health - Scratch:${s} TurboWarp:${t} Queue:${this.queue.length} Online:${this.getOnlineUsers()}`);
     }, 5 * 60 * 1000);
     const shutdown = () => {
       console.log("🛑 シャットダウン...");

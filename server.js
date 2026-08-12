@@ -283,8 +283,8 @@ async function handleRequest(s, setter, getOnlineUsers) {
     if (!isValidStr(targetAuthor)) { console.warn("⚠️ 不正なauthor:", targetAuthor); return; }
     let result;
     if (await db.isAuthorConfirmed(targetAuthor)) result = 3;
-    else if (await db.isAuthorUsedBeforeCutoff(targetAuthor)) result = 2;
-    else result = 1;
+    else if (await db.isAuthorUsedBeforeCutoff(targetAuthor)) result = 1;
+    else result = 2;
     await sendCloud(setter, randomCloud(), encodeLenLen(parseInt(userId)) + encodeLen(CMD.REGISTER_CHECK_AUTHOR) + encodeLen(result));
     return;
   }
@@ -311,24 +311,33 @@ async function handleRequest(s, setter, getOnlineUsers) {
     }
 
     if (regType === 0) {
-      // 本登録: 基礎データのusernameは信用せず、サーバー側で独立に再チェックする
-      const confirmed  = await db.isAuthorConfirmed(targetAuthor);
-      const usedBefore = await db.isAuthorUsedBeforeCutoff(targetAuthor);
-      if (confirmed || usedBefore) {
-        // 既に登録済み、または事前投稿実績のある職人名は本登録不可（仮登録を使うべき）
+      // 本登録: 事前投稿実績があってもチェックなしで登録可能。基礎データのusernameは信用しない
+      if (await db.hasRegisteredToday(username)) {
+        // 1人1日1回までの登録制限（仮登録含む）
         await sendCloud(setter, randomCloud(), encodeLenLen(parseInt(userId)) + encodeLen(CMD.REGISTER_SUBMIT) + encodeLen(0));
         return;
       }
-      await db.registerMakerConfirmed(targetAuthor, username, password);
-      await sendCloud(setter, randomCloud(), encodeLenLen(parseInt(userId)) + encodeLen(CMD.REGISTER_SUBMIT) + encodeLen(1));
+      try {
+        await db.registerMakerConfirmed(targetAuthor, username, password);
+        await sendCloud(setter, randomCloud(), encodeLenLen(parseInt(userId)) + encodeLen(CMD.REGISTER_SUBMIT) + encodeLen(1));
+      } catch (e) {
+        // 既に本登録済み(ユニーク制約違反)などの場合は失敗として0を返す
+        await sendCloud(setter, randomCloud(), encodeLenLen(parseInt(userId)) + encodeLen(CMD.REGISTER_SUBMIT) + encodeLen(0));
+      }
       return;
     } else {
-      // 仮登録: 既に本登録済みなら保存せず、いずれにせよ結果は0
-      const confirmed = await db.isAuthorConfirmed(targetAuthor);
-      if (!confirmed) {
-        await db.registerMakerPending(targetAuthor, username, password);
+      // 仮登録: 既に本登録済み、または1日1回制限に該当する場合は弾いて0を返す
+      if (await db.hasRegisteredToday(username)) {
+        await sendCloud(setter, randomCloud(), encodeLenLen(parseInt(userId)) + encodeLen(CMD.REGISTER_SUBMIT) + encodeLen(0));
+        return;
       }
-      await sendCloud(setter, randomCloud(), encodeLenLen(parseInt(userId)) + encodeLen(CMD.REGISTER_SUBMIT) + encodeLen(0));
+      const confirmed = await db.isAuthorConfirmed(targetAuthor);
+      if (confirmed) {
+        await sendCloud(setter, randomCloud(), encodeLenLen(parseInt(userId)) + encodeLen(CMD.REGISTER_SUBMIT) + encodeLen(0));
+        return;
+      }
+      await db.registerMakerPending(targetAuthor, username, password);
+      await sendCloud(setter, randomCloud(), encodeLenLen(parseInt(userId)) + encodeLen(CMD.REGISTER_SUBMIT) + encodeLen(2));
       return;
     }
   }

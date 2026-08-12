@@ -1,1021 +1,673 @@
 "use strict";
 /**
- * マリオメーカー風ゲーム クラウド変数サーバー v3
- * Scratch Cloud / TurboWarp Cloud ともに生WebSocketで直接接続する
+ * DB層 - Supabase (PostgreSQL)
+ * 環境変数: DATABASE_URL
  */
 
-const WebSocket = require("ws");
-const https     = require("https");
-const http      = require("http");
-const fs        = require("fs");
-const path      = require("path");
+const { Pool } = require("pg");
+const crypto   = require("crypto");
+const bcrypt   = require("bcryptjs");
 
-const db = require("./database");
-const {
-  encodeNum, decodeNum,
-  encodeLen, decodeLen,
-  encodeLenLen, decodeLenLen,
-  encodeAlphabet, decodeAlphabet,
-  encodeText, decodeText,
-  minutesToDateTimeInt,
-} = require("./encode");
+const pool = new Pool({
+  connectionString: process.env.DATABASE_URL,
+  ssl: { rejectUnauthorized: false },
+  max: 10,
+  idleTimeoutMillis: 30000,
+});
 
-const USERNAME      = process.env.SCRATCH_USERNAME;
-const PASSWORD      = process.env.SCRATCH_PASSWORD;
-const PROJECT_ID    = parseInt(process.env.SCRATCH_PROJECT_ID, 10);
-const PORT          = parseInt(process.env.PORT || "3000", 10);
-const ADMIN_PASSWORD = process.env.ADMIN_PASSWORD || "";
+// ─────────────────────────────────────────────
+// 初期化
+// ─────────────────────────────────────────────
+async function initDB() {
+  await pool.query(`
+    CREATE TABLE IF NOT EXISTS courses (
+      id            TEXT    PRIMARY KEY,
+      title         TEXT    NOT NULL,
+      author        TEXT    NOT NULL,
+      username      TEXT    NOT NULL DEFAULT '',
+      stage_data    TEXT    NOT NULL,
+      posted_at     BIGINT  NOT NULL,
+      play_count    INT     NOT NULL DEFAULT 0,
+      attempt_count INT     NOT NULL DEFAULT 0,
+      clear_count   INT     NOT NULL DEFAULT 0,
+      like_count    INT     NOT NULL DEFAULT 0
+    );
+    ALTER TABLE courses ADD COLUMN IF NOT EXISTS username TEXT NOT NULL DEFAULT '';
+    ALTER TABLE courses ADD COLUMN IF NOT EXISTS ip_address TEXT;
 
-const REQUEST_VARS = ["☁ request1", "☁ request2"];
-const CLOUD_VARS   = [
-  "☁ cloud1","☁ cloud2","☁ cloud3","☁ cloud4",
-  "☁ cloud5","☁ cloud6","☁ cloud7","☁ cloud8",
-];
+    CREATE TABLE IF NOT EXISTS likes (
+      id         SERIAL  PRIMARY KEY,
+      username   TEXT    NOT NULL,
+      course_id  TEXT    NOT NULL REFERENCES courses(id) ON DELETE CASCADE,
+      created_at BIGINT  NOT NULL DEFAULT EXTRACT(EPOCH FROM NOW())::BIGINT,
+      UNIQUE (username, course_id)
+    );
+    ALTER TABLE likes ADD COLUMN IF NOT EXISTS
+      created_at BIGINT NOT NULL DEFAULT EXTRACT(EPOCH FROM NOW())::BIGINT;
 
-const CMD = {
-  UPLOAD:          1,
-  RANDOM:         10,
-  WEEKLY:         11,
-  ALL_TIME:       12,
-  SEARCH_ID:      13,
-  SEARCH_AUTHOR:  14,
-  NEW_ARRIVAL:    15,
-  MAKER_RANK_WEEK:16,
-  MAKER_RANK_ALL: 17,
-  MAKER_INFO:     18,
-  OFFICIAL_MAKER: 19,
-  REGISTER_CHECK_AUTHOR:   50,
-  REGISTER_CHECK_USERNAME: 51,
-  REGISTER_SUBMIT:         52,
-  REGISTER_STATUS:         53,
-  REGISTER_LOGIN:          54,
-  LIKE:           20,
-  PLAY:           21,
-  ATTEMPT:        22,
-  CLEAR:          23,
-  GET_COURSE:     30,
-  GET_NOTIFY:     40,
-  GET_STATS:      90,
-  GET_ANNOUNCEMENT:91,
-  BAN_USERNAME:  600,
+    CREATE TABLE IF NOT EXISTS notifications (
+      username   TEXT    PRIMARY KEY,
+      cmd        INT     NOT NULL
+    );
+
+    CREATE TABLE IF NOT EXISTS bans (
+      username   TEXT    PRIMARY KEY,
+      expires_at BIGINT  NOT NULL
+    );
+
+    CREATE TABLE IF NOT EXISTS official_makers (
+      name       TEXT    PRIMARY KEY,
+      added_at   BIGINT  NOT NULL DEFAULT EXTRACT(EPOCH FROM NOW())::BIGINT
+    );
+
+    CREATE TABLE IF NOT EXISTS announcements (
+      id         SERIAL  PRIMARY KEY,
+      title      TEXT    NOT NULL,
+      body       TEXT    NOT NULL,
+      created_at BIGINT  NOT NULL DEFAULT FLOOR(
+        (EXTRACT(EPOCH FROM NOW()) - EXTRACT(EPOCH FROM TIMESTAMP '2000-01-01 00:00:00 UTC')) / 60
+      )
+    );
+
+    CREATE TABLE IF NOT EXISTS maker_accounts (
+      id            SERIAL  PRIMARY KEY,
+      author        TEXT    NOT NULL,
+      username      TEXT    NOT NULL,
+      password_hash TEXT    NOT NULL,
+      status        TEXT    NOT NULL DEFAULT 'pending',
+      created_at    BIGINT  NOT NULL DEFAULT EXTRACT(EPOCH FROM NOW())::BIGINT
+    );
+    CREATE UNIQUE INDEX IF NOT EXISTS idx_maker_accounts_confirmed_author
+      ON maker_accounts(author) WHERE status = 'confirmed';
+    CREATE INDEX IF NOT EXISTS idx_maker_accounts_author ON maker_accounts(author);
+
+    CREATE INDEX IF NOT EXISTS idx_courses_likes   ON courses(like_count DESC);
+    CREATE INDEX IF NOT EXISTS idx_courses_posted  ON courses(posted_at DESC);
+    CREATE INDEX IF NOT EXISTS idx_courses_author  ON courses(author);
+    CREATE INDEX IF NOT EXISTS idx_courses_title   ON courses(title);
+    CREATE INDEX IF NOT EXISTS idx_likes_course    ON likes(course_id);
+    CREATE INDEX IF NOT EXISTS idx_likes_created   ON likes(created_at DESC);
+  `);
+  console.log("✅ DB初期化完了");
+}
+
+// ─────────────────────────────────────────────
+// コースID生成（a〜z, 0〜9の3文字×3ブロック）
+// ─────────────────────────────────────────────
+const COURSE_ID_CHARS = "abcdefghijklmnopqrstuvwxyz0123456789";
+
+function generateCourseId() {
+  const seg = () => Array.from(
+    { length: 3 },
+    () => COURSE_ID_CHARS[Math.floor(Math.random() * COURSE_ID_CHARS.length)]
+  ).join("");
+  return `${seg()}-${seg()}-${seg()}`;
+}
+
+// 2000年1月1日からの分数
+function minutesSince2000() {
+  const epoch2000 = Date.UTC(2000, 0, 1, 0, 0, 0);
+  return Math.floor((Date.now() - epoch2000) / 60000);
+}
+
+// ─────────────────────────────────────────────
+// 公式ユーザー
+// ─────────────────────────────────────────────
+
+/** 指定した名前(author)が公式ユーザーとして登録されているか（完全一致） */
+async function isOfficialMaker(name) {
+  const { rows } = await pool.query(
+    "SELECT 1 FROM official_makers WHERE name=$1", [name]
+  );
+  return rows.length > 0;
+}
+
+/** 指定したusernameが、過去にそのauthor名で（_temp無しで）投稿したことがあるか */
+async function hasPostedAsAuthor(author, username) {
+  const { rows } = await pool.query(
+    "SELECT 1 FROM courses WHERE author=$1 AND username=$2 LIMIT 1",
+    [author, username]
+  );
+  return rows.length > 0;
+}
+
+// ─────────────────────────────────────────────
+// コース保存
+// ─────────────────────────────────────────────
+async function saveCourse(title, author, username, stageData, ipAddress = null) {
+  // 同一ステージデータの重複チェック
+  const { rows: dupRows } = await pool.query(
+    "SELECT 1 FROM courses WHERE stage_data=$1", [stageData]
+  );
+  if (dupRows.length) return { duplicate: true };
+
+  // 作者名が公式ユーザー名と完全一致する場合、なりすまし防止のため "_temp" を付与
+  // ただし、そのauthor名で過去に投稿実績がある(=本人とみなせる)usernameなら付与しない
+  let safeAuthor = author;
+  const official = await isOfficialMaker(author);
+  if (official) {
+    const alreadyPostedAsThis = await hasPostedAsAuthor(author, username);
+    if (!alreadyPostedAsThis) {
+      safeAuthor = `${author}_temp`;
+    }
+  }
+
+  // コースID衝突回避（最大5回リトライ）
+  let id = generateCourseId();
+  for (let i = 0; i < 5; i++) {
+    const { rows } = await pool.query("SELECT 1 FROM courses WHERE id=$1", [id]);
+    if (!rows.length) break;
+    id = generateCourseId();
+  }
+  const postedAt = minutesSince2000();
+  await pool.query(
+    `INSERT INTO courses (id, title, author, username, stage_data, posted_at, ip_address)
+     VALUES ($1, $2, $3, $4, $5, $6, $7)`,
+    [id, title, safeAuthor, username, stageData, postedAt, ipAddress || null]
+  );
+  return { id };
+}
+
+// ─────────────────────────────────────────────
+// コース取得
+// ─────────────────────────────────────────────
+async function getCourseById(id) {
+  const { rows } = await pool.query("SELECT * FROM courses WHERE id=$1", [id]);
+  return rows[0] || null;
+}
+
+// ─────────────────────────────────────────────
+// ランキング・検索
+// ─────────────────────────────────────────────
+const INFO_COLS = `id, title, author, like_count, play_count, attempt_count, clear_count, posted_at`;
+
+async function getRandomCourses(limit) {
+  const { rows } = await pool.query(
+    `SELECT ${INFO_COLS} FROM courses ORDER BY posted_at + (RANDOM() * 2880) DESC LIMIT $1`, [limit]
+  );
+  return rows;
+}
+
+async function getWeeklyRanking(limit) {
+  const since = Math.floor(Date.now() / 1000) - 7 * 24 * 60 * 60;
+  const { rows } = await pool.query(
+    `SELECT c.id, c.title, c.author, c.like_count, c.play_count,
+            c.attempt_count, c.clear_count, c.posted_at,
+            COUNT(l.id) AS weekly_count
+     FROM courses c
+     LEFT JOIN likes l ON l.course_id = c.id AND l.created_at >= $1
+     GROUP BY c.id
+     ORDER BY weekly_count DESC, c.like_count DESC, c.play_count DESC
+     LIMIT $2`,
+    [since, limit]
+  );
+  return rows.map(r => ({ ...r, like_count: parseInt(r.weekly_count), total_like_count: parseInt(r.like_count) }));
+}
+
+async function getAllTimeRanking(limit) {
+  const { rows } = await pool.query(
+    `SELECT ${INFO_COLS} FROM courses ORDER BY like_count DESC, play_count DESC LIMIT $1`, [limit]
+  );
+  return rows;
+}
+
+async function searchByCourseId(courseId) {
+  const { rows } = await pool.query(
+    `SELECT ${INFO_COLS} FROM courses WHERE id=$1`, [courseId]
+  );
+  return rows;
+}
+
+async function searchByAuthor(author, limit) {
+  const { rows } = await pool.query(
+    `SELECT ${INFO_COLS} FROM courses WHERE author=$1 ORDER BY posted_at DESC LIMIT $2`,
+    [author, limit]
+  );
+  return rows;
+}
+
+// CMD=15: 新着コース（posted_at 降順）
+async function getNewArrivalCourses(limit) {
+  const { rows } = await pool.query(
+    `SELECT ${INFO_COLS} FROM courses ORDER BY posted_at DESC LIMIT $1`, [limit]
+  );
+  return rows;
+}
+
+// ─────────────────────────────────────────────
+// 職人（メーカー）ランキング・情報
+// ─────────────────────────────────────────────
+
+// CMD=16: 職人ランキング（週間いいね数）
+async function getMakerRankingWeek(limit) {
+  const since = Math.floor(Date.now() / 1000) - 7 * 24 * 60 * 60;
+  const { rows } = await pool.query(
+    `WITH course_agg AS (
+       SELECT author,
+              COALESCE(SUM(play_count), 0) AS play_count,
+              MAX(posted_at)               AS latest_posted_at
+       FROM courses
+       GROUP BY author
+     ),
+     weekly_likes AS (
+       SELECT c.author, COUNT(l.id) AS like_count
+       FROM courses c
+       LEFT JOIN likes l ON l.course_id = c.id AND l.created_at >= $1
+       GROUP BY c.author
+     )
+     SELECT ca.author,
+            COALESCE(wl.like_count, 0) AS like_count,
+            ca.play_count,
+            ca.latest_posted_at,
+            EXISTS (
+              SELECT 1 FROM official_makers om WHERE om.name = ca.author
+            ) AS is_official
+     FROM course_agg ca
+     LEFT JOIN weekly_likes wl ON wl.author = ca.author
+     ORDER BY like_count DESC, ca.play_count DESC
+     LIMIT $2`,
+    [since, limit]
+  );
+  return rows.map(r => ({
+    author: r.author,
+    like_count: parseInt(r.like_count, 10),
+    play_count: parseInt(r.play_count, 10),
+    latest_posted_at: parseInt(r.latest_posted_at, 10),
+    is_official: r.is_official,
+  }));
+}
+
+// CMD=17: 職人ランキング（累計いいね数）
+async function getMakerRankingAllTime(limit) {
+  const { rows } = await pool.query(
+    `SELECT c.author,
+            COALESCE(SUM(c.like_count), 0)    AS like_count,
+            COALESCE(SUM(c.play_count), 0)    AS play_count,
+            MAX(c.posted_at)                  AS latest_posted_at,
+            EXISTS (
+              SELECT 1 FROM official_makers om WHERE om.name = c.author
+            )                                  AS is_official
+     FROM courses c
+     GROUP BY c.author
+     ORDER BY like_count DESC, play_count DESC
+     LIMIT $1`,
+    [limit]
+  );
+  return rows.map(r => ({
+    author: r.author,
+    like_count: parseInt(r.like_count, 10),
+    play_count: parseInt(r.play_count, 10),
+    latest_posted_at: parseInt(r.latest_posted_at, 10),
+    is_official: r.is_official,
+  }));
+}
+
+// CMD=18: 職人情報（author指定）
+async function getMakerInfo(author) {
+  const since = Math.floor(Date.now() / 1000) - 7 * 24 * 60 * 60;
+  const { rows } = await pool.query(
+    `WITH agg AS (
+       SELECT author,
+              COALESCE(SUM(like_count), 0) AS total_likes,
+              COALESCE(SUM(play_count), 0) AS total_plays,
+              COUNT(*)                     AS total_courses,
+              MAX(posted_at)               AS latest_posted_at
+       FROM courses
+       GROUP BY author
+     ),
+     ranked AS (
+       SELECT *,
+              RANK() OVER (ORDER BY total_likes DESC, total_plays DESC) AS all_time_rank
+       FROM agg
+     ),
+     weekly_agg AS (
+       SELECT c.author, COUNT(l.id) AS weekly_likes
+       FROM courses c
+       LEFT JOIN likes l ON l.course_id = c.id AND l.created_at >= $2
+       GROUP BY c.author
+     ),
+     weekly_ranked AS (
+       SELECT *,
+              RANK() OVER (ORDER BY weekly_likes DESC) AS weekly_rank
+       FROM weekly_agg
+     )
+     SELECT r.author, r.total_likes, r.total_plays, r.total_courses,
+            r.all_time_rank, r.latest_posted_at, wr.weekly_rank
+     FROM ranked r
+     JOIN weekly_ranked wr ON wr.author = r.author
+     WHERE r.author = $1`,
+    [author, since]
+  );
+  if (!rows.length) return null;
+  const r = rows[0];
+  return {
+    author: r.author,
+    total_likes: parseInt(r.total_likes, 10),
+    total_plays: parseInt(r.total_plays, 10),
+    total_courses: parseInt(r.total_courses, 10),
+    all_time_rank: parseInt(r.all_time_rank, 10),
+    weekly_rank: parseInt(r.weekly_rank, 10),
+    latest_posted_at: parseInt(r.latest_posted_at, 10),
+  };
+}
+
+// CMD=19: 公式職人一覧（ソートなし・登録順、CMD=16,17と同じフィールド構成）
+async function getOfficialMakers(limit) {
+  const { rows } = await pool.query(
+    `SELECT om.name                              AS author,
+            COALESCE(SUM(c.like_count), 0)        AS like_count,
+            COALESCE(SUM(c.play_count), 0)        AS play_count,
+            COALESCE(MAX(c.posted_at), 0)         AS latest_posted_at
+     FROM official_makers om
+     LEFT JOIN courses c ON c.author = om.name
+     GROUP BY om.name, om.added_at
+     ORDER BY om.added_at ASC
+     LIMIT $1`,
+    [limit]
+  );
+  return rows.map(r => ({
+    author: r.author,
+    like_count: parseInt(r.like_count, 10),
+    play_count: parseInt(r.play_count, 10),
+    latest_posted_at: parseInt(r.latest_posted_at, 10),
+    is_official: true,
+  }));
+}
+
+// CMD=91: 公式お知らせ（最新1件）
+async function getLatestAnnouncement() {
+  const { rows } = await pool.query(
+    "SELECT title, body, created_at FROM announcements ORDER BY created_at DESC LIMIT 1"
+  );
+  return rows[0] || null;
+}
+
+// ─────────────────────────────────────────────
+// 職人名アカウント（なりすまし対策: author名にパスワードを紐付ける）
+// ─────────────────────────────────────────────
+
+// 「事前投稿」判定基準日: 2026-08-13 00:00:00 (JST)
+const CUTOFF_POSTED_AT = (() => {
+  const epoch2000 = Date.UTC(2000, 0, 1, 0, 0, 0);
+  const cutoffUtcMs = Date.UTC(2026, 7, 13, 0, 0, 0) - 9 * 60 * 60 * 1000; // JST→UTC
+  return Math.floor((cutoffUtcMs - epoch2000) / 60000);
+})();
+
+/** authorが既に本登録済みか */
+async function isAuthorConfirmed(author) {
+  const { rows } = await pool.query(
+    "SELECT 1 FROM maker_accounts WHERE author=$1 AND status='confirmed'", [author]
+  );
+  return rows.length > 0;
+}
+
+/** authorが基準日より前に投稿されたコースで使われているか */
+async function isAuthorUsedBeforeCutoff(author) {
+  const { rows } = await pool.query(
+    "SELECT 1 FROM courses WHERE author=$1 AND posted_at < $2 LIMIT 1",
+    [author, CUTOFF_POSTED_AT]
+  );
+  return rows.length > 0;
+}
+
+/** そのusernameが基準日より前に、そのauthor名で投稿していたか */
+async function hasUsernameUsedAuthorBeforeCutoff(author, username) {
+  const { rows } = await pool.query(
+    "SELECT 1 FROM courses WHERE author=$1 AND username=$2 AND posted_at < $3 LIMIT 1",
+    [author, username, CUTOFF_POSTED_AT]
+  );
+  return rows.length > 0;
+}
+
+/** authorの登録状態: 'confirmed' | 'pending' | null */
+async function getMakerStatus(author) {
+  const { rows } = await pool.query(
+    `SELECT status FROM maker_accounts WHERE author=$1
+     ORDER BY (status='confirmed') DESC, created_at DESC LIMIT 1`,
+    [author]
+  );
+  return rows[0]?.status || null;
+}
+
+/** 本登録: パスワードをハッシュ化して保存し、同名authorの仮登録は自動で削除(却下)する */
+async function registerMakerConfirmed(author, username, password) {
+  const passwordHash = await bcrypt.hash(password, 10);
+  await pool.query(
+    "INSERT INTO maker_accounts (author, username, password_hash, status) VALUES ($1,$2,$3,'confirmed')",
+    [author, username, passwordHash]
+  );
+  await pool.query(
+    "DELETE FROM maker_accounts WHERE author=$1 AND status='pending'", [author]
+  );
+}
+
+/** 仮登録: 審査待ちとして保存する */
+async function registerMakerPending(author, username, password) {
+  const passwordHash = await bcrypt.hash(password, 10);
+  await pool.query(
+    "INSERT INTO maker_accounts (author, username, password_hash, status) VALUES ($1,$2,$3,'pending')",
+    [author, username, passwordHash]
+  );
+}
+
+/** 本登録済みauthorのパスワード照合 */
+async function verifyMakerPassword(author, password) {
+  const { rows } = await pool.query(
+    "SELECT password_hash FROM maker_accounts WHERE author=$1 AND status='confirmed'", [author]
+  );
+  if (!rows.length) return false;
+  return bcrypt.compare(password, rows[0].password_hash);
+}
+
+// ── 管理サイト用 ──
+
+/** 仮登録一覧（審査待ち） */
+async function listPendingMakers() {
+  const { rows } = await pool.query(
+    "SELECT id, author, username, created_at FROM maker_accounts WHERE status='pending' ORDER BY created_at ASC"
+  );
+  return rows;
+}
+
+/** 仮登録を承認: 本登録に切り替え、同名authorの他の仮登録は自動で削除(却下)する */
+async function approvePendingMaker(id) {
+  const { rows } = await pool.query(
+    "SELECT author FROM maker_accounts WHERE id=$1 AND status='pending'", [id]
+  );
+  if (!rows.length) return false;
+  const author = rows[0].author;
+  try {
+    await pool.query("UPDATE maker_accounts SET status='confirmed' WHERE id=$1", [id]);
+  } catch (e) {
+    // 既に別の申請が先に本登録済み(ユニーク制約違反)などの場合
+    return false;
+  }
+  await pool.query(
+    "DELETE FROM maker_accounts WHERE author=$1 AND status='pending' AND id<>$2", [author, id]
+  );
+  return true;
+}
+
+/** 仮登録を却下: 該当行を削除する */
+async function rejectPendingMaker(id) {
+  const { rowCount } = await pool.query(
+    "DELETE FROM maker_accounts WHERE id=$1 AND status='pending'", [id]
+  );
+  return rowCount > 0;
+}
+
+// ─────────────────────────────────────────────
+// 統計更新
+// ─────────────────────────────────────────────
+async function incrementPlay(courseId) {
+  await pool.query(
+    "UPDATE courses SET play_count=play_count+1 WHERE id=$1", [courseId]
+  );
+}
+
+async function incrementAttempt(courseId) {
+  await pool.query(
+    "UPDATE courses SET attempt_count=attempt_count+1 WHERE id=$1", [courseId]
+  );
+}
+
+async function incrementClear(courseId) {
+  await pool.query(
+    "UPDATE courses SET clear_count=clear_count+1 WHERE id=$1", [courseId]
+  );
+}
+
+const LIKES_MAX = 50000;
+
+async function addLike(username, courseId) {
+  const { rows } = await pool.query(
+    "SELECT 1 FROM likes WHERE username=$1 AND course_id=$2", [username, courseId]
+  );
+  if (rows.length) return { alreadyLiked: true };
+
+  const now = Math.floor(Date.now() / 1000);
+  await pool.query(
+    "INSERT INTO likes (username, course_id, created_at) VALUES ($1,$2,$3)",
+    [username, courseId, now]
+  );
+  await pool.query(
+    "UPDATE courses SET like_count=like_count+1 WHERE id=$1", [courseId]
+  );
+
+  const { rows: countRows } = await pool.query("SELECT COUNT(*) FROM likes");
+  const count = parseInt(countRows[0].count, 10);
+  if (count > LIKES_MAX) {
+    const excess = count - LIKES_MAX;
+    await pool.query(
+      `DELETE FROM likes WHERE id IN (
+         SELECT id FROM likes ORDER BY id ASC LIMIT $1
+       )`, [excess]
+    );
+    console.log(`🗑️ 古いいいねを ${excess} 件削除しました`);
+  }
+
+  return { alreadyLiked: false };
+}
+
+async function deleteOldLikes() {
+  const cutoff = Math.floor(Date.now() / 1000) - 7 * 24 * 60 * 60;
+  const { rowCount } = await pool.query(
+    "DELETE FROM likes WHERE created_at < $1", [cutoff]
+  );
+  if (rowCount > 0) console.log(`🗑️ 古いいいねを ${rowCount} 件削除しました`);
+}
+
+/** 指定usernameが、直近sinceSeconds秒以内に同一author名のコースへ何件いいねしたか */
+async function countRecentLikesForAuthor(username, author, sinceTimestamp) {
+  const { rows } = await pool.query(
+    `SELECT COUNT(*) FROM likes l
+     JOIN courses c ON c.id = l.course_id
+     WHERE l.username = $1 AND c.author = $2 AND l.created_at >= $3`,
+    [username, author, sinceTimestamp]
+  );
+  return parseInt(rows[0].count, 10);
+}
+
+async function resetWeeklyLikes() {
+  await deleteOldLikes();
+}
+
+// ─────────────────────────────────────────────
+// 通知
+// ─────────────────────────────────────────────
+async function upsertNotification(username, cmd) {
+  await pool.query(
+    `INSERT INTO notifications (username, cmd) VALUES ($1, $2)
+     ON CONFLICT (username) DO UPDATE SET cmd = EXCLUDED.cmd`,
+    [username, cmd]
+  );
+}
+
+async function getAndDeleteNotification(username) {
+  const { rows } = await pool.query(
+    "DELETE FROM notifications WHERE username=$1 RETURNING cmd", [username]
+  );
+  return rows[0] || null;
+}
+
+// ─────────────────────────────────────────────
+// BAN
+// ─────────────────────────────────────────────
+async function banUser(username, expiresAt) {
+  // usernameをBAN
+  await pool.query(
+    `INSERT INTO bans (username, expires_at) VALUES ($1, $2)
+     ON CONFLICT (username) DO UPDATE SET expires_at = EXCLUDED.expires_at`,
+    [username, expiresAt]
+  );
+  // そのユーザーが過去に投稿したコースのIPアドレスも全てBAN
+  const { rows: ipRows } = await pool.query(
+    "SELECT DISTINCT ip_address FROM courses WHERE username=$1 AND ip_address IS NOT NULL",
+    [username]
+  );
+  for (const { ip_address } of ipRows) {
+    await pool.query(
+      `INSERT INTO bans (username, expires_at) VALUES ($1, $2)
+       ON CONFLICT (username) DO UPDATE SET expires_at = EXCLUDED.expires_at`,
+      [ip_address, expiresAt]
+    );
+  }
+}
+
+async function isUserBanned(username, ipAddress = null) {
+  const now = Math.floor(Date.now() / 1000);
+  // usernameチェック
+  const { rows } = await pool.query(
+    "SELECT 1 FROM bans WHERE username=$1 AND expires_at > $2", [username, now]
+  );
+  if (rows.length > 0) return true;
+  // IPアドレスチェック
+  if (ipAddress) {
+    const { rows: ipRows } = await pool.query(
+      "SELECT 1 FROM bans WHERE username=$1 AND expires_at > $2", [ipAddress, now]
+    );
+    if (ipRows.length > 0) return true;
+  }
+  return false;
+}
+
+async function deleteCourse(courseId) {
+  const { rows } = await pool.query(
+    "DELETE FROM courses WHERE id=$1 RETURNING username", [courseId]
+  );
+  return rows[0] || null; // { username } or null
+}
+
+async function getStats() {
+  // posted_atは2000年1月1日からの分数なので7日分は60*24*7=10080分
+  const weekAgo = minutesSince2000() - 10080;
+  const { rows } = await pool.query(`
+    SELECT
+      COUNT(*)                                          AS total_courses,
+      COALESCE(SUM(play_count), 0)                      AS total_plays,
+      COALESCE(SUM(like_count), 0)                      AS total_likes,
+      COALESCE(SUM(clear_count), 0)                     AS total_clears,
+      COALESCE(SUM(attempt_count), 0)                   AS total_attempts,
+      COUNT(*) FILTER (WHERE posted_at >= $1)           AS weekly_courses,
+      (SELECT id FROM courses ORDER BY posted_at DESC LIMIT 1) AS latest_course_id
+    FROM courses
+  `, [weekAgo]);
+  return rows[0];
+}
+
+module.exports = {
+  initDB, pool,
+  saveCourse, getCourseById,
+  getRandomCourses, getWeeklyRanking, getAllTimeRanking,
+  searchByCourseId, searchByAuthor, getNewArrivalCourses,
+  incrementPlay, incrementAttempt, incrementClear, addLike,
+  resetWeeklyLikes, deleteOldLikes, minutesSince2000, countRecentLikesForAuthor,
+  upsertNotification, getAndDeleteNotification,
+  banUser, isUserBanned, deleteCourse, getStats,
+  isOfficialMaker, hasPostedAsAuthor,
+  getMakerRankingWeek, getMakerRankingAllTime, getMakerInfo, getOfficialMakers,
+  getLatestAnnouncement,
+  isAuthorConfirmed, isAuthorUsedBeforeCutoff, hasUsernameUsedAuthorBeforeCutoff,
+  getMakerStatus, registerMakerConfirmed, registerMakerPending, verifyMakerPassword,
+  listPendingMakers, approvePendingMaker, rejectPendingMaker,
 };
-
-const SEND_INTERVAL = 120;
-function sleep(ms) { return new Promise(r => setTimeout(r, ms)); }
-function randomCloud() { return CLOUD_VARS[Math.floor(Math.random() * CLOUD_VARS.length)]; }
-
-function parseUserId(s, pos = 0) {
-  const { value, next } = decodeLenLen(s, pos);
-  return { userId: String(value), next };
-}
-function parseCmd(s, pos) {
-  const { value, next } = decodeLen(s, pos);
-  return { cmd: value, next };
-}
-
-async function sendCloud(setter, name, value) {
-  await setter(name, String(value));
-  await sleep(SEND_INTERVAL);
-}
-
-// ─────────────────────────────────────────────
-// 汎用: 複数件のエンコード済み文字列をmaxLenでチャンク分割して送信
-// ─────────────────────────────────────────────
-async function sendEncodedItems(setter, userId, cmd, items) {
-  const header = encodeLenLen(parseInt(userId)) + encodeLen(cmd);
-  const maxLen = 1000;
-  let buffer = "";
-  for (const item of items) {
-    if (buffer.length > 0 && (header + buffer + item).length > maxLen) {
-      await sendCloud(setter, randomCloud(), header + buffer);
-      buffer = "";
-    }
-    buffer += item;
-  }
-  if (buffer.length > 0) {
-    await sendCloud(setter, randomCloud(), header + buffer);
-  }
-}
-
-// ─────────────────────────────────────────────
-// コース情報エンコード（CMD=10,11,12,15共通）
-// ─────────────────────────────────────────────
-function encodeCourseInfo(row, index) {
-  const clearRate = row.attempt_count > 0
-    ? Math.round(row.clear_count / row.attempt_count * 10000) / 100
-    : 0;
-  const clearRateEncoded = Math.round(clearRate * 100);
-  return encodeLen(index)
-    + encodeLen(row.like_count)
-    + encodeLen(row.play_count)
-    + encodeLen(clearRateEncoded)
-    + encodeText(row.title)
-    + encodeAlphabet(row.id)
-    + encodeAlphabet(row.author)
-    + encodeLen(row.posted_at);
-}
-
-async function sendCourseList(setter, userId, cmd, rows) {
-  const items = rows.map((row, i) => encodeCourseInfo(row, i + 1));
-  await sendEncodedItems(setter, userId, cmd, items);
-}
-
-// ─────────────────────────────────────────────
-// 職人ランキング行エンコード（CMD=16,17）
-// 何番目(len) + author(alphabet) + いいね数(len) + プレイ数(len)
-//   + 直近投稿日(lenlen, YYYYMMDDHHmm) + 公式ユーザー(len, 1/0)
-// ─────────────────────────────────────────────
-function encodeMakerRankRow(row, index) {
-  return encodeLen(index)
-    + encodeAlphabet(row.author)
-    + encodeLen(row.like_count)
-    + encodeLen(row.play_count)
-    + encodeLenLen(minutesToDateTimeInt(row.latest_posted_at))
-    + encodeLen(row.is_official ? 1 : 0);
-}
-
-async function sendMakerRankingList(setter, userId, cmd, rows) {
-  const items = rows.map((row, i) => encodeMakerRankRow(row, i + 1));
-  await sendEncodedItems(setter, userId, cmd, items);
-}
-
-// ─────────────────────────────────────────────
-// 職人情報エンコード（CMD=18単体 / CMD=19一覧の要素）
-// author(alphabet) + 総いいね数(len) + 総プレイ数(len) + 総投稿コース数(len)
-//   + 全体ランキング順位(len) + 週間ランキング順位(len) + 直近投稿日(lenlen, YYYYMMDDHHmm)
-// ─────────────────────────────────────────────
-function encodeMakerInfo(row) {
-  return encodeAlphabet(row.author)
-    + encodeLen(row.total_likes)
-    + encodeLen(row.total_plays)
-    + encodeLen(row.total_courses)
-    + encodeLen(row.all_time_rank)
-    + encodeLen(row.weekly_rank)
-    + encodeLenLen(minutesToDateTimeInt(row.latest_posted_at));
-}
-
-async function sendCourseData(setter, userId, stageData) {
-  const headerBase = encodeLenLen(parseInt(userId)) + encodeLen(CMD.GET_COURSE);
-  const maxLen = 1000;
-  const overhead = headerBase.length + 2 + 2;
-  const chunkSize = maxLen - overhead;
-  const totalChunks = Math.ceil(stageData.length / chunkSize);
-  const totalEnc = encodeLen(totalChunks);
-  for (let i = 0; i < totalChunks; i++) {
-    const seq = i + 1;
-    const chunk = stageData.slice(i * chunkSize, (i + 1) * chunkSize);
-    await sendCloud(setter, randomCloud(), headerBase + totalEnc + encodeLen(seq) + chunk);
-  }
-  await sendCloud(setter, randomCloud(), headerBase + totalEnc + encodeLen(0));
-}
-
-function isValidNum(value) { return typeof value === "number" && !isNaN(value) && isFinite(value); }
-function isValidStr(value) { return typeof value === "string" && value.length > 0; }
-
-async function handleRequest(s, setter, getOnlineUsers) {
-  let pos = 0;
-  const { userId, next: p1 } = parseUserId(s, pos); pos = p1;
-  if (!userId || isNaN(parseInt(userId))) { console.warn("⚠️ 不正なユーザーID:", userId); return; }
-  const { cmd, next: p2 } = parseCmd(s, pos); pos = p2;
-  if (!isValidNum(cmd)) { console.warn("⚠️ 不正なコマンドコード:", cmd); return; }
-
-  // 全コマンド共通: usernameを取得
-  let username;
-  try {
-    const { value, next } = decodeAlphabet(s, pos);
-    username = value;
-    pos = next;
-  } catch (e) {
-    // usernameのデコードに失敗した場合
-    if (cmd === CMD.GET_STATS) {
-      // CMD=90の旧式リクエスト
-      await sendCloud(setter, randomCloud(), encodeLenLen(parseInt(userId)) + encodeLen(407));
-      return;
-    }
-    console.warn("⚠️ usernameデコード失敗:", e.message); return;
-  }
-  if (!isValidStr(username)) {
-    if (cmd === CMD.GET_STATS) {
-      await sendCloud(setter, randomCloud(), encodeLenLen(parseInt(userId)) + encodeLen(407));
-      return;
-    }
-    console.warn("⚠️ 不正なusername:", username); return;
-  }
-
-  // CMD=10〜12,15: ランキング・ランダム・新着
-  if (cmd === CMD.RANDOM || cmd === CMD.WEEKLY || cmd === CMD.ALL_TIME || cmd === CMD.NEW_ARRIVAL) {
-    const { value: limit, next: p3 } = decodeLen(s, pos); pos = p3;
-    if (!isValidNum(limit) || limit <= 0) { console.warn("⚠️ 不正なlimit:", limit); return; }
-    let rows;
-    if      (cmd === CMD.RANDOM)      rows = await db.getRandomCourses(limit);
-    else if (cmd === CMD.WEEKLY)      rows = await db.getWeeklyRanking(limit);
-    else if (cmd === CMD.NEW_ARRIVAL) rows = await db.getNewArrivalCourses(limit);
-    else                               rows = await db.getAllTimeRanking(limit);
-    await sendCourseList(setter, userId, cmd, rows);
-    return;
-  }
-
-  // CMD=13: コースID検索
-  if (cmd === CMD.SEARCH_ID) {
-    const { value: courseId } = decodeAlphabet(s, pos);
-    if (!isValidStr(courseId)) { console.warn("⚠️ 不正なcourseId:", courseId); return; }
-    const rows = await db.searchByCourseId(courseId);
-    if (!rows.length) {
-      await sendCloud(setter, randomCloud(), encodeLenLen(parseInt(userId)) + encodeLen(300));
-      return;
-    }
-    await sendCourseList(setter, userId, cmd, rows);
-    return;
-  }
-
-  // CMD=14: 作者名検索
-  if (cmd === CMD.SEARCH_AUTHOR) {
-    const { value: author, next: p3 } = decodeAlphabet(s, pos); pos = p3;
-    if (!isValidStr(author)) { console.warn("⚠️ 不正なauthor:", author); return; }
-    const { value: limit } = decodeLen(s, pos);
-    if (!isValidNum(limit) || limit <= 0) { console.warn("⚠️ 不正なlimit:", limit); return; }
-    const rows = await db.searchByAuthor(author, limit);
-    if (!rows.length) {
-      await sendCloud(setter, randomCloud(), encodeLenLen(parseInt(userId)) + encodeLen(300));
-      return;
-    }
-    await sendCourseList(setter, userId, cmd, rows);
-    return;
-  }
-
-  // CMD=16,17: 職人ランキング（週間 / 累計）
-  if (cmd === CMD.MAKER_RANK_WEEK || cmd === CMD.MAKER_RANK_ALL) {
-    const { value: limit } = decodeLen(s, pos);
-    if (!isValidNum(limit) || limit <= 0) { console.warn("⚠️ 不正なlimit:", limit); return; }
-    const rows = cmd === CMD.MAKER_RANK_WEEK
-      ? await db.getMakerRankingWeek(limit)
-      : await db.getMakerRankingAllTime(limit);
-    await sendMakerRankingList(setter, userId, cmd, rows);
-    return;
-  }
-
-  // CMD=18: 職人情報（author指定）
-  if (cmd === CMD.MAKER_INFO) {
-    const { value: targetAuthor } = decodeAlphabet(s, pos);
-    if (!isValidStr(targetAuthor)) { console.warn("⚠️ 不正なauthor:", targetAuthor); return; }
-    const info = await db.getMakerInfo(targetAuthor);
-    if (!info) {
-      await sendCloud(setter, randomCloud(), encodeLenLen(parseInt(userId)) + encodeLen(300));
-      return;
-    }
-    const payload = encodeLenLen(parseInt(userId)) + encodeLen(CMD.MAKER_INFO) + encodeMakerInfo(info);
-    await sendCloud(setter, randomCloud(), payload);
-    return;
-  }
-
-  // CMD=19: 公式職人一覧（CMD=16,17と同じエンコード形式）
-  if (cmd === CMD.OFFICIAL_MAKER) {
-    const { value: limit } = decodeLen(s, pos);
-    if (!isValidNum(limit) || limit <= 0) { console.warn("⚠️ 不正なlimit:", limit); return; }
-    const rows = await db.getOfficialMakers(limit);
-    await sendMakerRankingList(setter, userId, cmd, rows);
-    return;
-  }
-
-  // CMD=50: 職人名の登録可否チェック
-  if (cmd === CMD.REGISTER_CHECK_AUTHOR) {
-    const { value: targetAuthor } = decodeAlphabet(s, pos);
-    if (!isValidStr(targetAuthor)) { console.warn("⚠️ 不正なauthor:", targetAuthor); return; }
-    let result;
-    if (await db.isAuthorConfirmed(targetAuthor)) result = 3;
-    else if (await db.isAuthorUsedBeforeCutoff(targetAuthor)) result = 2;
-    else result = 1;
-    await sendCloud(setter, randomCloud(), encodeLenLen(parseInt(userId)) + encodeLen(CMD.REGISTER_CHECK_AUTHOR) + encodeLen(result));
-    return;
-  }
-
-  // CMD=51: 指定usernameが基準日より前にそのauthor名を使用していたか
-  if (cmd === CMD.REGISTER_CHECK_USERNAME) {
-    const { value: targetAuthor, next: q1 } = decodeAlphabet(s, pos);
-    const { value: targetUsername } = decodeAlphabet(s, q1);
-    if (!isValidStr(targetAuthor) || !isValidStr(targetUsername)) {
-      console.warn("⚠️ 不正な入力:", targetAuthor, targetUsername); return;
-    }
-    const used = await db.hasUsernameUsedAuthorBeforeCutoff(targetAuthor, targetUsername);
-    await sendCloud(setter, randomCloud(), encodeLenLen(parseInt(userId)) + encodeLen(CMD.REGISTER_CHECK_USERNAME) + encodeLen(used ? 1 : 0));
-    return;
-  }
-
-  // CMD=52: 職人名登録（本登録 / 仮登録）
-  if (cmd === CMD.REGISTER_SUBMIT) {
-    const { value: targetAuthor, next: q1 } = decodeAlphabet(s, pos);
-    const { value: password, next: q2 } = decodeAlphabet(s, q1);
-    const { value: regType } = decodeLen(s, q2);
-    if (!isValidStr(targetAuthor) || !isValidStr(password) || !isValidNum(regType)) {
-      console.warn("⚠️ 不正な登録リクエスト"); return;
-    }
-
-    if (regType === 0) {
-      // 本登録: 基礎データのusernameは信用せず、サーバー側で独立に再チェックする
-      const confirmed  = await db.isAuthorConfirmed(targetAuthor);
-      const usedBefore = await db.isAuthorUsedBeforeCutoff(targetAuthor);
-      if (confirmed || usedBefore) {
-        // 既に登録済み、または事前投稿実績のある職人名は本登録不可（仮登録を使うべき）
-        await sendCloud(setter, randomCloud(), encodeLenLen(parseInt(userId)) + encodeLen(CMD.REGISTER_SUBMIT) + encodeLen(0));
-        return;
-      }
-      await db.registerMakerConfirmed(targetAuthor, username, password);
-      await sendCloud(setter, randomCloud(), encodeLenLen(parseInt(userId)) + encodeLen(CMD.REGISTER_SUBMIT) + encodeLen(1));
-      return;
-    } else {
-      // 仮登録: 既に本登録済みなら保存せず、いずれにせよ結果は0
-      const confirmed = await db.isAuthorConfirmed(targetAuthor);
-      if (!confirmed) {
-        await db.registerMakerPending(targetAuthor, username, password);
-      }
-      await sendCloud(setter, randomCloud(), encodeLenLen(parseInt(userId)) + encodeLen(CMD.REGISTER_SUBMIT) + encodeLen(0));
-      return;
-    }
-  }
-
-  // CMD=53: 職人名の登録状態確認
-  if (cmd === CMD.REGISTER_STATUS) {
-    const { value: targetAuthor } = decodeAlphabet(s, pos);
-    if (!isValidStr(targetAuthor)) { console.warn("⚠️ 不正なauthor:", targetAuthor); return; }
-    const status = await db.getMakerStatus(targetAuthor);
-    const result = status === "confirmed" ? 1 : status === "pending" ? 2 : 3;
-    await sendCloud(setter, randomCloud(), encodeLenLen(parseInt(userId)) + encodeLen(CMD.REGISTER_STATUS) + encodeLen(result));
-    return;
-  }
-
-  // CMD=54: 職人名とパスワードの照合
-  if (cmd === CMD.REGISTER_LOGIN) {
-    const { value: targetAuthor, next: q1 } = decodeAlphabet(s, pos);
-    const { value: password } = decodeAlphabet(s, q1);
-    if (!isValidStr(targetAuthor) || !isValidStr(password)) { console.warn("⚠️ 不正なログイン要求"); return; }
-    const ok = await db.verifyMakerPassword(targetAuthor, password);
-    await sendCloud(setter, randomCloud(), encodeLenLen(parseInt(userId)) + encodeLen(CMD.REGISTER_LOGIN) + encodeLen(ok ? 1 : 0));
-    return;
-  }
-
-  // CMD=20〜23: 統計更新
-  if (cmd === CMD.LIKE || cmd === CMD.PLAY || cmd === CMD.ATTEMPT || cmd === CMD.CLEAR) {
-    const { value: courseId } = decodeAlphabet(s, pos);
-    if (!isValidStr(courseId)) {
-      console.warn("⚠️ 不正なcourseId:", courseId); return;
-    }
-    if (cmd === CMD.PLAY)    { await db.incrementPlay(courseId); await db.incrementAttempt(courseId); return; }
-    if (cmd === CMD.ATTEMPT) { await db.incrementAttempt(courseId); return; }
-    if (cmd === CMD.CLEAR)   { await db.incrementClear(courseId);   return; }
-    if (cmd === CMD.LIKE) {
-      const banned = await db.isUserBanned(username);
-      if (banned) {
-        await sendCloud(setter, randomCloud(), encodeLenLen(parseInt(userId)) + encodeLen(405));
-        return;
-      }
-      // コース投稿者本人によるいいねは、既にいいね済みの場合と同じCMDを返して弾く
-      const course = await db.getCourseById(courseId);
-      if (course && course.username === username) {
-        await sendCloud(setter, randomCloud(), encodeLenLen(parseInt(userId)) + encodeLen(200));
-        return;
-      }
-      // 同一usernameが同一author名のコースに30分間で3件以上いいねしていたら、30分経つまで弾く
-      if (course) {
-        const since = Math.floor(Date.now() / 1000) - 30 * 60;
-        const recentCount = await db.countRecentLikesForAuthor(username, course.author, since);
-        if (recentCount >= 3) {
-          await sendCloud(setter, randomCloud(), encodeLenLen(parseInt(userId)) + encodeLen(202));
-          return;
-        }
-      }
-      const { alreadyLiked } = await db.addLike(username, courseId);
-      if (alreadyLiked) {
-        await sendCloud(setter, randomCloud(), encodeLenLen(parseInt(userId)) + encodeLen(200));
-      } else {
-        await sendCloud(setter, randomCloud(), encodeLenLen(parseInt(userId)) + encodeLen(201));
-      }
-      return;
-    }
-  }
-
-  // CMD=30: コースデータ取得
-  if (cmd === CMD.GET_COURSE) {
-    const { value: courseId } = decodeAlphabet(s, pos);
-    if (!isValidStr(courseId)) { console.warn("⚠️ 不正なcourseId:", courseId); return; }
-    const row = await db.getCourseById(courseId);
-    if (!row) return;
-    await sendCourseData(setter, userId, row.stage_data);
-    return;
-  }
-
-  // CMD=40: 通知取得（usernameは共通部分で取得済み）
-  if (cmd === CMD.GET_NOTIFY) {
-    const notification = await db.getAndDeleteNotification(username);
-    if (notification) {
-      await sendCloud(setter, randomCloud(), encodeLenLen(parseInt(userId)) + encodeLen(notification.cmd));
-    } else {
-      await sendCloud(setter, randomCloud(), encodeLenLen(parseInt(userId)) + encodeLen(500));
-    }
-    return;
-  }
-
-  // CMD=90: 統計データ取得（usernameは共通部分で取得済み）
-  if (cmd === CMD.GET_STATS) {
-    const stats = await db.getStats();
-    const payload = encodeLenLen(parseInt(userId))
-      + encodeLen(CMD.GET_STATS)
-      + encodeLen(parseInt(stats.total_courses))
-      + encodeLen(parseInt(stats.total_plays))
-      + encodeLen(parseInt(stats.total_likes))
-      + encodeLen(parseInt(stats.total_clears))
-      + encodeLen(parseInt(stats.total_attempts))
-      + encodeLen(parseInt(stats.weekly_courses))
-      + encodeLen(getOnlineUsers())
-      + (stats.latest_course_id ? encodeAlphabet(stats.latest_course_id) : encodeAlphabet("000-000-000"));
-    await sendCloud(setter, randomCloud(), payload);
-    return;
-  }
-
-  // CMD=91: 公式お知らせ取得（usernameは共通部分で取得済み、長さ制限を設けず単発送信）
-  if (cmd === CMD.GET_ANNOUNCEMENT) {
-    const announcement = await db.getLatestAnnouncement();
-    if (!announcement) {
-      await sendCloud(setter, randomCloud(), encodeLenLen(parseInt(userId)) + encodeLen(300));
-      return;
-    }
-    const payload = encodeLenLen(parseInt(userId))
-      + encodeLen(CMD.GET_ANNOUNCEMENT)
-      + encodeText(announcement.title)
-      + encodeLenLen(minutesToDateTimeInt(announcement.created_at))
-      + encodeText(announcement.body);
-    await sendCloud(setter, randomCloud(), payload);
-    return;
-  }
-
-  // CMD=600: ユーザー名変更検知→自動BAN（usernameは共通部分で取得済み）
-  if (cmd === CMD.BAN_USERNAME) {
-    // 既にBAN中の場合は期限を延長しない（繰り返し検知されても15分で確実に解除されるようにする）
-    const alreadyBanned = await db.isUserBanned(username);
-    if (!alreadyBanned) {
-      const expiresAt = Math.floor(Date.now() / 1000) + 15 * 60;
-      await db.banUser(username, expiresAt);
-      console.log(`🔨 自動BAN: ${username}`);
-    }
-    return;
-  }
-
-  console.warn("⚠️ 未知のコマンドコード:", cmd);
-}
-
-const uploadBuffers = new Map();
-const UPLOAD_TIMEOUT = 60 * 1000;
-
-async function handleUploadChunk(s, setter) {
-  let pos = 0;
-  const { userId, next: p1 } = parseUserId(s, pos); pos = p1;
-  const { cmd, next: p2 } = parseCmd(s, pos); pos = p2;
-  if (cmd !== CMD.UPLOAD) return;
-
-  const { value: username, next: p3 } = decodeAlphabet(s, pos); pos = p3;
-  if (!isValidStr(username)) { console.warn("⚠️ 不正なusername:", username); return; }
-
-  const banned = await db.isUserBanned(username);
-  if (banned) {
-    await sendCloud(setter, randomCloud(), encodeLenLen(parseInt(userId)) + encodeLen(103));
-    return;
-  }
-
-  const { value: totalChunks, next: p4 } = decodeLen(s, pos); pos = p4;
-  const { value: seq, next: p5 } = decodeLen(s, pos); pos = p5;
-
-  if (!uploadBuffers.has(userId)) {
-    const timer = setTimeout(() => uploadBuffers.delete(userId), UPLOAD_TIMEOUT);
-    uploadBuffers.set(userId, { totalChunks, chunks: new Map(), timer, username });
-  }
-  const buf = uploadBuffers.get(userId);
-  buf.totalChunks = totalChunks;
-  buf.username = username;
-
-  if (seq === 0) {
-    const { value: title, next: p6 } = decodeText(s, pos); pos = p6;
-    const { value: author } = decodeAlphabet(s, pos);
-    buf.title  = title;
-    buf.author = author;
-
-    let allPresent = true;
-    for (let i = 1; i <= buf.totalChunks; i++) {
-      if (!buf.chunks.has(i)) { allPresent = false; break; }
-    }
-    clearTimeout(buf.timer);
-    uploadBuffers.delete(userId);
-
-    if (allPresent) {
-      let stageData = "";
-      for (let i = 1; i <= totalChunks; i++) stageData += buf.chunks.get(i);
-      try {
-        const result = await db.saveCourse(buf.title, buf.author, buf.username, stageData);
-        if (result.duplicate) {
-          await sendCloud(setter, randomCloud(), encodeLenLen(parseInt(userId)) + encodeLen(102));
-        } else {
-          await sendCloud(setter, randomCloud(), encodeLenLen(parseInt(userId)) + encodeLen(100) + encodeAlphabet(result.id));
-        }
-      } catch (e) {
-        console.error("コース保存失敗:", e.message);
-        await sendCloud(setter, randomCloud(), encodeLenLen(parseInt(userId)) + encodeLen(101));
-      }
-    } else {
-      await sendCloud(setter, randomCloud(), encodeLenLen(parseInt(userId)) + encodeLen(101));
-    }
-  } else {
-    buf.chunks.set(seq, s.slice(pos));
-  }
-}
-
-async function onMessage(name, value, setter, getOnlineUsers) {
-  const s = String(value);
-  if (!s || s.length < 3) return;
-  try {
-    const { next: p1 } = parseUserId(s, 0);
-    const { cmd }      = parseCmd(s, p1);
-    if (cmd === CMD.UPLOAD) {
-      await handleUploadChunk(s, setter);
-    } else if (REQUEST_VARS.includes(name)) {
-      await handleRequest(s, setter, getOnlineUsers);
-    }
-  } catch (e) {
-    console.error(`❌ メッセージ処理エラー (${name}):`, e.message);
-  }
-}
-
-// ─────────────────────────────────────────────
-// 管理ページ用APIハンドラ
-// ─────────────────────────────────────────────
-function checkAuth(req) {
-  const auth = req.headers["authorization"] || "";
-  const b64  = auth.replace(/^Basic /, "");
-  const decoded = Buffer.from(b64, "base64").toString("utf8");
-  const [, pass] = decoded.split(":");
-  return pass === ADMIN_PASSWORD;
-}
-
-async function handleManageAPI(req, res) {
-  if (!checkAuth(req)) {
-    res.writeHead(401, { "WWW-Authenticate": 'Basic realm="manage"', "Content-Type": "application/json" });
-    res.end(JSON.stringify({ error: "unauthorized" }));
-    return;
-  }
-
-  const url = new URL(req.url, `http://localhost`);
-  const pathname = url.pathname;
-
-  // POST /api/delete-course
-  if (req.method === "POST" && pathname === "/api/delete-course") {
-    let body = "";
-    req.on("data", d => body += d);
-    req.on("end", async () => {
-      try {
-        const { courseId, reason } = JSON.parse(body);
-        if (!courseId || !reason) {
-          res.writeHead(400, { "Content-Type": "application/json" });
-          res.end(JSON.stringify({ error: "courseId, reason は必須です" }));
-          return;
-        }
-        const deleted = await db.deleteCourse(courseId);
-        if (!deleted) {
-          res.writeHead(404, { "Content-Type": "application/json" });
-          res.end(JSON.stringify({ error: "コースが見つかりません" }));
-          return;
-        }
-        await db.upsertNotification(deleted.username, reason);
-        res.writeHead(200, { "Content-Type": "application/json" });
-        res.end(JSON.stringify({ ok: true }));
-      } catch (e) {
-        res.writeHead(500, { "Content-Type": "application/json" });
-        res.end(JSON.stringify({ error: e.message }));
-      }
-    });
-    return;
-  }
-
-  // POST /api/ban-user
-  if (req.method === "POST" && pathname === "/api/ban-user") {
-    let body = "";
-    req.on("data", d => body += d);
-    req.on("end", async () => {
-      try {
-        const { username, duration } = JSON.parse(body);
-        if (!username || !duration) {
-          res.writeHead(400, { "Content-Type": "application/json" });
-          res.end(JSON.stringify({ error: "username, duration は必須です" }));
-          return;
-        }
-        const expiresAt = Math.floor(Date.now() / 1000) + parseInt(duration, 10);
-        await db.banUser(username, expiresAt);
-        await db.upsertNotification(username, 400);
-        res.writeHead(200, { "Content-Type": "application/json" });
-        res.end(JSON.stringify({ ok: true }));
-      } catch (e) {
-        res.writeHead(500, { "Content-Type": "application/json" });
-        res.end(JSON.stringify({ error: e.message }));
-      }
-    });
-    return;
-  }
-
-  // GET /api/pending-makers
-  if (req.method === "GET" && pathname === "/api/pending-makers") {
-    try {
-      const makers = await db.listPendingMakers();
-      res.writeHead(200, { "Content-Type": "application/json" });
-      res.end(JSON.stringify({ ok: true, makers }));
-    } catch (e) {
-      res.writeHead(500, { "Content-Type": "application/json" });
-      res.end(JSON.stringify({ error: e.message }));
-    }
-    return;
-  }
-
-  // POST /api/approve-maker
-  if (req.method === "POST" && pathname === "/api/approve-maker") {
-    let body = "";
-    req.on("data", d => body += d);
-    req.on("end", async () => {
-      try {
-        const { id } = JSON.parse(body);
-        if (!id) {
-          res.writeHead(400, { "Content-Type": "application/json" });
-          res.end(JSON.stringify({ error: "id は必須です" }));
-          return;
-        }
-        const ok = await db.approvePendingMaker(id);
-        res.writeHead(200, { "Content-Type": "application/json" });
-        res.end(JSON.stringify({ ok }));
-      } catch (e) {
-        res.writeHead(500, { "Content-Type": "application/json" });
-        res.end(JSON.stringify({ error: e.message }));
-      }
-    });
-    return;
-  }
-
-  // POST /api/reject-maker
-  if (req.method === "POST" && pathname === "/api/reject-maker") {
-    let body = "";
-    req.on("data", d => body += d);
-    req.on("end", async () => {
-      try {
-        const { id } = JSON.parse(body);
-        if (!id) {
-          res.writeHead(400, { "Content-Type": "application/json" });
-          res.end(JSON.stringify({ error: "id は必須です" }));
-          return;
-        }
-        const ok = await db.rejectPendingMaker(id);
-        res.writeHead(200, { "Content-Type": "application/json" });
-        res.end(JSON.stringify({ ok }));
-      } catch (e) {
-        res.writeHead(500, { "Content-Type": "application/json" });
-        res.end(JSON.stringify({ error: e.message }));
-      }
-    });
-    return;
-  }
-
-  res.writeHead(404, { "Content-Type": "application/json" });
-  res.end(JSON.stringify({ error: "not found" }));
-}
-
-// ─────────────────────────────────────────────
-// Scratch本家へのログイン（生WebSocket接続用のセッションID取得）
-// ─────────────────────────────────────────────
-function httpsRequest(options, body) {
-  return new Promise((resolve, reject) => {
-    const req = https.request(options, res => {
-      let data = "";
-      res.setEncoding("utf8");
-      res.on("data", chunk => { data += chunk; });
-      res.on("end", () => resolve({ statusCode: res.statusCode, headers: res.headers, body: data }));
-    });
-    req.on("error", reject);
-    if (body) req.write(body);
-    req.end();
-  });
-}
-
-async function scratchLogin(username, password) {
-  // 1. CSRFトークン取得
-  const csrfRes = await httpsRequest({
-    hostname: "scratch.mit.edu",
-    path: "/csrf_token/",
-    method: "GET",
-    headers: { "User-Agent": "MarioMakerServer/1.0" },
-  });
-  const csrfCookies = csrfRes.headers["set-cookie"] || [];
-  const csrfMatch = csrfCookies.map(c => c.match(/scratchcsrftoken=([^;]+)/)).find(Boolean);
-  if (!csrfMatch) throw new Error("CSRFトークン取得失敗");
-  const csrfToken = csrfMatch[1];
-
-  // 2. ログイン
-  const bodyStr = JSON.stringify({ username, password });
-  const loginRes = await httpsRequest({
-    hostname: "scratch.mit.edu",
-    path: "/login/",
-    method: "POST",
-    headers: {
-      "Content-Type": "application/json",
-      "Content-Length": Buffer.byteLength(bodyStr),
-      "X-CSRFToken": csrfToken,
-      "X-Requested-With": "XMLHttpRequest",
-      "Cookie": `scratchcsrftoken=${csrfToken}; scratchlanguage=en;`,
-      "Referer": "https://scratch.mit.edu",
-      "User-Agent": "MarioMakerServer/1.0",
-    },
-  }, bodyStr);
-
-  const loginCookies = loginRes.headers["set-cookie"] || [];
-  const sessionMatch = loginCookies.map(c => c.match(/scratchsessionsid="?([^;"]+)"?/)).find(Boolean);
-  if (!sessionMatch) {
-    throw new Error(`ログイン失敗(status ${loginRes.statusCode}): ${loginRes.body.slice(0, 200)}`);
-  }
-  return sessionMatch[1];
-}
-
-function withTimeout(promise, ms, label) {
-  return Promise.race([
-    promise,
-    new Promise((_, reject) => setTimeout(() => reject(new Error(`${label}タイムアウト`)), ms)),
-  ]);
-}
-
-class CloudManager {
-  constructor() {
-    this.scratch    = { conn: null, isReconnecting: false, delay: 5000 };
-    this.turbowarp  = { conn: null, isReconnecting: false, delay: 2000 };
-    this.queue      = [];
-    this.processing = false;
-    this.recentUsers = new Map(); // username -> lastSeenAt(unixtime)
-  }
-
-  // リクエストからusernameを取り出してrecentUsersに記録
-  trackUser(s) {
-    try {
-      const { next: p1 } = parseUserId(s, 0);
-      const { cmd, next: p2 } = parseCmd(s, p1);
-      // UPLOADはCMD直後にusernameがあるので別処理
-      if (cmd === CMD.UPLOAD) {
-        const { value: username } = decodeAlphabet(s, p2);
-        if (isValidStr(username)) this.recentUsers.set(username, Math.floor(Date.now() / 1000));
-        return;
-      }
-      // その他のコマンドはCMD直後にusernameがある（新フォーマット）
-      const { value: username } = decodeAlphabet(s, p2);
-      if (isValidStr(username)) {
-        this.recentUsers.set(username, Math.floor(Date.now() / 1000));
-      }
-    } catch (_) {}
-  }
-
-  // 5分以内のユーザー数を返す
-  getOnlineUsers() {
-    const cutoff = Math.floor(Date.now() / 1000) - 5 * 60;
-    for (const [username, lastSeen] of this.recentUsers) {
-      if (lastSeen < cutoff) this.recentUsers.delete(username);
-    }
-    return this.recentUsers.size;
-  }
-
-  // 5分以内のユーザー名一覧を返す
-  getOnlineUsernames() {
-    const cutoff = Math.floor(Date.now() / 1000) - 5 * 60;
-    for (const [username, lastSeen] of this.recentUsers) {
-      if (lastSeen < cutoff) this.recentUsers.delete(username);
-    }
-    return Array.from(this.recentUsers.keys());
-  }
-
-  enqueue(name, value, setter) {
-    this.queue.push({ name, value, setter });
-    if (!this.processing) this.processQueue();
-  }
-
-  async processQueue() {
-    this.processing = true;
-    while (this.queue.length > 0) {
-      const { name, value, setter } = this.queue.shift();
-      this.trackUser(String(value));
-      await onMessage(name, value, setter, () => this.getOnlineUsers());
-    }
-    this.processing = false;
-  }
-
-  // Scratch Cloudへ生WebSocketで直接接続（scratchcloudライブラリは使用しない）
-  connectScratch() {
-    if (this.scratch.conn?.readyState === WebSocket.OPEN || this.scratch.isReconnecting) return;
-    this.scratch.isReconnecting = true;
-    console.log("🔄 Scratch Cloud 接続中...");
-
-    withTimeout(scratchLogin(USERNAME, PASSWORD), 15000, "Scratchログイン")
-      .then(sessionId => {
-        const ws = new WebSocket("wss://clouddata.scratch.mit.edu", {
-          headers: {
-            Cookie: `scratchsessionsid=${sessionId};`,
-            Origin: "https://scratch.mit.edu",
-            "User-Agent": "MarioMakerServer/1.0",
-          },
-        });
-
-        const connectTimeout = setTimeout(() => {
-          console.error("❌ Scratch WebSocket接続タイムアウト");
-          ws.terminate();
-        }, 15000);
-
-        const setter = (name, value) => {
-          if (ws.readyState !== WebSocket.OPEN) return Promise.reject(new Error("Scratch切断"));
-          ws.send(JSON.stringify({ method: "set", name, value: String(value), user: USERNAME, project_id: PROJECT_ID }) + "\n");
-          return Promise.resolve();
-        };
-
-        ws.on("open", async () => {
-          clearTimeout(connectTimeout);
-          ws.send(JSON.stringify({ method: "handshake", user: USERNAME, project_id: PROJECT_ID }) + "\n");
-          this.scratch.conn  = ws;
-          this.scratch.delay = 5000;
-          this.scratch.isReconnecting = false;
-          console.log("✅ Scratch Cloud 接続成功（直接接続）");
-          console.log("🔄 Scratch クラウド変数を初期化中...");
-          for (const v of [...REQUEST_VARS, ...CLOUD_VARS]) { await setter(v, "0"); await sleep(SEND_INTERVAL); }
-          console.log("✅ Scratch クラウド変数初期化完了");
-        });
-
-        ws.on("message", raw => {
-          try {
-            const text = Buffer.isBuffer(raw) ? raw.toString("utf8") : raw;
-            for (const line of text.trim().split("\n")) {
-              if (!line) continue;
-              const data = JSON.parse(line);
-              if (data.method === "set" && [...REQUEST_VARS, ...CLOUD_VARS].includes(data.name)) {
-                this.enqueue(data.name, data.value, setter);
-              }
-            }
-          } catch (e) { console.warn("⚠️ Scratch メッセージ解析失敗:", e.message); }
-        });
-
-        ws.on("close", () => {
-          clearTimeout(connectTimeout);
-          console.warn("⚠️ Scratch 切断");
-          this.scratch.conn = null;
-          this.scratch.isReconnecting = false;
-          this.scheduleReconnect("scratch");
-        });
-
-        ws.on("error", e => {
-          clearTimeout(connectTimeout);
-          console.error("❌ Scratch エラー:", e.message);
-          this.scratch.conn = null;
-          this.scratch.isReconnecting = false;
-          this.scheduleReconnect("scratch");
-        });
-      })
-      .catch(e => {
-        console.error("❌ Scratch 接続失敗:", e.message);
-        this.scratch.conn = null;
-        this.scratch.isReconnecting = false;
-        this.scheduleReconnect("scratch");
-      });
-  }
-
-  connectTurboWarp() {
-    if (this.turbowarp.conn?.readyState === WebSocket.OPEN || this.turbowarp.isReconnecting) return;
-    this.turbowarp.isReconnecting = true;
-    try {
-      const ws = new WebSocket("wss://clouddata.turbowarp.org", { headers: { "User-Agent": "MarioMakerServer/1.0" } });
-      const setter = (name, value) => {
-        if (ws.readyState !== WebSocket.OPEN) return Promise.reject(new Error("TW切断"));
-        ws.send(JSON.stringify({ method: "set", name, value: String(value), user: "server-bot", project_id: PROJECT_ID }));
-        return Promise.resolve();
-      };
-      ws.on("open", async () => {
-        ws.send(JSON.stringify({ method: "handshake", user: "server-bot", project_id: PROJECT_ID }));
-        this.turbowarp.conn  = ws;
-        this.turbowarp.delay = 2000;
-        this.turbowarp.isReconnecting = false;
-        console.log("✅ TurboWarp Cloud 接続成功");
-        console.log("🔄 TurboWarp クラウド変数を初期化中...");
-        for (const v of [...REQUEST_VARS, ...CLOUD_VARS]) { await setter(v, "0"); await sleep(SEND_INTERVAL); }
-        console.log("✅ TurboWarp クラウド変数初期化完了");
-      });
-      ws.on("message", raw => {
-        try {
-          const text = Buffer.isBuffer(raw) ? raw.toString("utf8") : raw;
-          for (const line of text.trim().split("\n")) {
-            if (!line) continue;
-            const data = JSON.parse(line);
-            if (data.method === "set" && [...REQUEST_VARS, ...CLOUD_VARS].includes(data.name)) {
-              this.enqueue(data.name, data.value, setter);
-            }
-          }
-        } catch (e) { console.warn("⚠️ TW メッセージ解析失敗:", e.message); }
-      });
-      ws.on("close", () => { console.warn("⚠️ TurboWarp 切断"); this.turbowarp.conn = null; this.turbowarp.isReconnecting = false; this.scheduleReconnect("turbowarp"); });
-      ws.on("error", e => { console.error("❌ TurboWarp エラー:", e.message); this.turbowarp.conn = null; this.turbowarp.isReconnecting = false; this.scheduleReconnect("turbowarp"); });
-    } catch (e) {
-      console.error("❌ TurboWarp 接続作成失敗:", e.message);
-      this.turbowarp.isReconnecting = false;
-      this.scheduleReconnect("turbowarp");
-    }
-  }
-
-  scheduleReconnect(mode) {
-    const data = this[mode];
-    if (data.isReconnecting) return;
-    const delay = Math.min(data.delay, 3600000);
-    console.log(`⏰ ${mode} 再接続 ${delay}ms 後`);
-    data.delay = Math.min(data.delay * 3, 3600000);
-    setTimeout(() => { if (mode === "scratch") this.connectScratch(); else this.connectTurboWarp(); }, delay);
-  }
-
-  scheduleWeeklyReset() {
-    setInterval(async () => {
-      await db.deleteOldLikes().catch(e => console.error("いいねクリーンアップ失敗:", e));
-      console.log("🗑️ いいねクリーンアップ実行");
-    }, 60 * 60 * 1000);
-    console.log("📅 いいねクリーンアップ: 1時間ごとに実行");
-  }
-
-  async start() {
-    // 同じ内容のuncaughtExceptionが連続する場合は間引いて出力する（ログの見やすさ対策）
-    let lastUncaughtMsg = null;
-    let uncaughtCount = 0;
-    let uncaughtLogTimer = null;
-    process.on("uncaughtException", e => {
-      if (e.message === lastUncaughtMsg) {
-        uncaughtCount++;
-        if (!uncaughtLogTimer) {
-          uncaughtLogTimer = setTimeout(() => {
-            console.error(`❌ uncaughtException（直近30秒で同内容が${uncaughtCount}回発生）: ${lastUncaughtMsg}`);
-            uncaughtCount = 0;
-            uncaughtLogTimer = null;
-          }, 30000);
-        }
-      } else {
-        lastUncaughtMsg = e.message;
-        uncaughtCount = 0;
-        console.error("❌ uncaughtException:", e.message);
-      }
-    });
-    process.on("unhandledRejection", e => {
-      console.error("❌ unhandledRejection:", e);
-    });
-    await db.initDB();
-    await Promise.allSettled([this.connectScratch(), Promise.resolve(this.connectTurboWarp())]);
-    this.scheduleWeeklyReset();
-
-    const server = http.createServer(async (req, res) => {
-      const url = new URL(req.url, `http://localhost`);
-
-      // 管理ページ HTML
-      if (url.pathname === "/manage") {
-        const html = fs.readFileSync(path.join(__dirname, "manage.html"), "utf8");
-        res.writeHead(200, { "Content-Type": "text/html; charset=utf-8" });
-        res.end(html);
-        return;
-      }
-
-      // 管理API
-      if (url.pathname.startsWith("/api/")) {
-        await handleManageAPI(req, res);
-        return;
-      }
-
-      // ヘルスチェック
-      res.writeHead(200, { "Content-Type": "application/json" });
-      res.end(JSON.stringify({
-        status:    "ok",
-        scratch:   this.scratch.conn?.readyState === WebSocket.OPEN ? "connected" : "disconnected",
-        turbowarp: this.turbowarp.conn?.readyState === WebSocket.OPEN ? "connected" : "disconnected",
-        queue:     this.queue.length,
-        onlineUsers: this.getOnlineUsers(),
-        onlineUsernames: this.getOnlineUsernames(),
-        uptime:    process.uptime(),
-      }));
-    });
-    server.listen(PORT, () => console.log(`🌐 ヘルスチェック: http://0.0.0.0:${PORT}`));
-    setInterval(() => {
-      const s = this.scratch.conn?.readyState === WebSocket.OPEN ? "✅" : "❌";
-      const t = this.turbowarp.conn?.readyState === WebSocket.OPEN ? "✅" : "❌";
-      console.log(`💡 Health - Scratch:${s} TurboWarp:${t} Queue:${this.queue.length} Online:${this.getOnlineUsers()}`);
-    }, 5 * 60 * 1000);
-    const shutdown = () => {
-      console.log("🛑 シャットダウン...");
-      try { this.scratch.conn?.close();   } catch (_) {}
-      try { this.turbowarp.conn?.close(); } catch (_) {}
-      server.close();
-      db.pool.end();
-      process.exit(0);
-    };
-    process.on("SIGTERM", shutdown);
-    process.on("SIGINT",  shutdown);
-    console.log("🚀 サーバー起動完了");
-  }
-}
-
-if (require.main === module) {
-  new CloudManager().start().catch(e => { console.error("❌ 起動失敗:", e); process.exit(1); });
-}
-
-module.exports = { CloudManager };

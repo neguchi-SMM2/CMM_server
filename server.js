@@ -44,6 +44,11 @@ const CMD = {
   MAKER_RANK_ALL: 17,
   MAKER_INFO:     18,
   OFFICIAL_MAKER: 19,
+  REGISTER_CHECK_AUTHOR:   50,
+  REGISTER_CHECK_USERNAME: 51,
+  REGISTER_SUBMIT:         52,
+  REGISTER_STATUS:         53,
+  REGISTER_LOGIN:          54,
   LIKE:           20,
   PLAY:           21,
   ATTEMPT:        22,
@@ -269,6 +274,82 @@ async function handleRequest(s, setter, getOnlineUsers) {
     if (!isValidNum(limit) || limit <= 0) { console.warn("⚠️ 不正なlimit:", limit); return; }
     const rows = await db.getOfficialMakers(limit);
     await sendMakerRankingList(setter, userId, cmd, rows);
+    return;
+  }
+
+  // CMD=50: 職人名の登録可否チェック
+  if (cmd === CMD.REGISTER_CHECK_AUTHOR) {
+    const { value: targetAuthor } = decodeAlphabet(s, pos);
+    if (!isValidStr(targetAuthor)) { console.warn("⚠️ 不正なauthor:", targetAuthor); return; }
+    let result;
+    if (await db.isAuthorConfirmed(targetAuthor)) result = 3;
+    else if (await db.isAuthorUsedBeforeCutoff(targetAuthor)) result = 2;
+    else result = 1;
+    await sendCloud(setter, randomCloud(), encodeLenLen(parseInt(userId)) + encodeLen(CMD.REGISTER_CHECK_AUTHOR) + encodeLen(result));
+    return;
+  }
+
+  // CMD=51: 指定usernameが基準日より前にそのauthor名を使用していたか
+  if (cmd === CMD.REGISTER_CHECK_USERNAME) {
+    const { value: targetAuthor, next: q1 } = decodeAlphabet(s, pos);
+    const { value: targetUsername } = decodeAlphabet(s, q1);
+    if (!isValidStr(targetAuthor) || !isValidStr(targetUsername)) {
+      console.warn("⚠️ 不正な入力:", targetAuthor, targetUsername); return;
+    }
+    const used = await db.hasUsernameUsedAuthorBeforeCutoff(targetAuthor, targetUsername);
+    await sendCloud(setter, randomCloud(), encodeLenLen(parseInt(userId)) + encodeLen(CMD.REGISTER_CHECK_USERNAME) + encodeLen(used ? 1 : 0));
+    return;
+  }
+
+  // CMD=52: 職人名登録（本登録 / 仮登録）
+  if (cmd === CMD.REGISTER_SUBMIT) {
+    const { value: targetAuthor, next: q1 } = decodeAlphabet(s, pos);
+    const { value: password, next: q2 } = decodeAlphabet(s, q1);
+    const { value: regType } = decodeLen(s, q2);
+    if (!isValidStr(targetAuthor) || !isValidStr(password) || !isValidNum(regType)) {
+      console.warn("⚠️ 不正な登録リクエスト"); return;
+    }
+
+    if (regType === 0) {
+      // 本登録: 基礎データのusernameは信用せず、サーバー側で独立に再チェックする
+      const confirmed  = await db.isAuthorConfirmed(targetAuthor);
+      const usedBefore = await db.isAuthorUsedBeforeCutoff(targetAuthor);
+      if (confirmed || usedBefore) {
+        // 既に登録済み、または事前投稿実績のある職人名は本登録不可（仮登録を使うべき）
+        await sendCloud(setter, randomCloud(), encodeLenLen(parseInt(userId)) + encodeLen(CMD.REGISTER_SUBMIT) + encodeLen(0));
+        return;
+      }
+      await db.registerMakerConfirmed(targetAuthor, username, password);
+      await sendCloud(setter, randomCloud(), encodeLenLen(parseInt(userId)) + encodeLen(CMD.REGISTER_SUBMIT) + encodeLen(1));
+      return;
+    } else {
+      // 仮登録: 既に本登録済みなら保存せず、いずれにせよ結果は0
+      const confirmed = await db.isAuthorConfirmed(targetAuthor);
+      if (!confirmed) {
+        await db.registerMakerPending(targetAuthor, username, password);
+      }
+      await sendCloud(setter, randomCloud(), encodeLenLen(parseInt(userId)) + encodeLen(CMD.REGISTER_SUBMIT) + encodeLen(0));
+      return;
+    }
+  }
+
+  // CMD=53: 職人名の登録状態確認
+  if (cmd === CMD.REGISTER_STATUS) {
+    const { value: targetAuthor } = decodeAlphabet(s, pos);
+    if (!isValidStr(targetAuthor)) { console.warn("⚠️ 不正なauthor:", targetAuthor); return; }
+    const status = await db.getMakerStatus(targetAuthor);
+    const result = status === "confirmed" ? 1 : status === "pending" ? 2 : 3;
+    await sendCloud(setter, randomCloud(), encodeLenLen(parseInt(userId)) + encodeLen(CMD.REGISTER_STATUS) + encodeLen(result));
+    return;
+  }
+
+  // CMD=54: 職人名とパスワードの照合
+  if (cmd === CMD.REGISTER_LOGIN) {
+    const { value: targetAuthor, next: q1 } = decodeAlphabet(s, pos);
+    const { value: password } = decodeAlphabet(s, q1);
+    if (!isValidStr(targetAuthor) || !isValidStr(password)) { console.warn("⚠️ 不正なログイン要求"); return; }
+    const ok = await db.verifyMakerPassword(targetAuthor, password);
+    await sendCloud(setter, randomCloud(), encodeLenLen(parseInt(userId)) + encodeLen(CMD.REGISTER_LOGIN) + encodeLen(ok ? 1 : 0));
     return;
   }
 
@@ -528,6 +609,65 @@ async function handleManageAPI(req, res) {
         await db.upsertNotification(username, 400);
         res.writeHead(200, { "Content-Type": "application/json" });
         res.end(JSON.stringify({ ok: true }));
+      } catch (e) {
+        res.writeHead(500, { "Content-Type": "application/json" });
+        res.end(JSON.stringify({ error: e.message }));
+      }
+    });
+    return;
+  }
+
+  // GET /api/pending-makers
+  if (req.method === "GET" && pathname === "/api/pending-makers") {
+    try {
+      const makers = await db.listPendingMakers();
+      res.writeHead(200, { "Content-Type": "application/json" });
+      res.end(JSON.stringify({ ok: true, makers }));
+    } catch (e) {
+      res.writeHead(500, { "Content-Type": "application/json" });
+      res.end(JSON.stringify({ error: e.message }));
+    }
+    return;
+  }
+
+  // POST /api/approve-maker
+  if (req.method === "POST" && pathname === "/api/approve-maker") {
+    let body = "";
+    req.on("data", d => body += d);
+    req.on("end", async () => {
+      try {
+        const { id } = JSON.parse(body);
+        if (!id) {
+          res.writeHead(400, { "Content-Type": "application/json" });
+          res.end(JSON.stringify({ error: "id は必須です" }));
+          return;
+        }
+        const ok = await db.approvePendingMaker(id);
+        res.writeHead(200, { "Content-Type": "application/json" });
+        res.end(JSON.stringify({ ok }));
+      } catch (e) {
+        res.writeHead(500, { "Content-Type": "application/json" });
+        res.end(JSON.stringify({ error: e.message }));
+      }
+    });
+    return;
+  }
+
+  // POST /api/reject-maker
+  if (req.method === "POST" && pathname === "/api/reject-maker") {
+    let body = "";
+    req.on("data", d => body += d);
+    req.on("end", async () => {
+      try {
+        const { id } = JSON.parse(body);
+        if (!id) {
+          res.writeHead(400, { "Content-Type": "application/json" });
+          res.end(JSON.stringify({ error: "id は必須です" }));
+          return;
+        }
+        const ok = await db.rejectPendingMaker(id);
+        res.writeHead(200, { "Content-Type": "application/json" });
+        res.end(JSON.stringify({ ok }));
       } catch (e) {
         res.writeHead(500, { "Content-Type": "application/json" });
         res.end(JSON.stringify({ error: e.message }));

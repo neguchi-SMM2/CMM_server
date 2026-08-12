@@ -459,6 +459,20 @@ async function verifyMakerPassword(author, password) {
   return bcrypt.compare(password, rows[0].password_hash);
 }
 
+/** そのusernameが本日中(JST)に既に職人登録(仮登録含む)を行ったか */
+async function hasRegisteredToday(username) {
+  const now = new Date();
+  const jstNow = new Date(now.getTime() + 9 * 60 * 60 * 1000);
+  const y = jstNow.getUTCFullYear(), mo = jstNow.getUTCMonth(), d = jstNow.getUTCDate();
+  const startOfDayJstMs = Date.UTC(y, mo, d, 0, 0, 0) - 9 * 60 * 60 * 1000;
+  const startOfDaySec = Math.floor(startOfDayJstMs / 1000);
+  const { rows } = await pool.query(
+    "SELECT 1 FROM maker_accounts WHERE username=$1 AND created_at >= $2 LIMIT 1",
+    [username, startOfDaySec]
+  );
+  return rows.length > 0;
+}
+
 // ── 管理サイト用 ──
 
 /** 仮登録一覧（審査待ち） */
@@ -668,6 +682,6 @@ module.exports = {
   getMakerRankingWeek, getMakerRankingAllTime, getMakerInfo, getOfficialMakers,
   getLatestAnnouncement,
   isAuthorConfirmed, isAuthorUsedBeforeCutoff, hasUsernameUsedAuthorBeforeCutoff,
-  getMakerStatus, registerMakerConfirmed, registerMakerPending, verifyMakerPassword,
+  getMakerStatus, registerMakerConfirmed, registerMakerPending, verifyMakerPassword, hasRegisteredToday,
   listPendingMakers, approvePendingMaker, rejectPendingMaker,
 };

@@ -6,6 +6,7 @@
 
 const { Pool } = require("pg");
 const crypto   = require("crypto");
+const bcrypt   = require("bcryptjs");
 
 const pool = new Pool({
   connectionString: process.env.DATABASE_URL,
@@ -67,6 +68,18 @@ async function initDB() {
         (EXTRACT(EPOCH FROM NOW()) - EXTRACT(EPOCH FROM TIMESTAMP '2000-01-01 00:00:00 UTC')) / 60
       )
     );
+
+    CREATE TABLE IF NOT EXISTS maker_accounts (
+      id            SERIAL  PRIMARY KEY,
+      author        TEXT    NOT NULL,
+      username      TEXT    NOT NULL,
+      password_hash TEXT    NOT NULL,
+      status        TEXT    NOT NULL DEFAULT 'pending',
+      created_at    BIGINT  NOT NULL DEFAULT EXTRACT(EPOCH FROM NOW())::BIGINT
+    );
+    CREATE UNIQUE INDEX IF NOT EXISTS idx_maker_accounts_confirmed_author
+      ON maker_accounts(author) WHERE status = 'confirmed';
+    CREATE INDEX IF NOT EXISTS idx_maker_accounts_author ON maker_accounts(author);
 
     CREATE INDEX IF NOT EXISTS idx_courses_likes   ON courses(like_count DESC);
     CREATE INDEX IF NOT EXISTS idx_courses_posted  ON courses(posted_at DESC);
@@ -370,6 +383,120 @@ async function getLatestAnnouncement() {
 }
 
 // ─────────────────────────────────────────────
+// 職人名アカウント（なりすまし対策: author名にパスワードを紐付ける）
+// ─────────────────────────────────────────────
+
+// 「事前投稿」判定基準日: 2026-08-13 00:00:00 (JST)
+const CUTOFF_POSTED_AT = (() => {
+  const epoch2000 = Date.UTC(2000, 0, 1, 0, 0, 0);
+  const cutoffUtcMs = Date.UTC(2026, 7, 13, 0, 0, 0) - 9 * 60 * 60 * 1000; // JST→UTC
+  return Math.floor((cutoffUtcMs - epoch2000) / 60000);
+})();
+
+/** authorが既に本登録済みか */
+async function isAuthorConfirmed(author) {
+  const { rows } = await pool.query(
+    "SELECT 1 FROM maker_accounts WHERE author=$1 AND status='confirmed'", [author]
+  );
+  return rows.length > 0;
+}
+
+/** authorが基準日より前に投稿されたコースで使われているか */
+async function isAuthorUsedBeforeCutoff(author) {
+  const { rows } = await pool.query(
+    "SELECT 1 FROM courses WHERE author=$1 AND posted_at < $2 LIMIT 1",
+    [author, CUTOFF_POSTED_AT]
+  );
+  return rows.length > 0;
+}
+
+/** そのusernameが基準日より前に、そのauthor名で投稿していたか */
+async function hasUsernameUsedAuthorBeforeCutoff(author, username) {
+  const { rows } = await pool.query(
+    "SELECT 1 FROM courses WHERE author=$1 AND username=$2 AND posted_at < $3 LIMIT 1",
+    [author, username, CUTOFF_POSTED_AT]
+  );
+  return rows.length > 0;
+}
+
+/** authorの登録状態: 'confirmed' | 'pending' | null */
+async function getMakerStatus(author) {
+  const { rows } = await pool.query(
+    `SELECT status FROM maker_accounts WHERE author=$1
+     ORDER BY (status='confirmed') DESC, created_at DESC LIMIT 1`,
+    [author]
+  );
+  return rows[0]?.status || null;
+}
+
+/** 本登録: パスワードをハッシュ化して保存し、同名authorの仮登録は自動で削除(却下)する */
+async function registerMakerConfirmed(author, username, password) {
+  const passwordHash = await bcrypt.hash(password, 10);
+  await pool.query(
+    "INSERT INTO maker_accounts (author, username, password_hash, status) VALUES ($1,$2,$3,'confirmed')",
+    [author, username, passwordHash]
+  );
+  await pool.query(
+    "DELETE FROM maker_accounts WHERE author=$1 AND status='pending'", [author]
+  );
+}
+
+/** 仮登録: 審査待ちとして保存する */
+async function registerMakerPending(author, username, password) {
+  const passwordHash = await bcrypt.hash(password, 10);
+  await pool.query(
+    "INSERT INTO maker_accounts (author, username, password_hash, status) VALUES ($1,$2,$3,'pending')",
+    [author, username, passwordHash]
+  );
+}
+
+/** 本登録済みauthorのパスワード照合 */
+async function verifyMakerPassword(author, password) {
+  const { rows } = await pool.query(
+    "SELECT password_hash FROM maker_accounts WHERE author=$1 AND status='confirmed'", [author]
+  );
+  if (!rows.length) return false;
+  return bcrypt.compare(password, rows[0].password_hash);
+}
+
+// ── 管理サイト用 ──
+
+/** 仮登録一覧（審査待ち） */
+async function listPendingMakers() {
+  const { rows } = await pool.query(
+    "SELECT id, author, username, created_at FROM maker_accounts WHERE status='pending' ORDER BY created_at ASC"
+  );
+  return rows;
+}
+
+/** 仮登録を承認: 本登録に切り替え、同名authorの他の仮登録は自動で削除(却下)する */
+async function approvePendingMaker(id) {
+  const { rows } = await pool.query(
+    "SELECT author FROM maker_accounts WHERE id=$1 AND status='pending'", [id]
+  );
+  if (!rows.length) return false;
+  const author = rows[0].author;
+  try {
+    await pool.query("UPDATE maker_accounts SET status='confirmed' WHERE id=$1", [id]);
+  } catch (e) {
+    // 既に別の申請が先に本登録済み(ユニーク制約違反)などの場合
+    return false;
+  }
+  await pool.query(
+    "DELETE FROM maker_accounts WHERE author=$1 AND status='pending' AND id<>$2", [author, id]
+  );
+  return true;
+}
+
+/** 仮登録を却下: 該当行を削除する */
+async function rejectPendingMaker(id) {
+  const { rowCount } = await pool.query(
+    "DELETE FROM maker_accounts WHERE id=$1 AND status='pending'", [id]
+  );
+  return rowCount > 0;
+}
+
+// ─────────────────────────────────────────────
 // 統計更新
 // ─────────────────────────────────────────────
 async function incrementPlay(courseId) {
@@ -540,4 +667,7 @@ module.exports = {
   isOfficialMaker, hasPostedAsAuthor,
   getMakerRankingWeek, getMakerRankingAllTime, getMakerInfo, getOfficialMakers,
   getLatestAnnouncement,
+  isAuthorConfirmed, isAuthorUsedBeforeCutoff, hasUsernameUsedAuthorBeforeCutoff,
+  getMakerStatus, registerMakerConfirmed, registerMakerPending, verifyMakerPassword,
+  listPendingMakers, approvePendingMaker, rejectPendingMaker,
 };

@@ -28,10 +28,24 @@
     .msg.err { background: #7f1d1d; color: #fca5a5; display: block; }
     table { width: 100%; border-collapse: collapse; margin-top: 1rem; font-size: 0.9rem; }
     th, td { text-align: left; padding: 0.5rem 0.6rem; border-bottom: 1px solid #334155; }
-    th { color: #94a3b8; font-weight: 600; }
+    th { color: #94a3b8; font-weight: 600; white-space: nowrap; }
     td.actions { display: flex; gap: 0.5rem; }
     td.actions button { margin-top: 0; width: auto; padding: 0.4rem 0.8rem; font-size: 0.85rem; }
     .empty { color: #64748b; font-size: 0.9rem; margin-top: 1rem; }
+    .table-wrap { overflow-x: auto; -webkit-overflow-scrolling: touch; }
+
+    @media (max-width: 640px) {
+      body { padding: 1rem; }
+      h1 { font-size: 1.25rem; margin-bottom: 1.25rem; padding-bottom: 0.75rem; }
+      h2 { font-size: 1rem; }
+      .cards { grid-template-columns: 1fr; gap: 1rem; }
+      .card { padding: 1rem; }
+      input, select, button { font-size: 1rem; }
+      button { padding: 0.85rem; }
+      table { font-size: 0.8rem; min-width: 640px; }
+      td.actions { flex-direction: column; gap: 0.4rem; }
+      td.actions button { width: 100%; padding: 0.6rem; }
+    }
   </style>
 </head>
 <body>
@@ -83,12 +97,14 @@
       <button class="btn-neutral" onclick="loadPendingMakers()">一覧を読み込む</button>
       <div id="maker-msg" class="msg"></div>
       <div id="maker-empty" class="empty" style="display:none;">仮登録はありません</div>
-      <table id="maker-table" style="display:none;">
-        <thead>
-          <tr><th>職人名 (author)</th><th>ユーザー名 (username)</th><th>申請日時</th><th>操作</th></tr>
-        </thead>
-        <tbody id="maker-tbody"></tbody>
-      </table>
+      <div class="table-wrap">
+        <table id="maker-table" style="display:none;">
+          <thead>
+            <tr><th>職人名 (author)</th><th>ユーザー名 (username)</th><th>投稿実績</th><th>最新タイトル</th><th>申請日時</th><th>操作</th></tr>
+          </thead>
+          <tbody id="maker-tbody"></tbody>
+        </table>
+      </div>
     </div>
 
   </div>
@@ -195,6 +211,8 @@
         tr.innerHTML = `
           <td>${escapeHtml(m.author)}</td>
           <td>${escapeHtml(m.username)}</td>
+          <td>${m.hasPosted ? "✅ あり" : "❌ なし"}</td>
+          <td>${m.latestTitle ? escapeHtml(m.latestTitle) : "-"}</td>
           <td>${formatCreatedAt(m.created_at)}</td>
           <td class="actions">
             <button class="btn-warn" data-id="${m.id}" data-action="approve">承認</button>

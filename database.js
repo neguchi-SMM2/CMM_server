@@ -475,12 +475,23 @@ async function hasRegisteredToday(username) {
 
 // ── 管理サイト用 ──
 
-/** 仮登録一覧（審査待ち） */
+/** 仮登録一覧（審査待ち）。そのusernameの過去投稿実績・最新タイトルも付与する */
 async function listPendingMakers() {
   const { rows } = await pool.query(
     "SELECT id, author, username, created_at FROM maker_accounts WHERE status='pending' ORDER BY created_at ASC"
   );
-  return rows;
+  const enriched = await Promise.all(rows.map(async r => {
+    const { rows: courseRows } = await pool.query(
+      "SELECT title FROM courses WHERE author=$1 AND username=$2 ORDER BY posted_at DESC LIMIT 1",
+      [r.author, r.username]
+    );
+    return {
+      ...r,
+      hasPosted: courseRows.length > 0,
+      latestTitle: courseRows.length > 0 ? courseRows[0].title : null,
+    };
+  }));
+  return enriched;
 }
 
 /** 仮登録を承認: 本登録に切り替え、同名authorの他の仮登録は自動で削除(却下)する */
@@ -508,6 +519,23 @@ async function rejectPendingMaker(id) {
     "DELETE FROM maker_accounts WHERE id=$1 AND status='pending'", [id]
   );
   return rowCount > 0;
+}
+
+/**
+ * 登録後30日以内に1コースも投稿されなかった本登録職人を削除する。
+ * ただし、その職人名で(いつでも)コースを投稿したことがある場合は対象外。
+ */
+async function cleanupInactiveMakers() {
+  const cutoff = Math.floor(Date.now() / 1000) - 30 * 24 * 60 * 60;
+  const { rows } = await pool.query(
+    `DELETE FROM maker_accounts
+     WHERE status = 'confirmed'
+       AND created_at <= $1
+       AND author NOT IN (SELECT DISTINCT author FROM courses)
+     RETURNING author`,
+    [cutoff]
+  );
+  return rows.map(r => r.author);
 }
 
 // ─────────────────────────────────────────────
@@ -683,5 +711,5 @@ module.exports = {
   getLatestAnnouncement,
   isAuthorConfirmed, isAuthorUsedBeforeCutoff, hasUsernameUsedAuthorBeforeCutoff,
   getMakerStatus, registerMakerConfirmed, registerMakerPending, verifyMakerPassword, hasRegisteredToday,
-  listPendingMakers, approvePendingMaker, rejectPendingMaker,
+  listPendingMakers, approvePendingMaker, rejectPendingMaker, cleanupInactiveMakers,
 };

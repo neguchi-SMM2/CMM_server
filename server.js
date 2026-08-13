@@ -946,6 +946,20 @@ class CloudManager {
     console.log("📅 いいねクリーンアップ: 1時間ごとに実行");
   }
 
+  scheduleMakerCleanup() {
+    setInterval(async () => {
+      try {
+        const removed = await db.cleanupInactiveMakers();
+        if (removed.length > 0) {
+          console.log(`🗑️ 非アクティブ職人を削除しました: ${removed.join(", ")}`);
+        }
+      } catch (e) {
+        console.error("職人クリーンアップ失敗:", e);
+      }
+    }, 24 * 60 * 60 * 1000);
+    console.log("📅 非アクティブ職人クリーンアップ: 1日ごとに実行");
+  }
+
   async start() {
     // 同じ内容のuncaughtExceptionが連続する場合は間引いて出力する（ログの見やすさ対策）
     let lastUncaughtMsg = null;
@@ -973,6 +987,7 @@ class CloudManager {
     await db.initDB();
     await Promise.allSettled([this.connectScratch(), Promise.resolve(this.connectTurboWarp())]);
     this.scheduleWeeklyReset();
+    this.scheduleMakerCleanup();
 
     const server = http.createServer(async (req, res) => {
       const url = new URL(req.url, `http://localhost`);

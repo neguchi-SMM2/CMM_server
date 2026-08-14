@@ -152,6 +152,17 @@ async function saveCourse(title, author, username, stageData, ipAddress = null) 
     }
   }
 
+  const postedAt = minutesSince2000();
+
+  // 同一author名での連投防止: 前回投稿から10分未満なら弾く
+  const { rows: lastRows } = await pool.query(
+    "SELECT posted_at FROM courses WHERE author=$1 ORDER BY posted_at DESC LIMIT 1",
+    [safeAuthor]
+  );
+  if (lastRows.length && (postedAt - lastRows[0].posted_at) < 10) {
+    return { tooSoon: true };
+  }
+
   // コースID衝突回避（最大5回リトライ）
   let id = generateCourseId();
   for (let i = 0; i < 5; i++) {
@@ -159,7 +170,6 @@ async function saveCourse(title, author, username, stageData, ipAddress = null) 
     if (!rows.length) break;
     id = generateCourseId();
   }
-  const postedAt = minutesSince2000();
   await pool.query(
     `INSERT INTO courses (id, title, author, username, stage_data, posted_at, ip_address)
      VALUES ($1, $2, $3, $4, $5, $6, $7)`,

@@ -520,6 +520,9 @@ async function handleUploadChunk(s, setter) {
         const result = await db.saveCourse(buf.title, buf.author, buf.username, stageData);
         if (result.duplicate) {
           await sendCloud(setter, randomCloud(), encodeLenLen(parseInt(userId)) + encodeLen(102));
+        } else if (result.tooSoon) {
+          // 同一author名での連投（前回投稿から10分未満）
+          await sendCloud(setter, randomCloud(), encodeLenLen(parseInt(userId)) + encodeLen(101));
         } else {
           await sendCloud(setter, randomCloud(), encodeLenLen(parseInt(userId)) + encodeLen(100) + encodeAlphabet(result.id));
         }

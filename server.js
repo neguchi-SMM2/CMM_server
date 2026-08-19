@@ -325,23 +325,34 @@ async function handleRequest(s, setter, getOnlineUsers) {
         await sendCloud(setter, randomCloud(), encodeLenLen(parseInt(userId)) + encodeLen(CMD.REGISTER_SUBMIT) + encodeLen(0));
       }
       return;
-    } else {
-      // 仮登録: 既に本登録済み、または1日1回制限に該当する場合は弾いて0を返す
-      if (await db.hasRegisteredToday(username)) {
-        await sendCloud(setter, randomCloud(), encodeLenLen(parseInt(userId)) + encodeLen(CMD.REGISTER_SUBMIT) + encodeLen(0));
-        return;
-      }
-      const confirmed = await db.isAuthorConfirmed(targetAuthor);
-      if (confirmed) {
-        await sendCloud(setter, randomCloud(), encodeLenLen(parseInt(userId)) + encodeLen(CMD.REGISTER_SUBMIT) + encodeLen(0));
-        return;
-      }
-      await db.registerMakerPending(targetAuthor, username, password);
-      await sendCloud(setter, randomCloud(), encodeLenLen(parseInt(userId)) + encodeLen(CMD.REGISTER_SUBMIT) + encodeLen(2));
+  } else {
+    // 仮登録
+    if (await db.hasRegisteredToday(username)) {
+      await sendCloud(setter, randomCloud(), encodeLenLen(parseInt(userId)) + encodeLen(CMD.REGISTER_SUBMIT) + encodeLen(0));
       return;
     }
+    const confirmed = await db.isAuthorConfirmed(targetAuthor);
+    if (confirmed) {
+      await sendCloud(setter, randomCloud(), encodeLenLen(parseInt(userId)) + encodeLen(CMD.REGISTER_SUBMIT) + encodeLen(0));
+      return;
+    }
+  
+    // 変更: usernameがtargetAuthorを使用していた場合は本登録に昇格
+    const hasUsed = await db.hasUsernameUsedAuthorBeforeCutoff(targetAuthor, username);
+    if (hasUsed) {
+      try {
+        await db.registerMakerConfirmed(targetAuthor, username, password);
+        await sendCloud(setter, randomCloud(), encodeLenLen(parseInt(userId)) + encodeLen(CMD.REGISTER_SUBMIT) + encodeLen(1));
+      } catch (e) {
+        await sendCloud(setter, randomCloud(), encodeLenLen(parseInt(userId)) + encodeLen(CMD.REGISTER_SUBMIT) + encodeLen(0));
+      }
+      return;
+    }
+  
+    await db.registerMakerPending(targetAuthor, username, password);
+    await sendCloud(setter, randomCloud(), encodeLenLen(parseInt(userId)) + encodeLen(CMD.REGISTER_SUBMIT) + encodeLen(2));
+    return;
   }
-
   // CMD=53: 職人名の登録状態確認
   if (cmd === CMD.REGISTER_STATUS) {
     const { value: targetAuthor } = decodeAlphabet(s, pos);

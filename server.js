@@ -78,9 +78,6 @@ async function sendCloud(setter, name, value) {
   await sleep(SEND_INTERVAL);
 }
 
-// ─────────────────────────────────────────────
-// 汎用: 複数件のエンコード済み文字列をmaxLenでチャンク分割して送信
-// ─────────────────────────────────────────────
 async function sendEncodedItems(setter, userId, cmd, items) {
   const header = encodeLenLen(parseInt(userId)) + encodeLen(cmd);
   const maxLen = 1000;
@@ -97,9 +94,6 @@ async function sendEncodedItems(setter, userId, cmd, items) {
   }
 }
 
-// ─────────────────────────────────────────────
-// コース情報エンコード（CMD=10,11,12,15共通）
-// ─────────────────────────────────────────────
 function encodeCourseInfo(row, index) {
   const clearRate = row.attempt_count > 0
     ? Math.round(row.clear_count / row.attempt_count * 10000) / 100
@@ -120,11 +114,6 @@ async function sendCourseList(setter, userId, cmd, rows) {
   await sendEncodedItems(setter, userId, cmd, items);
 }
 
-// ─────────────────────────────────────────────
-// 職人ランキング行エンコード（CMD=16,17）
-// 何番目(len) + author(alphabet) + いいね数(len) + プレイ数(len)
-//   + 直近投稿日(lenlen, YYYYMMDDHHmm) + 公式ユーザー(len, 1/0)
-// ─────────────────────────────────────────────
 function encodeMakerRankRow(row, index) {
   return encodeLen(index)
     + encodeAlphabet(row.author)
@@ -139,11 +128,6 @@ async function sendMakerRankingList(setter, userId, cmd, rows) {
   await sendEncodedItems(setter, userId, cmd, items);
 }
 
-// ─────────────────────────────────────────────
-// 職人情報エンコード（CMD=18単体 / CMD=19一覧の要素）
-// author(alphabet) + 総いいね数(len) + 総プレイ数(len) + 総投稿コース数(len)
-//   + 全体ランキング順位(len) + 週間ランキング順位(len) + 直近投稿日(lenlen, YYYYMMDDHHmm)
-// ─────────────────────────────────────────────
 function encodeMakerInfo(row) {
   return encodeAlphabet(row.author)
     + encodeLen(row.total_likes)
@@ -179,16 +163,13 @@ async function handleRequest(s, setter, getOnlineUsers) {
   const { cmd, next: p2 } = parseCmd(s, pos); pos = p2;
   if (!isValidNum(cmd)) { console.warn("⚠️ 不正なコマンドコード:", cmd); return; }
 
-  // 全コマンド共通: usernameを取得
   let username;
   try {
     const { value, next } = decodeAlphabet(s, pos);
     username = value;
     pos = next;
   } catch (e) {
-    // usernameのデコードに失敗した場合
     if (cmd === CMD.GET_STATS) {
-      // CMD=90の旧式リクエスト
       await sendCloud(setter, randomCloud(), encodeLenLen(parseInt(userId)) + encodeLen(407));
       return;
     }
@@ -202,7 +183,6 @@ async function handleRequest(s, setter, getOnlineUsers) {
     console.warn("⚠️ 不正なusername:", username); return;
   }
 
-  // CMD=10〜12,15: ランキング・ランダム・新着
   if (cmd === CMD.RANDOM || cmd === CMD.WEEKLY || cmd === CMD.ALL_TIME || cmd === CMD.NEW_ARRIVAL) {
     const { value: limit, next: p3 } = decodeLen(s, pos); pos = p3;
     if (!isValidNum(limit) || limit <= 0) { console.warn("⚠️ 不正なlimit:", limit); return; }
@@ -215,7 +195,6 @@ async function handleRequest(s, setter, getOnlineUsers) {
     return;
   }
 
-  // CMD=13: コースID検索
   if (cmd === CMD.SEARCH_ID) {
     const { value: courseId } = decodeAlphabet(s, pos);
     if (!isValidStr(courseId)) { console.warn("⚠️ 不正なcourseId:", courseId); return; }
@@ -228,7 +207,6 @@ async function handleRequest(s, setter, getOnlineUsers) {
     return;
   }
 
-  // CMD=14: 作者名検索
   if (cmd === CMD.SEARCH_AUTHOR) {
     const { value: author, next: p3 } = decodeAlphabet(s, pos); pos = p3;
     if (!isValidStr(author)) { console.warn("⚠️ 不正なauthor:", author); return; }
@@ -243,7 +221,6 @@ async function handleRequest(s, setter, getOnlineUsers) {
     return;
   }
 
-  // CMD=16,17: 職人ランキング（週間 / 累計）
   if (cmd === CMD.MAKER_RANK_WEEK || cmd === CMD.MAKER_RANK_ALL) {
     const { value: limit } = decodeLen(s, pos);
     if (!isValidNum(limit) || limit <= 0) { console.warn("⚠️ 不正なlimit:", limit); return; }
@@ -254,7 +231,6 @@ async function handleRequest(s, setter, getOnlineUsers) {
     return;
   }
 
-  // CMD=18: 職人情報（author指定）
   if (cmd === CMD.MAKER_INFO) {
     const { value: targetAuthor } = decodeAlphabet(s, pos);
     if (!isValidStr(targetAuthor)) { console.warn("⚠️ 不正なauthor:", targetAuthor); return; }
@@ -268,7 +244,6 @@ async function handleRequest(s, setter, getOnlineUsers) {
     return;
   }
 
-  // CMD=19: 公式職人一覧（CMD=16,17と同じエンコード形式）
   if (cmd === CMD.OFFICIAL_MAKER) {
     const { value: limit } = decodeLen(s, pos);
     if (!isValidNum(limit) || limit <= 0) { console.warn("⚠️ 不正なlimit:", limit); return; }
@@ -277,7 +252,6 @@ async function handleRequest(s, setter, getOnlineUsers) {
     return;
   }
 
-  // CMD=50: 職人名の登録可否チェック
   if (cmd === CMD.REGISTER_CHECK_AUTHOR) {
     const { value: targetAuthor } = decodeAlphabet(s, pos);
     if (!isValidStr(targetAuthor)) { console.warn("⚠️ 不正なauthor:", targetAuthor); return; }
@@ -289,7 +263,6 @@ async function handleRequest(s, setter, getOnlineUsers) {
     return;
   }
 
-  // CMD=51: 指定usernameが基準日より前にそのauthor名を使用していたか
   if (cmd === CMD.REGISTER_CHECK_USERNAME) {
     const { value: targetAuthor, next: q1 } = decodeAlphabet(s, pos);
     const { value: targetUsername } = decodeAlphabet(s, q1);
@@ -301,7 +274,6 @@ async function handleRequest(s, setter, getOnlineUsers) {
     return;
   }
 
-  // CMD=52: 職人名登録（本登録 / 仮登録）
   if (cmd === CMD.REGISTER_SUBMIT) {
     const { value: targetAuthor, next: q1 } = decodeAlphabet(s, pos);
     const { value: password, next: q2 } = decodeAlphabet(s, q1);
@@ -311,9 +283,7 @@ async function handleRequest(s, setter, getOnlineUsers) {
     }
 
     if (regType === 0) {
-      // 本登録: 事前投稿実績があってもチェックなしで登録可能。基礎データのusernameは信用しない
       if (await db.hasRegisteredToday(username)) {
-        // 1人1日1回までの登録制限（仮登録含む）
         await sendCloud(setter, randomCloud(), encodeLenLen(parseInt(userId)) + encodeLen(CMD.REGISTER_SUBMIT) + encodeLen(0));
         return;
       }
@@ -321,39 +291,37 @@ async function handleRequest(s, setter, getOnlineUsers) {
         await db.registerMakerConfirmed(targetAuthor, username, password);
         await sendCloud(setter, randomCloud(), encodeLenLen(parseInt(userId)) + encodeLen(CMD.REGISTER_SUBMIT) + encodeLen(1));
       } catch (e) {
-        // 既に本登録済み(ユニーク制約違反)などの場合は失敗として0を返す
         await sendCloud(setter, randomCloud(), encodeLenLen(parseInt(userId)) + encodeLen(CMD.REGISTER_SUBMIT) + encodeLen(0));
       }
       return;
-  } else {
-    // 仮登録
-    if (await db.hasRegisteredToday(username)) {
-      await sendCloud(setter, randomCloud(), encodeLenLen(parseInt(userId)) + encodeLen(CMD.REGISTER_SUBMIT) + encodeLen(0));
-      return;
-    }
-    const confirmed = await db.isAuthorConfirmed(targetAuthor);
-    if (confirmed) {
-      await sendCloud(setter, randomCloud(), encodeLenLen(parseInt(userId)) + encodeLen(CMD.REGISTER_SUBMIT) + encodeLen(0));
-      return;
-    }
-  
-    // 変更: usernameがtargetAuthorを使用していた場合は本登録に昇格
-    const hasUsed = await db.hasUsernameUsedAuthorBeforeCutoff(targetAuthor, username);
-    if (hasUsed) {
-      try {
-        await db.registerMakerConfirmed(targetAuthor, username, password);
-        await sendCloud(setter, randomCloud(), encodeLenLen(parseInt(userId)) + encodeLen(CMD.REGISTER_SUBMIT) + encodeLen(1));
-      } catch (e) {
+    } else {
+      if (await db.hasRegisteredToday(username)) {
         await sendCloud(setter, randomCloud(), encodeLenLen(parseInt(userId)) + encodeLen(CMD.REGISTER_SUBMIT) + encodeLen(0));
+        return;
       }
+      const confirmed = await db.isAuthorConfirmed(targetAuthor);
+      if (confirmed) {
+        await sendCloud(setter, randomCloud(), encodeLenLen(parseInt(userId)) + encodeLen(CMD.REGISTER_SUBMIT) + encodeLen(0));
+        return;
+      }
+
+      const hasUsed = await db.hasUsernameUsedAuthorBeforeCutoff(targetAuthor, username);
+      if (hasUsed) {
+        try {
+          await db.registerMakerConfirmed(targetAuthor, username, password);
+          await sendCloud(setter, randomCloud(), encodeLenLen(parseInt(userId)) + encodeLen(CMD.REGISTER_SUBMIT) + encodeLen(1));
+        } catch (e) {
+          await sendCloud(setter, randomCloud(), encodeLenLen(parseInt(userId)) + encodeLen(CMD.REGISTER_SUBMIT) + encodeLen(0));
+        }
+        return;
+      }
+
+      await db.registerMakerPending(targetAuthor, username, password);
+      await sendCloud(setter, randomCloud(), encodeLenLen(parseInt(userId)) + encodeLen(CMD.REGISTER_SUBMIT) + encodeLen(2));
       return;
     }
-  
-    await db.registerMakerPending(targetAuthor, username, password);
-    await sendCloud(setter, randomCloud(), encodeLenLen(parseInt(userId)) + encodeLen(CMD.REGISTER_SUBMIT) + encodeLen(2));
-    return;
   }
-  // CMD=53: 職人名の登録状態確認
+
   if (cmd === CMD.REGISTER_STATUS) {
     const { value: targetAuthor } = decodeAlphabet(s, pos);
     if (!isValidStr(targetAuthor)) { console.warn("⚠️ 不正なauthor:", targetAuthor); return; }
@@ -363,7 +331,6 @@ async function handleRequest(s, setter, getOnlineUsers) {
     return;
   }
 
-  // CMD=54: 職人名とパスワードの照合
   if (cmd === CMD.REGISTER_LOGIN) {
     const { value: targetAuthor, next: q1 } = decodeAlphabet(s, pos);
     const { value: password } = decodeAlphabet(s, q1);
@@ -373,7 +340,6 @@ async function handleRequest(s, setter, getOnlineUsers) {
     return;
   }
 
-  // CMD=20〜23: 統計更新
   if (cmd === CMD.LIKE || cmd === CMD.PLAY || cmd === CMD.ATTEMPT || cmd === CMD.CLEAR) {
     const { value: courseId } = decodeAlphabet(s, pos);
     if (!isValidStr(courseId)) {
@@ -388,13 +354,11 @@ async function handleRequest(s, setter, getOnlineUsers) {
         await sendCloud(setter, randomCloud(), encodeLenLen(parseInt(userId)) + encodeLen(405));
         return;
       }
-      // コース投稿者本人によるいいねは、既にいいね済みの場合と同じCMDを返して弾く
       const course = await db.getCourseById(courseId);
       if (course && course.username === username) {
         await sendCloud(setter, randomCloud(), encodeLenLen(parseInt(userId)) + encodeLen(200));
         return;
       }
-      // 同一usernameが同一author名のコースに30分間で3件以上いいねしていたら、30分経つまで弾く
       if (course) {
         const since = Math.floor(Date.now() / 1000) - 30 * 60;
         const recentCount = await db.countRecentLikesForAuthor(username, course.author, since);
@@ -413,7 +377,6 @@ async function handleRequest(s, setter, getOnlineUsers) {
     }
   }
 
-  // CMD=30: コースデータ取得
   if (cmd === CMD.GET_COURSE) {
     const { value: courseId } = decodeAlphabet(s, pos);
     if (!isValidStr(courseId)) { console.warn("⚠️ 不正なcourseId:", courseId); return; }
@@ -423,7 +386,6 @@ async function handleRequest(s, setter, getOnlineUsers) {
     return;
   }
 
-  // CMD=40: 通知取得（usernameは共通部分で取得済み）
   if (cmd === CMD.GET_NOTIFY) {
     const notification = await db.getAndDeleteNotification(username);
     if (notification) {
@@ -434,7 +396,6 @@ async function handleRequest(s, setter, getOnlineUsers) {
     return;
   }
 
-  // CMD=90: 統計データ取得（usernameは共通部分で取得済み）
   if (cmd === CMD.GET_STATS) {
     const stats = await db.getStats();
     const payload = encodeLenLen(parseInt(userId))
@@ -451,7 +412,6 @@ async function handleRequest(s, setter, getOnlineUsers) {
     return;
   }
 
-  // CMD=91: 公式お知らせ取得（usernameは共通部分で取得済み、長さ制限を設けず単発送信）
   if (cmd === CMD.GET_ANNOUNCEMENT) {
     const announcement = await db.getLatestAnnouncement();
     if (!announcement) {
@@ -467,9 +427,7 @@ async function handleRequest(s, setter, getOnlineUsers) {
     return;
   }
 
-  // CMD=600: ユーザー名変更検知→自動BAN（usernameは共通部分で取得済み）
   if (cmd === CMD.BAN_USERNAME) {
-    // 既にBAN中の場合は期限を延長しない（繰り返し検知されても15分で確実に解除されるようにする）
     const alreadyBanned = await db.isUserBanned(username);
     if (!alreadyBanned) {
       const expiresAt = Math.floor(Date.now() / 1000) + 15 * 60;
@@ -532,7 +490,6 @@ async function handleUploadChunk(s, setter) {
         if (result.duplicate) {
           await sendCloud(setter, randomCloud(), encodeLenLen(parseInt(userId)) + encodeLen(102));
         } else if (result.tooSoon) {
-          // 同一author名での連投（前回投稿から10分未満）
           await sendCloud(setter, randomCloud(), encodeLenLen(parseInt(userId)) + encodeLen(101));
         } else {
           await sendCloud(setter, randomCloud(), encodeLenLen(parseInt(userId)) + encodeLen(100) + encodeAlphabet(result.id));
@@ -565,9 +522,6 @@ async function onMessage(name, value, setter, getOnlineUsers) {
   }
 }
 
-// ─────────────────────────────────────────────
-// 管理ページ用APIハンドラ
-// ─────────────────────────────────────────────
 function checkAuth(req) {
   const auth = req.headers["authorization"] || "";
   const b64  = auth.replace(/^Basic /, "");
@@ -586,7 +540,6 @@ async function handleManageAPI(req, res) {
   const url = new URL(req.url, `http://localhost`);
   const pathname = url.pathname;
 
-  // POST /api/delete-course
   if (req.method === "POST" && pathname === "/api/delete-course") {
     let body = "";
     req.on("data", d => body += d);
@@ -615,7 +568,6 @@ async function handleManageAPI(req, res) {
     return;
   }
 
-  // POST /api/ban-user
   if (req.method === "POST" && pathname === "/api/ban-user") {
     let body = "";
     req.on("data", d => body += d);
@@ -640,7 +592,6 @@ async function handleManageAPI(req, res) {
     return;
   }
 
-  // GET /api/pending-makers
   if (req.method === "GET" && pathname === "/api/pending-makers") {
     try {
       const makers = await db.listPendingMakers();
@@ -653,7 +604,6 @@ async function handleManageAPI(req, res) {
     return;
   }
 
-  // POST /api/approve-maker
   if (req.method === "POST" && pathname === "/api/approve-maker") {
     let body = "";
     req.on("data", d => body += d);
@@ -676,7 +626,6 @@ async function handleManageAPI(req, res) {
     return;
   }
 
-  // POST /api/reject-maker
   if (req.method === "POST" && pathname === "/api/reject-maker") {
     let body = "";
     req.on("data", d => body += d);
@@ -703,9 +652,6 @@ async function handleManageAPI(req, res) {
   res.end(JSON.stringify({ error: "not found" }));
 }
 
-// ─────────────────────────────────────────────
-// Scratch本家へのログイン（生WebSocket接続用のセッションID取得）
-// ─────────────────────────────────────────────
 function httpsRequest(options, body) {
   return new Promise((resolve, reject) => {
     const req = https.request(options, res => {
@@ -721,7 +667,6 @@ function httpsRequest(options, body) {
 }
 
 async function scratchLogin(username, password) {
-  // 1. CSRFトークン取得
   const csrfRes = await httpsRequest({
     hostname: "scratch.mit.edu",
     path: "/csrf_token/",
@@ -733,7 +678,6 @@ async function scratchLogin(username, password) {
   if (!csrfMatch) throw new Error("CSRFトークン取得失敗");
   const csrfToken = csrfMatch[1];
 
-  // 2. ログイン
   const bodyStr = JSON.stringify({ username, password });
   const loginRes = await httpsRequest({
     hostname: "scratch.mit.edu",
@@ -771,21 +715,18 @@ class CloudManager {
     this.turbowarp  = { conn: null, isReconnecting: false, delay: 2000 };
     this.queue      = [];
     this.processing = false;
-    this.recentUsers = new Map(); // username -> lastSeenAt(unixtime)
+    this.recentUsers = new Map();
   }
 
-  // リクエストからusernameを取り出してrecentUsersに記録
   trackUser(s) {
     try {
       const { next: p1 } = parseUserId(s, 0);
       const { cmd, next: p2 } = parseCmd(s, p1);
-      // UPLOADはCMD直後にusernameがあるので別処理
       if (cmd === CMD.UPLOAD) {
         const { value: username } = decodeAlphabet(s, p2);
         if (isValidStr(username)) this.recentUsers.set(username, Math.floor(Date.now() / 1000));
         return;
       }
-      // その他のコマンドはCMD直後にusernameがある（新フォーマット）
       const { value: username } = decodeAlphabet(s, p2);
       if (isValidStr(username)) {
         this.recentUsers.set(username, Math.floor(Date.now() / 1000));
@@ -793,7 +734,6 @@ class CloudManager {
     } catch (_) {}
   }
 
-  // 5分以内のユーザー数を返す
   getOnlineUsers() {
     const cutoff = Math.floor(Date.now() / 1000) - 5 * 60;
     for (const [username, lastSeen] of this.recentUsers) {
@@ -802,7 +742,6 @@ class CloudManager {
     return this.recentUsers.size;
   }
 
-  // 5分以内のユーザー名一覧を返す
   getOnlineUsernames() {
     const cutoff = Math.floor(Date.now() / 1000) - 5 * 60;
     for (const [username, lastSeen] of this.recentUsers) {
@@ -826,7 +765,6 @@ class CloudManager {
     this.processing = false;
   }
 
-  // Scratch Cloudへ生WebSocketで直接接続（scratchcloudライブラリは使用しない）
   connectScratch() {
     if (this.scratch.conn?.readyState === WebSocket.OPEN || this.scratch.isReconnecting) return;
     this.scratch.isReconnecting = true;
@@ -975,7 +913,6 @@ class CloudManager {
   }
 
   async start() {
-    // 同じ内容のuncaughtExceptionが連続する場合は間引いて出力する（ログの見やすさ対策）
     let lastUncaughtMsg = null;
     let uncaughtCount = 0;
     let uncaughtLogTimer = null;
@@ -1006,7 +943,6 @@ class CloudManager {
     const server = http.createServer(async (req, res) => {
       const url = new URL(req.url, `http://localhost`);
 
-      // 管理ページ HTML
       if (url.pathname === "/manage") {
         const html = fs.readFileSync(path.join(__dirname, "manage.html"), "utf8");
         res.writeHead(200, { "Content-Type": "text/html; charset=utf-8" });
@@ -1014,13 +950,11 @@ class CloudManager {
         return;
       }
 
-      // 管理API
       if (url.pathname.startsWith("/api/")) {
         await handleManageAPI(req, res);
         return;
       }
 
-      // ヘルスチェック
       res.writeHead(200, { "Content-Type": "application/json" });
       res.end(JSON.stringify({
         status:    "ok",

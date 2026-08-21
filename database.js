@@ -247,13 +247,11 @@ const MAKER_POINT_EXPONENT    = 0.3;
 
 /**
  * 職人ポイント計算（全期間）
- * (平均いいね数 × 65 + 平均プレイ数 × 6.5) / (投稿数 + 1)^0.3
+ * (総いいね数 × 65 + 総プレイ数 × 6.5) / (投稿数 + 1)^0.3
  */
 function calcMakerPointAllTime(totalLikes, totalPlays, courseCount) {
   if (courseCount === 0) return 0;
-  const avgLikes = totalLikes / courseCount;
-  const avgPlays = totalPlays / courseCount;
-  const base  = avgLikes * MAKER_POINT_LIKE_WEIGHT + avgPlays * MAKER_POINT_PLAY_WEIGHT;
+  const base  = totalLikes * MAKER_POINT_LIKE_WEIGHT + totalPlays * MAKER_POINT_PLAY_WEIGHT;
   const bonus = Math.pow(courseCount + 1, MAKER_POINT_EXPONENT);
   return base / bonus;
 }
@@ -263,10 +261,9 @@ function calcMakerPointAllTime(totalLikes, totalPlays, courseCount) {
  * (週間いいね数 × 65 + 週間投稿コースのプレイ数合計 × 6.5) ÷ (週間投稿数 + 1)^0.3
  * ただし全期間ポイントを超えない
  */
-function calcMakerPointWeekly(weeklyLikes, weeklyCourseCount, allTimePoint) {
+function calcMakerPointWeekly(weeklyLikes, weeklyPlays, weeklyCourseCount, allTimePoint) {
   if (weeklyCourseCount === 0) return 0;
-  const avgLikes = weeklyLikes / weeklyCourseCount;
-  const base  = avgLikes * MAKER_POINT_LIKE_WEIGHT;
+  const base  = weeklyLikes * MAKER_POINT_LIKE_WEIGHT + weeklyPlays * MAKER_POINT_PLAY_WEIGHT;
   const bonus = Math.pow(weeklyCourseCount + 1, MAKER_POINT_EXPONENT);
   const raw = base / bonus;
   return Math.min(raw, allTimePoint);
@@ -296,7 +293,7 @@ async function getMakerRankingWeek(limit) {
       [since]
     ),
     pool.query(
-      `SELECT author, COUNT(*) AS weekly_courses
+      `SELECT author, COUNT(*) AS weekly_courses, COALESCE(SUM(play_count), 0) AS weekly_plays
        FROM courses
        WHERE posted_at >= $1
        GROUP BY author`,
@@ -317,6 +314,7 @@ async function getMakerRankingWeek(limit) {
   }
   const weeklyLikeMap   = new Map(weeklyLikeResult.rows.map(r => [r.author, parseInt(r.weekly_likes, 10)]));
   const weeklyCourseMap = new Map(weeklyCourseResult.rows.map(r => [r.author, parseInt(r.weekly_courses, 10)]));
+  const weeklyPlayMap   = new Map(weeklyCourseResult.rows.map(r => [r.author, parseInt(r.weekly_plays, 10)]));
 
   const authors = new Set([...weeklyLikeMap.keys(), ...weeklyCourseMap.keys()]);
 
@@ -324,9 +322,10 @@ async function getMakerRankingWeek(limit) {
   for (const author of authors) {
     const weeklyLikes = weeklyLikeMap.get(author) || 0;
     const weeklyCourses = weeklyCourseMap.get(author) || 0;
+    const weeklyPlays = weeklyPlayMap.get(author) || 0;
     const allTimePoint = allTimeMap.get(author) || 0;
     const effectiveWeeklyCourses = weeklyCourses > 0 ? weeklyCourses : (weeklyLikes > 0 ? 1 : 0);
-    const point = calcMakerPointWeekly(weeklyLikes, effectiveWeeklyCourses, allTimePoint);
+    const point = calcMakerPointWeekly(weeklyLikes, weeklyPlays, effectiveWeeklyCourses, allTimePoint);
     if (point <= 0) continue;
 
     results.push({

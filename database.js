@@ -241,13 +241,13 @@ async function getNewArrivalCourses(limit) {
 // ─────────────────────────────────────────────
 
 // 職人ポイント計算のパラメータ
-const MAKER_POINT_LIKE_WEIGHT = 140;
-const MAKER_POINT_PLAY_WEIGHT = 14;
+const MAKER_POINT_LIKE_WEIGHT = 65;
+const MAKER_POINT_PLAY_WEIGHT = 6.5;
 const MAKER_POINT_EXPONENT    = 0.3;
 
 /**
  * 職人ポイント計算（全期間）
- * (平均いいね数 × 140 + 平均プレイ数 × 14) × (投稿数 + 1)^0.3
+ * (平均いいね数 × 65 + 平均プレイ数 × 6.5) / (投稿数 + 1)^0.3
  */
 function calcMakerPointAllTime(totalLikes, totalPlays, courseCount) {
   if (courseCount === 0) return 0;
@@ -255,12 +255,12 @@ function calcMakerPointAllTime(totalLikes, totalPlays, courseCount) {
   const avgPlays = totalPlays / courseCount;
   const base  = avgLikes * MAKER_POINT_LIKE_WEIGHT + avgPlays * MAKER_POINT_PLAY_WEIGHT;
   const bonus = Math.pow(courseCount + 1, MAKER_POINT_EXPONENT);
-  return base * bonus;
+  return base / bonus;
 }
 
 /**
  * 職人ポイント計算（週間）
- * 週間平均いいね数 × 140 × (週間投稿数 + 1)^0.3
+ * (週間いいね数 × 65 + 週間投稿コースのプレイ数合計 × 6.5) ÷ (週間投稿数 + 1)^0.3
  * ただし全期間ポイントを超えない
  */
 function calcMakerPointWeekly(weeklyLikes, weeklyCourseCount, allTimePoint) {
@@ -268,7 +268,7 @@ function calcMakerPointWeekly(weeklyLikes, weeklyCourseCount, allTimePoint) {
   const avgLikes = weeklyLikes / weeklyCourseCount;
   const base  = avgLikes * MAKER_POINT_LIKE_WEIGHT;
   const bonus = Math.pow(weeklyCourseCount + 1, MAKER_POINT_EXPONENT);
-  const raw = base * bonus;
+  const raw = base / bonus;
   return Math.min(raw, allTimePoint);
 }
 
@@ -413,6 +413,7 @@ async function getMakerInfo(author) {
     maker_point: Math.round(allTimePoint),
     total_likes: totalLikes,
     total_plays: totalPlays,
+    total_courses: totalCourses,
     all_time_rank: allTimeRank,
     weekly_rank: weeklyRank,
     is_official: !!officialRow.rows.length,

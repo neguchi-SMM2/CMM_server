@@ -114,11 +114,13 @@ async function sendCourseList(setter, userId, cmd, rows) {
   await sendEncodedItems(setter, userId, cmd, items);
 }
 
+// CMD=16,17,19共通: 何番目(Len) + author(alphabet) + 職人ポイント(Len)
+//   + 直近投稿日(LenLen) + 公式ユーザー(Len, 1/0)
+// ※いいね数・プレイ数は送らない
 function encodeMakerRankRow(row, index) {
   return encodeLen(index)
     + encodeAlphabet(row.author)
-    + encodeLen(row.like_count)
-    + encodeLen(row.play_count)
+    + encodeLen(Math.round(row.point))
     + encodeLenLen(minutesToDateTimeInt(row.latest_posted_at))
     + encodeLen(row.is_official ? 1 : 0);
 }
@@ -128,14 +130,17 @@ async function sendMakerRankingList(setter, userId, cmd, rows) {
   await sendEncodedItems(setter, userId, cmd, items);
 }
 
+// CMD=18: author(alphabet) + 職人ポイント(全期間)(Len) + 総いいね数(Len) + 総プレイ数(Len)
+//   + 全体順位(Len) + 週間順位(Len) + 直近投稿日(LenLen) + 公式ユーザー(Len, 1/0)
 function encodeMakerInfo(row) {
   return encodeAlphabet(row.author)
+    + encodeLen(row.maker_point)
     + encodeLen(row.total_likes)
     + encodeLen(row.total_plays)
-    + encodeLen(row.total_courses)
     + encodeLen(row.all_time_rank)
     + encodeLen(row.weekly_rank)
-    + encodeLenLen(minutesToDateTimeInt(row.latest_posted_at));
+    + encodeLenLen(minutesToDateTimeInt(row.latest_posted_at))
+    + encodeLen(row.is_official ? 1 : 0);
 }
 
 async function sendCourseData(setter, userId, stageData) {

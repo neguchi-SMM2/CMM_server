@@ -377,8 +377,9 @@ async function getMakerRankingAllTime(limit) {
 
 // CMD=18: 職人情報（author指定）
 // 送信するのは 職人ポイント(全期間) + 総いいね数 + 総プレイ数 + 全体順位 + 週間順位 + 公式フラグ
+// コース投稿実績がなくても、職人登録(maker_accounts)されていれば0実績として情報を返す
 async function getMakerInfo(author) {
-  const [courseAggResult, officialRow] = await Promise.all([
+  const [courseAggResult, officialRow, registeredRow] = await Promise.all([
     pool.query(
       `SELECT author,
               COALESCE(SUM(like_count), 0) AS total_likes,
@@ -391,12 +392,23 @@ async function getMakerInfo(author) {
       [author]
     ),
     pool.query(`SELECT 1 FROM official_makers WHERE name=$1`, [author]),
+    pool.query(
+      `SELECT 1 FROM maker_accounts WHERE author=$1 AND status='confirmed' LIMIT 1`,
+      [author]
+    ),
   ]);
-  if (!courseAggResult.rows.length) return null;
-  const r = courseAggResult.rows[0];
-  const totalLikes   = parseInt(r.total_likes, 10);
-  const totalPlays   = parseInt(r.total_plays, 10);
-  const totalCourses = parseInt(r.total_courses, 10);
+
+  const hasCourses = courseAggResult.rows.length > 0;
+  const isRegistered = registeredRow.rows.length > 0;
+
+  // コース投稿実績がなく、職人登録もされていない場合のみnullを返す
+  if (!hasCourses && !isRegistered) return null;
+
+  const r = hasCourses ? courseAggResult.rows[0] : null;
+  const totalLikes   = r ? parseInt(r.total_likes, 10) : 0;
+  const totalPlays   = r ? parseInt(r.total_plays, 10) : 0;
+  const totalCourses = r ? parseInt(r.total_courses, 10) : 0;
+  const latestPostedAt = r ? parseInt(r.latest_posted_at, 10) : 0;
   const allTimePoint = calcMakerPointAllTime(totalLikes, totalPlays, totalCourses);
 
   const allTimeRanking = await getMakerRankingAllTime(Number.MAX_SAFE_INTEGER);
@@ -416,7 +428,7 @@ async function getMakerInfo(author) {
     all_time_rank: allTimeRank,
     weekly_rank: weeklyRank,
     is_official: !!officialRow.rows.length,
-    latest_posted_at: parseInt(r.latest_posted_at, 10),
+    latest_posted_at: latestPostedAt,
   };
 }
 

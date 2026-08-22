@@ -131,15 +131,18 @@ async function sendMakerRankingList(setter, userId, cmd, rows) {
 }
 
 // CMD=18: author(alphabet) + 職人ポイント(全期間)(Len) + 総いいね数(Len) + 総プレイ数(Len)
-//   + 全体順位(Len) + 週間順位(Len) + 直近投稿日(LenLen) + 公式ユーザー(Len, 1/0) + 投稿コース数(Len)
+//   + 全体順位(Len) + 週間順位(Len) + 直近投稿日(LenLen、未投稿の場合は-1) + 公式ユーザー(Len, 1/0) + 投稿コース数(Len)
 function encodeMakerInfo(row) {
+  const latestPostedEncoded = row.latest_posted_at > 0
+    ? encodeLenLen(minutesToDateTimeInt(row.latest_posted_at))
+    : encodeLenLen(-1);
   return encodeAlphabet(row.author)
     + encodeLen(row.maker_point)
     + encodeLen(row.total_likes)
     + encodeLen(row.total_plays)
     + encodeLen(row.all_time_rank)
     + encodeLen(row.weekly_rank)
-    + encodeLenLen(minutesToDateTimeInt(row.latest_posted_at))
+    + latestPostedEncoded
     + encodeLen(row.is_official ? 1 : 0)
     + encodeLen(row.total_courses);
 }

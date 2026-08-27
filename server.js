@@ -94,7 +94,7 @@ async function sendEncodedItems(setter, userId, cmd, items) {
   }
 }
 
-function encodeCourseInfo(row, index) {
+function encodeCourseInfo(row, index, isOfficial) {
   const clearRate = row.attempt_count > 0
     ? Math.round(row.clear_count / row.attempt_count * 10000) / 100
     : 0;
@@ -106,11 +106,14 @@ function encodeCourseInfo(row, index) {
     + encodeText(row.title)
     + encodeAlphabet(row.id)
     + encodeAlphabet(row.author)
-    + encodeLen(row.posted_at);
+    + encodeLen(row.posted_at)
+    + encodeLen(isOfficial ? 1 : 0)
+    + encodeLen(row.red ? 1 : 0);
 }
 
 async function sendCourseList(setter, userId, cmd, rows) {
-  const items = rows.map((row, i) => encodeCourseInfo(row, i + 1));
+  const officialSet = new Set((await db.pool.query("SELECT name FROM official_makers")).rows.map(r => r.name));
+  const items = rows.map((row, i) => encodeCourseInfo(row, i + 1, officialSet.has(row.author)));
   await sendEncodedItems(setter, userId, cmd, items);
 }
 

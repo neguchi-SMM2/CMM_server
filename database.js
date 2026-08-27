@@ -34,6 +34,7 @@ async function initDB() {
     );
     ALTER TABLE courses ADD COLUMN IF NOT EXISTS username TEXT NOT NULL DEFAULT '';
     ALTER TABLE courses ADD COLUMN IF NOT EXISTS ip_address TEXT;
+    ALTER TABLE courses ADD COLUMN IF NOT EXISTS red INT NOT NULL DEFAULT 0;
 
     CREATE TABLE IF NOT EXISTS likes (
       id         SERIAL  PRIMARY KEY,
@@ -163,10 +164,16 @@ async function saveCourse(title, author, username, stageData, ipAddress = null) 
     if (!rows.length) break;
     id = generateCourseId();
   }
+
+  // このコースが何番目の投稿になるか（累計コース数+1）を求め、500の倍数ならred=1
+  const { rows: countRows } = await pool.query("SELECT COUNT(*) FROM courses");
+  const courseNumber = parseInt(countRows[0].count, 10) + 1;
+  const red = courseNumber % 500 === 0 ? 1 : 0;
+
   await pool.query(
-    `INSERT INTO courses (id, title, author, username, stage_data, posted_at, ip_address)
-     VALUES ($1, $2, $3, $4, $5, $6, $7)`,
-    [id, title, safeAuthor, username, stageData, postedAt, ipAddress || null]
+    `INSERT INTO courses (id, title, author, username, stage_data, posted_at, ip_address, red)
+     VALUES ($1, $2, $3, $4, $5, $6, $7, $8)`,
+    [id, title, safeAuthor, username, stageData, postedAt, ipAddress || null, red]
   );
   return { id };
 }
@@ -182,7 +189,7 @@ async function getCourseById(id) {
 // ─────────────────────────────────────────────
 // ランキング・検索
 // ─────────────────────────────────────────────
-const INFO_COLS = `id, title, author, like_count, play_count, attempt_count, clear_count, posted_at`;
+const INFO_COLS = `id, title, author, like_count, play_count, attempt_count, clear_count, posted_at, red`;
 
 async function getRandomCourses(limit) {
   const { rows } = await pool.query(
@@ -195,7 +202,7 @@ async function getWeeklyRanking(limit) {
   const since = Math.floor(Date.now() / 1000) - 7 * 24 * 60 * 60;
   const { rows } = await pool.query(
     `SELECT c.id, c.title, c.author, c.like_count, c.play_count,
-            c.attempt_count, c.clear_count, c.posted_at,
+            c.attempt_count, c.clear_count, c.posted_at, c.red,
             COUNT(l.id) AS weekly_count
      FROM courses c
      LEFT JOIN likes l ON l.course_id = c.id AND l.created_at >= $1

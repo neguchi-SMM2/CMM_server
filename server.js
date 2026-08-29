@@ -660,8 +660,241 @@ async function handleManageAPI(req, res) {
     return;
   }
 
+  // GET /api/chat-reports (未解決の通報一覧)
+  if (req.method === "GET" && pathname === "/api/chat-reports") {
+    try {
+      const reports = await db.listChatReports();
+      res.writeHead(200, { "Content-Type": "application/json" });
+      res.end(JSON.stringify({ ok: true, reports }));
+    } catch (e) {
+      res.writeHead(500, { "Content-Type": "application/json" });
+      res.end(JSON.stringify({ error: e.message }));
+    }
+    return;
+  }
+
+  // POST /api/chat-resolve-report
+  if (req.method === "POST" && pathname === "/api/chat-resolve-report") {
+    let body = "";
+    req.on("data", d => body += d);
+    req.on("end", async () => {
+      try {
+        const { id } = JSON.parse(body);
+        if (!id) {
+          res.writeHead(400, { "Content-Type": "application/json" });
+          res.end(JSON.stringify({ error: "id は必須です" }));
+          return;
+        }
+        const ok = await db.resolveChatReport(id);
+        res.writeHead(200, { "Content-Type": "application/json" });
+        res.end(JSON.stringify({ ok }));
+      } catch (e) {
+        res.writeHead(500, { "Content-Type": "application/json" });
+        res.end(JSON.stringify({ error: e.message }));
+      }
+    });
+    return;
+  }
+
+  // POST /api/chat-ban (チャットからのみBAN。ゲーム内投稿等には影響しない)
+  if (req.method === "POST" && pathname === "/api/chat-ban") {
+    let body = "";
+    req.on("data", d => body += d);
+    req.on("end", async () => {
+      try {
+        const { author, duration, reason } = JSON.parse(body);
+        if (!author || !duration) {
+          res.writeHead(400, { "Content-Type": "application/json" });
+          res.end(JSON.stringify({ error: "author, duration は必須です" }));
+          return;
+        }
+        const expiresAt = Math.floor(Date.now() / 1000) + parseInt(duration, 10);
+        await db.banChatAuthor(author, expiresAt, reason || null);
+        res.writeHead(200, { "Content-Type": "application/json" });
+        res.end(JSON.stringify({ ok: true }));
+      } catch (e) {
+        res.writeHead(500, { "Content-Type": "application/json" });
+        res.end(JSON.stringify({ error: e.message }));
+      }
+    });
+    return;
+  }
+
   res.writeHead(404, { "Content-Type": "application/json" });
   res.end(JSON.stringify({ error: "not found" }));
+}
+
+// ─────────────────────────────────────────────
+// 職人チャット用 公開API（Basic認証不要、トークン認証）
+// ─────────────────────────────────────────────
+
+// 連投対策: authorごとに直近送信時刻を記録し、最小送信間隔を強制する
+const chatLastSentAt = new Map();
+const CHAT_MIN_INTERVAL_MS = 3000; // 最短送信間隔
+const CHAT_MAX_LENGTH = 300;       // 1メッセージの最大文字数
+
+function readJsonBody(req) {
+  return new Promise((resolve, reject) => {
+    let body = "";
+    req.on("data", d => { body += d; if (body.length > 1e6) req.destroy(); });
+    req.on("end", () => {
+      try { resolve(body ? JSON.parse(body) : {}); }
+      catch (e) { reject(e); }
+    });
+    req.on("error", reject);
+  });
+}
+
+function getBearerToken(req) {
+  const auth = req.headers["authorization"] || "";
+  const m = auth.match(/^Bearer (.+)$/);
+  return m ? m[1] : null;
+}
+
+function sendJson(res, status, obj) {
+  res.writeHead(status, { "Content-Type": "application/json" });
+  res.end(JSON.stringify(obj));
+}
+
+async function requireChatAuth(req, res) {
+  const token = getBearerToken(req);
+  const author = await db.getAuthorByToken(token);
+  if (!author) {
+    sendJson(res, 401, { error: "unauthorized" });
+    return null;
+  }
+  const banned = await db.isChatBanned(author);
+  if (banned) {
+    sendJson(res, 403, { error: "banned" });
+    return null;
+  }
+  return author;
+}
+
+async function handleChatAPI(req, res) {
+  const url = new URL(req.url, "http://localhost");
+  const pathname = url.pathname;
+
+  // POST /api/chat/login
+  if (req.method === "POST" && pathname === "/api/chat/login") {
+    try {
+      const { author, password } = await readJsonBody(req);
+      if (!isValidStr(author) || !isValidStr(password)) {
+        return sendJson(res, 400, { error: "author, password は必須です" });
+      }
+      const result = await db.chatLogin(author, password);
+      if (result.error) return sendJson(res, 401, { error: result.error });
+      return sendJson(res, 200, { ok: true, token: result.token, author: result.author });
+    } catch (e) {
+      return sendJson(res, 500, { error: e.message });
+    }
+  }
+
+  // POST /api/chat/logout
+  if (req.method === "POST" && pathname === "/api/chat/logout") {
+    const token = getBearerToken(req);
+    if (token) await db.chatLogout(token);
+    return sendJson(res, 200, { ok: true });
+  }
+
+  // GET /api/chat/messages?after=ID  （全体チャットは誰でも閲覧可、ログイン不要）
+  if (req.method === "GET" && pathname === "/api/chat/messages") {
+    try {
+      const afterId = parseInt(url.searchParams.get("after") || "0", 10);
+      const messages = await db.getChatMessages(afterId, 100);
+      return sendJson(res, 200, { ok: true, messages });
+    } catch (e) {
+      return sendJson(res, 500, { error: e.message });
+    }
+  }
+
+  // POST /api/chat/send  { text }  （ログイン必須）
+  if (req.method === "POST" && pathname === "/api/chat/send") {
+    const author = await requireChatAuth(req, res);
+    if (!author) return;
+    try {
+      const { text } = await readJsonBody(req);
+      if (!isValidStr(text) || text.length > CHAT_MAX_LENGTH) {
+        return sendJson(res, 400, { error: "不正なメッセージです" });
+      }
+      const lastSent = chatLastSentAt.get(author) || 0;
+      if (Date.now() - lastSent < CHAT_MIN_INTERVAL_MS) {
+        return sendJson(res, 429, { error: "送信間隔が短すぎます" });
+      }
+      chatLastSentAt.set(author, Date.now());
+      const saved = await db.saveChatMessage(author, text.trim());
+      return sendJson(res, 200, { ok: true, id: saved.id, created_at: parseInt(saved.created_at, 10) });
+    } catch (e) {
+      return sendJson(res, 500, { error: e.message });
+    }
+  }
+
+  // GET /api/chat/dm/partners （ログイン必須）
+  if (req.method === "GET" && pathname === "/api/chat/dm/partners") {
+    const author = await requireChatAuth(req, res);
+    if (!author) return;
+    try {
+      const partners = await db.getDMPartners(author);
+      return sendJson(res, 200, { ok: true, partners });
+    } catch (e) {
+      return sendJson(res, 500, { error: e.message });
+    }
+  }
+
+  // GET /api/chat/dm/messages?with=author&after=ID （ログイン必須）
+  if (req.method === "GET" && pathname === "/api/chat/dm/messages") {
+    const author = await requireChatAuth(req, res);
+    if (!author) return;
+    try {
+      const withAuthor = url.searchParams.get("with");
+      if (!isValidStr(withAuthor)) return sendJson(res, 400, { error: "withは必須です" });
+      const afterId = parseInt(url.searchParams.get("after") || "0", 10);
+      const messages = await db.getDMMessages(author, withAuthor, afterId, 100);
+      return sendJson(res, 200, { ok: true, messages });
+    } catch (e) {
+      return sendJson(res, 500, { error: e.message });
+    }
+  }
+
+  // POST /api/chat/dm/send  { to, text } （ログイン必須）
+  if (req.method === "POST" && pathname === "/api/chat/dm/send") {
+    const author = await requireChatAuth(req, res);
+    if (!author) return;
+    try {
+      const { to, text } = await readJsonBody(req);
+      if (!isValidStr(to) || !isValidStr(text) || text.length > CHAT_MAX_LENGTH) {
+        return sendJson(res, 400, { error: "不正なメッセージです" });
+      }
+      if (to === author) return sendJson(res, 400, { error: "自分自身には送信できません" });
+      const lastSent = chatLastSentAt.get(author) || 0;
+      if (Date.now() - lastSent < CHAT_MIN_INTERVAL_MS) {
+        return sendJson(res, 429, { error: "送信間隔が短すぎます" });
+      }
+      chatLastSentAt.set(author, Date.now());
+      const saved = await db.saveDM(author, to, text.trim());
+      return sendJson(res, 200, { ok: true, id: saved.id, created_at: parseInt(saved.created_at, 10) });
+    } catch (e) {
+      return sendJson(res, 500, { error: e.message });
+    }
+  }
+
+  // POST /api/chat/report  { target_author, reason } （ログイン必須）
+  if (req.method === "POST" && pathname === "/api/chat/report") {
+    const author = await requireChatAuth(req, res);
+    if (!author) return;
+    try {
+      const { target_author, reason } = await readJsonBody(req);
+      if (!isValidStr(target_author) || !isValidStr(reason)) {
+        return sendJson(res, 400, { error: "target_author, reason は必須です" });
+      }
+      await db.createChatReport(author, target_author, reason.slice(0, 500));
+      return sendJson(res, 200, { ok: true });
+    } catch (e) {
+      return sendJson(res, 500, { error: e.message });
+    }
+  }
+
+  sendJson(res, 404, { error: "not found" });
 }
 
 function httpsRequest(options, body) {
@@ -959,6 +1192,17 @@ class CloudManager {
         const html = fs.readFileSync(path.join(__dirname, "manage.html"), "utf8");
         res.writeHead(200, { "Content-Type": "text/html; charset=utf-8" });
         res.end(html);
+        return;
+      }
+
+      // 公開チャットAPI（Basic認証は不要。トークンで各エンドポイント内で認証する）
+      // chat.htmlはGitHub Pages等の別ドメインから呼ばれるためCORSを許可する
+      if (url.pathname.startsWith("/api/chat/")) {
+        res.setHeader("Access-Control-Allow-Origin", "*");
+        res.setHeader("Access-Control-Allow-Methods", "GET, POST, OPTIONS");
+        res.setHeader("Access-Control-Allow-Headers", "Content-Type, Authorization");
+        if (req.method === "OPTIONS") { res.writeHead(204); res.end(); return; }
+        await handleChatAPI(req, res);
         return;
       }
 

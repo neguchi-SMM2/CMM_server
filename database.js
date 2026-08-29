@@ -124,6 +124,13 @@ async function initDB() {
     );
     CREATE INDEX IF NOT EXISTS idx_chat_reports_resolved ON chat_reports(resolved, created_at DESC);
 
+    CREATE TABLE IF NOT EXISTS chat_blocks (
+      blocker    TEXT    NOT NULL,
+      blocked    TEXT    NOT NULL,
+      created_at BIGINT  NOT NULL DEFAULT EXTRACT(EPOCH FROM NOW())::BIGINT,
+      PRIMARY KEY (blocker, blocked)
+    );
+
     CREATE INDEX IF NOT EXISTS idx_courses_likes   ON courses(like_count DESC);
     CREATE INDEX IF NOT EXISTS idx_courses_posted  ON courses(posted_at DESC);
     CREATE INDEX IF NOT EXISTS idx_courses_author  ON courses(author);
@@ -951,6 +958,49 @@ async function resolveChatReport(id) {
   return rowCount > 0;
 }
 
+// ─────────────────────────────────────────────
+// メッセージ削除（自分が送ったものだけ）
+// ─────────────────────────────────────────────
+
+async function deleteChatMessage(id, author) {
+  const { rowCount } = await pool.query(
+    "DELETE FROM chat_messages WHERE id=$1 AND author=$2", [id, author]
+  );
+  return rowCount > 0;
+}
+
+async function deleteDMMessage(id, author) {
+  const { rowCount } = await pool.query(
+    "DELETE FROM chat_dm WHERE id=$1 AND from_author=$2", [id, author]
+  );
+  return rowCount > 0;
+}
+
+// ─────────────────────────────────────────────
+// ブロック
+// ─────────────────────────────────────────────
+
+async function blockAuthor(blocker, blocked) {
+  await pool.query(
+    `INSERT INTO chat_blocks (blocker, blocked) VALUES ($1, $2)
+     ON CONFLICT (blocker, blocked) DO NOTHING`,
+    [blocker, blocked]
+  );
+}
+
+async function unblockAuthor(blocker, blocked) {
+  await pool.query(
+    "DELETE FROM chat_blocks WHERE blocker=$1 AND blocked=$2", [blocker, blocked]
+  );
+}
+
+async function getBlockedAuthors(blocker) {
+  const { rows } = await pool.query(
+    "SELECT blocked FROM chat_blocks WHERE blocker=$1 ORDER BY created_at DESC", [blocker]
+  );
+  return rows.map(r => r.blocked);
+}
+
 module.exports = {
   initDB, pool,
   saveCourse, getCourseById,
@@ -970,4 +1020,6 @@ module.exports = {
   chatLogin, getAuthorByToken, chatLogout,
   saveChatMessage, getChatMessages, saveDM, getDMMessages, getDMPartners,
   banChatAuthor, isChatBanned, createChatReport, listChatReports, resolveChatReport,
+  deleteChatMessage, deleteDMMessage,
+  blockAuthor, unblockAuthor, getBlockedAuthors,
 };

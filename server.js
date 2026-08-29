@@ -894,6 +894,75 @@ async function handleChatAPI(req, res) {
     }
   }
 
+  // POST /api/chat/delete  { id } （全体チャット・自分のメッセージのみ削除可）
+  if (req.method === "POST" && pathname === "/api/chat/delete") {
+    const author = await requireChatAuth(req, res);
+    if (!author) return;
+    try {
+      const { id } = await readJsonBody(req);
+      if (!id) return sendJson(res, 400, { error: "id は必須です" });
+      const ok = await db.deleteChatMessage(id, author);
+      return sendJson(res, 200, { ok });
+    } catch (e) {
+      return sendJson(res, 500, { error: e.message });
+    }
+  }
+
+  // POST /api/chat/dm/delete  { id } （DM・自分のメッセージのみ削除可）
+  if (req.method === "POST" && pathname === "/api/chat/dm/delete") {
+    const author = await requireChatAuth(req, res);
+    if (!author) return;
+    try {
+      const { id } = await readJsonBody(req);
+      if (!id) return sendJson(res, 400, { error: "id は必須です" });
+      const ok = await db.deleteDMMessage(id, author);
+      return sendJson(res, 200, { ok });
+    } catch (e) {
+      return sendJson(res, 500, { error: e.message });
+    }
+  }
+
+  // GET /api/chat/blocked （自分のブロック一覧）
+  if (req.method === "GET" && pathname === "/api/chat/blocked") {
+    const author = await requireChatAuth(req, res);
+    if (!author) return;
+    try {
+      const blocked = await db.getBlockedAuthors(author);
+      return sendJson(res, 200, { ok: true, blocked });
+    } catch (e) {
+      return sendJson(res, 500, { error: e.message });
+    }
+  }
+
+  // POST /api/chat/block  { target_author }
+  if (req.method === "POST" && pathname === "/api/chat/block") {
+    const author = await requireChatAuth(req, res);
+    if (!author) return;
+    try {
+      const { target_author } = await readJsonBody(req);
+      if (!isValidStr(target_author)) return sendJson(res, 400, { error: "target_author は必須です" });
+      if (target_author === author) return sendJson(res, 400, { error: "自分自身はブロックできません" });
+      await db.blockAuthor(author, target_author);
+      return sendJson(res, 200, { ok: true });
+    } catch (e) {
+      return sendJson(res, 500, { error: e.message });
+    }
+  }
+
+  // POST /api/chat/unblock  { target_author }
+  if (req.method === "POST" && pathname === "/api/chat/unblock") {
+    const author = await requireChatAuth(req, res);
+    if (!author) return;
+    try {
+      const { target_author } = await readJsonBody(req);
+      if (!isValidStr(target_author)) return sendJson(res, 400, { error: "target_author は必須です" });
+      await db.unblockAuthor(author, target_author);
+      return sendJson(res, 200, { ok: true });
+    } catch (e) {
+      return sendJson(res, 500, { error: e.message });
+    }
+  }
+
   sendJson(res, 404, { error: "not found" });
 }
 

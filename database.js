@@ -7,6 +7,7 @@
 const { Pool } = require("pg");
 const crypto   = require("crypto");
 const bcrypt   = require("bcryptjs");
+const zlib     = require("zlib");
 
 const pool = new Pool({
   connectionString: process.env.DATABASE_URL,
@@ -81,6 +82,47 @@ async function initDB() {
     CREATE UNIQUE INDEX IF NOT EXISTS idx_maker_accounts_confirmed_author
       ON maker_accounts(author) WHERE status = 'confirmed';
     CREATE INDEX IF NOT EXISTS idx_maker_accounts_author ON maker_accounts(author);
+
+    CREATE TABLE IF NOT EXISTS chat_sessions (
+      token      TEXT    PRIMARY KEY,
+      author     TEXT    NOT NULL,
+      created_at BIGINT  NOT NULL DEFAULT EXTRACT(EPOCH FROM NOW())::BIGINT
+    );
+    CREATE INDEX IF NOT EXISTS idx_chat_sessions_author ON chat_sessions(author);
+
+    CREATE TABLE IF NOT EXISTS chat_messages (
+      id         SERIAL  PRIMARY KEY,
+      author     TEXT    NOT NULL,
+      body       BYTEA   NOT NULL,
+      created_at BIGINT  NOT NULL DEFAULT EXTRACT(EPOCH FROM NOW())::BIGINT
+    );
+    CREATE INDEX IF NOT EXISTS idx_chat_messages_created ON chat_messages(created_at DESC);
+
+    CREATE TABLE IF NOT EXISTS chat_dm (
+      id          SERIAL  PRIMARY KEY,
+      from_author TEXT    NOT NULL,
+      to_author   TEXT    NOT NULL,
+      body        BYTEA   NOT NULL,
+      created_at  BIGINT  NOT NULL DEFAULT EXTRACT(EPOCH FROM NOW())::BIGINT
+    );
+    CREATE INDEX IF NOT EXISTS idx_chat_dm_from ON chat_dm(from_author, to_author, created_at DESC);
+    CREATE INDEX IF NOT EXISTS idx_chat_dm_to   ON chat_dm(to_author, from_author, created_at DESC);
+
+    CREATE TABLE IF NOT EXISTS chat_bans (
+      author     TEXT    PRIMARY KEY,
+      expires_at BIGINT  NOT NULL,
+      reason     TEXT
+    );
+
+    CREATE TABLE IF NOT EXISTS chat_reports (
+      id            SERIAL  PRIMARY KEY,
+      reporter      TEXT    NOT NULL,
+      target_author TEXT    NOT NULL,
+      reason        TEXT    NOT NULL,
+      created_at    BIGINT  NOT NULL DEFAULT EXTRACT(EPOCH FROM NOW())::BIGINT,
+      resolved      BOOLEAN NOT NULL DEFAULT FALSE
+    );
+    CREATE INDEX IF NOT EXISTS idx_chat_reports_resolved ON chat_reports(resolved, created_at DESC);
 
     CREATE INDEX IF NOT EXISTS idx_courses_likes   ON courses(like_count DESC);
     CREATE INDEX IF NOT EXISTS idx_courses_posted  ON courses(posted_at DESC);
@@ -766,6 +808,149 @@ async function getStats() {
   return rows[0];
 }
 
+// ─────────────────────────────────────────────
+// 職人チャット
+// ─────────────────────────────────────────────
+
+function compressText(text) {
+  return zlib.gzipSync(Buffer.from(text, "utf8"));
+}
+function decompressText(buf) {
+  return zlib.gunzipSync(buf).toString("utf8");
+}
+
+/** ログイン: 本登録済み職人のみ。トークンを発行してchat_sessionsに保存する */
+async function chatLogin(author, password) {
+  const confirmed = await isAuthorConfirmed(author);
+  if (!confirmed) return { error: "not_registered" };
+  const ok = await verifyMakerPassword(author, password);
+  if (!ok) return { error: "invalid_password" };
+  const banned = await isChatBanned(author);
+  if (banned) return { error: "banned" };
+  const token = crypto.randomBytes(32).toString("hex");
+  await pool.query(
+    "INSERT INTO chat_sessions (token, author) VALUES ($1, $2)", [token, author]
+  );
+  return { token, author };
+}
+
+/** トークンからauthorを取得（無効なら null） */
+async function getAuthorByToken(token) {
+  if (!token) return null;
+  const { rows } = await pool.query(
+    "SELECT author FROM chat_sessions WHERE token=$1", [token]
+  );
+  return rows[0]?.author || null;
+}
+
+async function chatLogout(token) {
+  await pool.query("DELETE FROM chat_sessions WHERE token=$1", [token]);
+}
+
+/** 全体チャットへ投稿 */
+async function saveChatMessage(author, text) {
+  const body = compressText(text);
+  const { rows } = await pool.query(
+    "INSERT INTO chat_messages (author, body) VALUES ($1, $2) RETURNING id, created_at",
+    [author, body]
+  );
+  return rows[0];
+}
+
+/** 全体チャットの取得（idが afterId より大きいものを古い順、最大limit件） */
+async function getChatMessages(afterId, limit) {
+  const { rows } = await pool.query(
+    "SELECT id, author, body, created_at FROM chat_messages WHERE id > $1 ORDER BY id ASC LIMIT $2",
+    [afterId || 0, limit]
+  );
+  return rows.map(r => ({
+    id: r.id, author: r.author, text: decompressText(r.body), created_at: parseInt(r.created_at, 10),
+  }));
+}
+
+/** DM送信 */
+async function saveDM(fromAuthor, toAuthor, text) {
+  const body = compressText(text);
+  const { rows } = await pool.query(
+    "INSERT INTO chat_dm (from_author, to_author, body) VALUES ($1, $2, $3) RETURNING id, created_at",
+    [fromAuthor, toAuthor, body]
+  );
+  return rows[0];
+}
+
+/** 2者間のDM取得 */
+async function getDMMessages(authorA, authorB, afterId, limit) {
+  const { rows } = await pool.query(
+    `SELECT id, from_author, to_author, body, created_at FROM chat_dm
+     WHERE ((from_author=$1 AND to_author=$2) OR (from_author=$2 AND to_author=$1))
+       AND id > $3
+     ORDER BY id ASC LIMIT $4`,
+    [authorA, authorB, afterId || 0, limit]
+  );
+  return rows.map(r => ({
+    id: r.id, from: r.from_author, to: r.to_author,
+    text: decompressText(r.body), created_at: parseInt(r.created_at, 10),
+  }));
+}
+
+/** DM相手一覧（最新メッセージ時刻順） */
+async function getDMPartners(author) {
+  const { rows } = await pool.query(
+    `SELECT partner, MAX(created_at) AS last_at FROM (
+       SELECT to_author AS partner, created_at FROM chat_dm WHERE from_author=$1
+       UNION ALL
+       SELECT from_author AS partner, created_at FROM chat_dm WHERE to_author=$1
+     ) t
+     GROUP BY partner
+     ORDER BY last_at DESC`,
+    [author]
+  );
+  return rows.map(r => ({ author: r.partner, last_at: parseInt(r.last_at, 10) }));
+}
+
+// ─────────────────────────────────────────────
+// チャットBAN・通報
+// ─────────────────────────────────────────────
+
+async function banChatAuthor(author, expiresAt, reason = null) {
+  await pool.query(
+    `INSERT INTO chat_bans (author, expires_at, reason) VALUES ($1, $2, $3)
+     ON CONFLICT (author) DO UPDATE SET expires_at = EXCLUDED.expires_at, reason = EXCLUDED.reason`,
+    [author, expiresAt, reason]
+  );
+  // BAN対象の既存セッションを全て無効化
+  await pool.query("DELETE FROM chat_sessions WHERE author=$1", [author]);
+}
+
+async function isChatBanned(author) {
+  const now = Math.floor(Date.now() / 1000);
+  const { rows } = await pool.query(
+    "SELECT 1 FROM chat_bans WHERE author=$1 AND expires_at > $2", [author, now]
+  );
+  return rows.length > 0;
+}
+
+async function createChatReport(reporter, targetAuthor, reason) {
+  await pool.query(
+    "INSERT INTO chat_reports (reporter, target_author, reason) VALUES ($1, $2, $3)",
+    [reporter, targetAuthor, reason]
+  );
+}
+
+async function listChatReports() {
+  const { rows } = await pool.query(
+    "SELECT id, reporter, target_author, reason, created_at FROM chat_reports WHERE resolved=FALSE ORDER BY created_at ASC"
+  );
+  return rows;
+}
+
+async function resolveChatReport(id) {
+  const { rowCount } = await pool.query(
+    "UPDATE chat_reports SET resolved=TRUE WHERE id=$1", [id]
+  );
+  return rowCount > 0;
+}
+
 module.exports = {
   initDB, pool,
   saveCourse, getCourseById,
@@ -782,4 +967,7 @@ module.exports = {
   getMakerStatus, registerMakerConfirmed, registerMakerPending, verifyMakerPassword, hasRegisteredToday,
   listPendingMakers, approvePendingMaker, rejectPendingMaker, cleanupInactiveMakers,
   calcMakerPointAllTime, calcMakerPointWeekly,
+  chatLogin, getAuthorByToken, chatLogout,
+  saveChatMessage, getChatMessages, saveDM, getDMMessages, getDMPartners,
+  banChatAuthor, isChatBanned, createChatReport, listChatReports, resolveChatReport,
 };

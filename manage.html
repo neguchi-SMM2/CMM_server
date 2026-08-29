@@ -33,28 +33,15 @@
     td.actions button { margin-top: 0; width: auto; padding: 0.4rem 0.8rem; font-size: 0.85rem; }
     .empty { color: #64748b; font-size: 0.9rem; margin-top: 1rem; }
     .table-wrap { overflow-x: auto; -webkit-overflow-scrolling: touch; }
-
-    @media (max-width: 640px) {
-      body { padding: 1rem; }
-      h1 { font-size: 1.25rem; margin-bottom: 1.25rem; padding-bottom: 0.75rem; }
-      h2 { font-size: 1rem; }
-      .cards { grid-template-columns: 1fr; gap: 1rem; }
-      .card { padding: 1rem; }
-      input, select, button { font-size: 1rem; }
-      button { padding: 0.85rem; }
-      table { font-size: 0.8rem; min-width: 640px; }
-      td.actions { flex-direction: column; gap: 0.4rem; }
-      td.actions button { width: 100%; padding: 0.6rem; }
-    }
   </style>
 </head>
 <body>
-  <h1>管理ページ</h1>
+  <h1>🛡️ 管理ページ</h1>
   <div class="cards">
 
     <!-- コース削除 -->
     <div class="card">
-      <h2>コース削除 &amp; 通知</h2>
+      <h2>🗑️ コース削除 &amp; 通知</h2>
       <label>コースID</label>
       <input id="del-course-id" type="text" placeholder="xxx-xxx-xxx">
       <label>削除理由</label>
@@ -63,9 +50,6 @@
         <option value="402">402 - プロジェクト・ユーザーの宣伝</option>
         <option value="403">403 - 過度ないいね要求</option>
         <option value="404">404 - タイトル・作者名でやり取り</option>
-        <option value="406">406 - 悪口や誹謗中傷</option>
-        <option value="407">407 - なりすまし</option>
-        <option value="408">408 - パクり</option>
       </select>
       <button class="btn-danger" onclick="deleteCourse()">削除して通知</button>
       <div id="del-msg" class="msg"></div>
@@ -73,13 +57,11 @@
 
     <!-- ユーザーBAN -->
     <div class="card">
-      <h2>ユーザーBAN</h2>
+      <h2>🔨 ユーザーBAN</h2>
       <label>ユーザー名</label>
       <input id="ban-username" type="text" placeholder="username">
       <label>BAN期間</label>
       <select id="ban-duration">
-        <option value="25200">7時間</option>
-        <option value="57600">16時間</option>
         <option value="86400">1日</option>
         <option value="259200">3日</option>
         <option value="604800">7日</option>
@@ -92,18 +74,39 @@
       <div id="ban-msg" class="msg"></div>
     </div>
 
-    <!-- 職人名 仮登録審査 -->
+    <!-- 職人チャットBAN -->
+    <div class="card">
+      <h2>💬 職人チャットBAN</h2>
+      <label>職人名 (author)</label>
+      <input id="chat-ban-author" type="text" placeholder="author">
+      <label>BAN期間</label>
+      <select id="chat-ban-duration">
+        <option value="86400">1日</option>
+        <option value="259200">3日</option>
+        <option value="604800">7日</option>
+        <option value="1209600">14日</option>
+        <option value="2592000">30日</option>
+        <option value="31536000">365日</option>
+        <option value="9999999999">永久</option>
+      </select>
+      <label>理由（任意）</label>
+      <input id="chat-ban-reason" type="text" placeholder="理由">
+      <button class="btn-warn" onclick="banChatAuthor()">チャットからBAN</button>
+      <div id="chat-ban-msg" class="msg"></div>
+    </div>
+
+    <!-- チャット通報一覧 -->
     <div class="card wide">
-      <h2>職人名 仮登録審査</h2>
-      <button class="btn-neutral" onclick="loadPendingMakers()">一覧を読み込む</button>
-      <div id="maker-msg" class="msg"></div>
-      <div id="maker-empty" class="empty" style="display:none;">仮登録はありません</div>
+      <h2>🚨 チャット通報一覧</h2>
+      <button class="btn-neutral" onclick="loadChatReports()">一覧を読み込む</button>
+      <div id="report-msg" class="msg"></div>
+      <div id="report-empty" class="empty" style="display:none;">未解決の通報はありません</div>
       <div class="table-wrap">
-        <table id="maker-table" style="display:none;">
+        <table id="report-table" style="display:none;">
           <thead>
-            <tr><th>職人名 (author)</th><th>ユーザー名 (username)</th><th>投稿実績</th><th>最新タイトル</th><th>申請日時</th><th>操作</th></tr>
+            <tr><th>通報者</th><th>対象職人</th><th>理由</th><th>通報日時</th><th>操作</th></tr>
           </thead>
-          <tbody id="maker-tbody"></tbody>
+          <tbody id="report-tbody"></tbody>
         </table>
       </div>
     </div>
@@ -117,7 +120,7 @@
       return "Basic " + btoa("admin:" + pass);
     }
 
-    function ensureAuth(msgId) {
+    async function apiFetch(path, body) {
       let auth = getAuth();
       if (!auth) {
         const pass = prompt("管理パスワードを入力してください:");
@@ -125,12 +128,6 @@
         sessionStorage.setItem("admin_pass", pass);
         auth = "Basic " + btoa("admin:" + pass);
       }
-      return auth;
-    }
-
-    async function apiFetch(path, body) {
-      const auth = ensureAuth(body._msgId);
-      if (!auth) return null;
       const res = await fetch(path, {
         method: "POST",
         headers: { "Content-Type": "application/json", "Authorization": auth },
@@ -139,18 +136,6 @@
       if (res.status === 401) {
         sessionStorage.removeItem("admin_pass");
         showMsg(body._msgId, "パスワードが違います", false);
-        return null;
-      }
-      return res.json();
-    }
-
-    async function apiGet(path, msgId) {
-      const auth = ensureAuth(msgId);
-      if (!auth) return null;
-      const res = await fetch(path, { headers: { "Authorization": auth } });
-      if (res.status === 401) {
-        sessionStorage.removeItem("admin_pass");
-        showMsg(msgId, "パスワードが違います", false);
         return null;
       }
       return res.json();
@@ -182,63 +167,88 @@
       else showMsg("ban-msg", data.error || "エラーが発生しました", false);
     }
 
+    async function banChatAuthor() {
+      const author   = document.getElementById("chat-ban-author").value.trim();
+      const duration = document.getElementById("chat-ban-duration").value;
+      const reason   = document.getElementById("chat-ban-reason").value.trim();
+      if (!author) { showMsg("chat-ban-msg", "職人名を入力してください", false); return; }
+      const data = await apiFetch("/api/chat-ban", { author, duration, reason, _msgId: "chat-ban-msg" });
+      if (!data) return;
+      if (data.ok) showMsg("chat-ban-msg", "チャットからBANしました", true);
+      else showMsg("chat-ban-msg", data.error || "エラーが発生しました", false);
+    }
+
+    async function apiGet(path, msgId) {
+      let auth = getAuth();
+      if (!auth) {
+        const pass = prompt("管理パスワードを入力してください:");
+        if (!pass) return null;
+        sessionStorage.setItem("admin_pass", pass);
+        auth = "Basic " + btoa("admin:" + pass);
+      }
+      const res = await fetch(path, { headers: { "Authorization": auth } });
+      if (res.status === 401) {
+        sessionStorage.removeItem("admin_pass");
+        showMsg(msgId, "パスワードが違います", false);
+        return null;
+      }
+      return res.json();
+    }
+
     function formatCreatedAt(unixSeconds) {
       const d = new Date(unixSeconds * 1000);
       return d.toLocaleString("ja-JP");
     }
 
-    async function loadPendingMakers() {
-      const data = await apiGet("/api/pending-makers", "maker-msg");
+    async function loadChatReports() {
+      const data = await apiGet("/api/chat-reports", "report-msg");
       if (!data) return;
-      if (!data.ok) { showMsg("maker-msg", data.error || "取得に失敗しました", false); return; }
+      if (!data.ok) { showMsg("report-msg", data.error || "取得に失敗しました", false); return; }
 
-      const tbody = document.getElementById("maker-tbody");
-      const table = document.getElementById("maker-table");
-      const empty = document.getElementById("maker-empty");
+      const tbody = document.getElementById("report-tbody");
+      const table = document.getElementById("report-table");
+      const empty = document.getElementById("report-empty");
       tbody.innerHTML = "";
 
-      if (!data.makers.length) {
+      if (!data.reports.length) {
         table.style.display = "none";
         empty.style.display = "block";
-        document.getElementById("maker-msg").className = "msg";
+        document.getElementById("report-msg").className = "msg";
         return;
       }
 
       table.style.display = "table";
       empty.style.display = "none";
 
-      for (const m of data.makers) {
+      for (const r of data.reports) {
         const tr = document.createElement("tr");
         tr.innerHTML = `
-          <td>${escapeHtml(m.author)}</td>
-          <td>${escapeHtml(m.username)}</td>
-          <td>${m.hasPosted ? "✅ あり" : "❌ なし"}</td>
-          <td>${m.latestTitle ? escapeHtml(m.latestTitle) : "-"}</td>
-          <td>${formatCreatedAt(m.created_at)}</td>
+          <td>${escapeHtml(r.reporter)}</td>
+          <td>${escapeHtml(r.target_author)}</td>
+          <td>${escapeHtml(r.reason)}</td>
+          <td>${formatCreatedAt(r.created_at)}</td>
           <td class="actions">
-            <button class="btn-warn" data-id="${m.id}" data-action="approve">承認</button>
-            <button class="btn-danger" data-id="${m.id}" data-action="reject">却下</button>
+            <button class="btn-neutral" data-id="${r.id}" data-action="resolve">解決済みにする</button>
           </td>
         `;
         tbody.appendChild(tr);
       }
 
       tbody.querySelectorAll("button").forEach(btn => {
-        btn.addEventListener("click", () => handleMakerAction(btn.dataset.id, btn.dataset.action));
+        btn.addEventListener("click", () => resolveChatReport(btn.dataset.id));
       });
 
-      document.getElementById("maker-msg").className = "msg";
+      document.getElementById("report-msg").className = "msg";
     }
 
-    async function handleMakerAction(id, action) {
-      const path = action === "approve" ? "/api/approve-maker" : "/api/reject-maker";
-      const data = await apiFetch(path, { id: parseInt(id, 10), _msgId: "maker-msg" });
+    async function resolveChatReport(id) {
+      const data = await apiFetch("/api/chat-resolve-report", { id: parseInt(id, 10), _msgId: "report-msg" });
       if (!data) return;
       if (data.ok) {
-        showMsg("maker-msg", action === "approve" ? "承認しました" : "却下しました", true);
-        loadPendingMakers();
+        showMsg("report-msg", "解決済みにしました", true);
+        loadChatReports();
       } else {
-        showMsg("maker-msg", "処理に失敗しました（既に処理済みの可能性があります）", false);
+        showMsg("report-msg", "処理に失敗しました", false);
       }
     }
 

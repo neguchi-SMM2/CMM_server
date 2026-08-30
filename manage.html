@@ -104,7 +104,7 @@
       <div class="table-wrap">
         <table id="report-table" style="display:none;">
           <thead>
-            <tr><th>通報者</th><th>対象職人</th><th>理由</th><th>通報日時</th><th>操作</th></tr>
+            <tr><th>通報者</th><th>対象職人</th><th>理由</th><th>通報されたメッセージ</th><th>通報日時</th><th>操作</th></tr>
           </thead>
           <tbody id="report-tbody"></tbody>
         </table>
@@ -222,10 +222,15 @@
 
       for (const r of data.reports) {
         const tr = document.createElement("tr");
+        const kindLabel = r.message_kind === "global" ? "全体" : r.message_kind === "dm" ? "DM" : "";
+        const messageCell = r.message_text
+          ? `<span style="color:#94a3b8;font-size:0.8rem;">${kindLabel ? "[" + kindLabel + "] " : ""}</span>${escapeHtml(r.message_text)}`
+          : `<span style="color:#64748b;">（メッセージ指定なし）</span>`;
         tr.innerHTML = `
           <td>${escapeHtml(r.reporter)}</td>
           <td>${escapeHtml(r.target_author)}</td>
           <td>${escapeHtml(r.reason)}</td>
+          <td>${messageCell}</td>
           <td>${formatCreatedAt(r.created_at)}</td>
           <td class="actions">
             <button class="btn-neutral" data-id="${r.id}" data-action="resolve">解決済みにする</button>

@@ -86,8 +86,10 @@ async function initDB() {
     CREATE TABLE IF NOT EXISTS chat_sessions (
       token      TEXT    PRIMARY KEY,
       author     TEXT    NOT NULL,
+      ip_address TEXT,
       created_at BIGINT  NOT NULL DEFAULT EXTRACT(EPOCH FROM NOW())::BIGINT
     );
+    ALTER TABLE chat_sessions ADD COLUMN IF NOT EXISTS ip_address TEXT;
     CREATE INDEX IF NOT EXISTS idx_chat_sessions_author ON chat_sessions(author);
 
     CREATE TABLE IF NOT EXISTS chat_messages (
@@ -129,8 +131,14 @@ async function initDB() {
       target_author TEXT    NOT NULL,
       reason        TEXT    NOT NULL,
       created_at    BIGINT  NOT NULL DEFAULT EXTRACT(EPOCH FROM NOW())::BIGINT,
-      resolved      BOOLEAN NOT NULL DEFAULT FALSE
+      resolved      BOOLEAN NOT NULL DEFAULT FALSE,
+      message_kind  TEXT,
+      message_id    INT,
+      message_text  TEXT
     );
+    ALTER TABLE chat_reports ADD COLUMN IF NOT EXISTS message_kind TEXT;
+    ALTER TABLE chat_reports ADD COLUMN IF NOT EXISTS message_id INT;
+    ALTER TABLE chat_reports ADD COLUMN IF NOT EXISTS message_text TEXT;
     CREATE INDEX IF NOT EXISTS idx_chat_reports_resolved ON chat_reports(resolved, created_at DESC);
 
     CREATE TABLE IF NOT EXISTS chat_blocks (
@@ -836,16 +844,16 @@ function decompressText(buf) {
 }
 
 /** ログイン: 本登録済み職人のみ。トークンを発行してchat_sessionsに保存する */
-async function chatLogin(author, password) {
+async function chatLogin(author, password, ipAddress = null) {
   const confirmed = await isAuthorConfirmed(author);
   if (!confirmed) return { error: "not_registered" };
   const ok = await verifyMakerPassword(author, password);
   if (!ok) return { error: "invalid_password" };
-  const banned = await isChatBanned(author);
+  const banned = await isChatBanned(author, ipAddress);
   if (banned) return { error: "banned" };
   const token = crypto.randomBytes(32).toString("hex");
   await pool.query(
-    "INSERT INTO chat_sessions (token, author) VALUES ($1, $2)", [token, author]
+    "INSERT INTO chat_sessions (token, author, ip_address) VALUES ($1, $2, $3)", [token, author, ipAddress || null]
   );
   return { token, author };
 }
@@ -955,28 +963,63 @@ async function banChatAuthor(author, expiresAt, reason = null) {
      ON CONFLICT (author) DO UPDATE SET expires_at = EXCLUDED.expires_at, reason = EXCLUDED.reason`,
     [author, expiresAt, reason]
   );
+  // そのauthorが過去にチャットへログインした際のIPアドレスも全てBANする
+  // （IPアドレスを変えて別のauthor名で再ログインされてもBANが効くようにするため）
+  const { rows: ipRows } = await pool.query(
+    "SELECT DISTINCT ip_address FROM chat_sessions WHERE author=$1 AND ip_address IS NOT NULL",
+    [author]
+  );
+  for (const { ip_address } of ipRows) {
+    await pool.query(
+      `INSERT INTO chat_bans (author, expires_at, reason) VALUES ($1, $2, $3)
+       ON CONFLICT (author) DO UPDATE SET expires_at = EXCLUDED.expires_at, reason = EXCLUDED.reason`,
+      [ip_address, expiresAt, reason]
+    );
+  }
   // BAN対象の既存セッションを全て無効化
   await pool.query("DELETE FROM chat_sessions WHERE author=$1", [author]);
 }
 
-async function isChatBanned(author) {
+async function isChatBanned(author, ipAddress = null) {
   const now = Math.floor(Date.now() / 1000);
   const { rows } = await pool.query(
     "SELECT 1 FROM chat_bans WHERE author=$1 AND expires_at > $2", [author, now]
   );
-  return rows.length > 0;
+  if (rows.length > 0) return true;
+  if (ipAddress) {
+    const { rows: ipRows } = await pool.query(
+      "SELECT 1 FROM chat_bans WHERE author=$1 AND expires_at > $2", [ipAddress, now]
+    );
+    if (ipRows.length > 0) return true;
+  }
+  return false;
 }
 
-async function createChatReport(reporter, targetAuthor, reason) {
+/**
+ * 通報を作成する。kind('global'/'dm')とmessageIdが指定された場合、
+ * 通報された時点のメッセージ本文をサーバー側で取得してスナップショット保存する
+ * （後でメッセージが削除されても、通報された内容を確認できるようにするため）
+ */
+async function createChatReport(reporter, targetAuthor, reason, kind = null, messageId = null) {
+  let messageText = null;
+  if (kind === "global" && messageId) {
+    const { rows } = await pool.query("SELECT body FROM chat_messages WHERE id=$1", [messageId]);
+    if (rows.length) messageText = decompressText(rows[0].body);
+  } else if (kind === "dm" && messageId) {
+    const { rows } = await pool.query("SELECT body FROM chat_dm WHERE id=$1", [messageId]);
+    if (rows.length) messageText = decompressText(rows[0].body);
+  }
   await pool.query(
-    "INSERT INTO chat_reports (reporter, target_author, reason) VALUES ($1, $2, $3)",
-    [reporter, targetAuthor, reason]
+    `INSERT INTO chat_reports (reporter, target_author, reason, message_kind, message_id, message_text)
+     VALUES ($1, $2, $3, $4, $5, $6)`,
+    [reporter, targetAuthor, reason, kind, messageId || null, messageText]
   );
 }
 
 async function listChatReports() {
   const { rows } = await pool.query(
-    "SELECT id, reporter, target_author, reason, created_at FROM chat_reports WHERE resolved=FALSE ORDER BY created_at ASC"
+    `SELECT id, reporter, target_author, reason, created_at, message_kind, message_id, message_text
+     FROM chat_reports WHERE resolved=FALSE ORDER BY created_at ASC`
   );
   return rows;
 }

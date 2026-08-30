@@ -111,6 +111,28 @@
       </div>
     </div>
 
+    <!-- 禁止ワード管理 -->
+    <div class="card wide">
+      <h2>🈲 禁止ワード管理</h2>
+      <p style="font-size:0.85rem;color:#94a3b8;margin-bottom:0.75rem;">
+        ここに登録した単語を含むメッセージ（全角・半角や大文字小文字は区別されません）は、全体チャット・DMともに送信できなくなります。
+      </p>
+      <div style="display:flex;gap:0.5rem;">
+        <input id="banned-word-input" type="text" placeholder="追加する単語" style="margin-top:0;">
+        <button class="btn-warn" style="margin-top:0;width:auto;padding:0.6rem 1.2rem;" onclick="addBannedWord()">追加</button>
+      </div>
+      <div id="banned-word-msg" class="msg"></div>
+      <div id="banned-word-empty" class="empty" style="display:none;">登録された禁止ワードはありません</div>
+      <div class="table-wrap">
+        <table id="banned-word-table" style="display:none;">
+          <thead>
+            <tr><th>単語</th><th>操作</th></tr>
+          </thead>
+          <tbody id="banned-word-tbody"></tbody>
+        </table>
+      </div>
+    </div>
+
   </div>
 
   <script>
@@ -261,6 +283,68 @@
       const div = document.createElement("div");
       div.textContent = str;
       return div.innerHTML;
+    }
+
+    // ── 禁止ワード管理 ──
+    async function loadBannedWords() {
+      const data = await apiGet("/api/banned-words", "banned-word-msg");
+      if (!data) return;
+      if (!data.ok) { showMsg("banned-word-msg", data.error || "取得に失敗しました", false); return; }
+
+      const tbody = document.getElementById("banned-word-tbody");
+      const table = document.getElementById("banned-word-table");
+      const empty = document.getElementById("banned-word-empty");
+      tbody.innerHTML = "";
+
+      if (!data.words.length) {
+        table.style.display = "none";
+        empty.style.display = "block";
+        return;
+      }
+
+      table.style.display = "table";
+      empty.style.display = "none";
+
+      for (const word of data.words) {
+        const tr = document.createElement("tr");
+        tr.innerHTML = `
+          <td>${escapeHtml(word)}</td>
+          <td class="actions">
+            <button class="btn-danger" data-word="${escapeHtml(word)}">削除</button>
+          </td>
+        `;
+        tbody.appendChild(tr);
+      }
+
+      tbody.querySelectorAll("button").forEach(btn => {
+        btn.addEventListener("click", () => removeBannedWord(btn.dataset.word));
+      });
+    }
+
+    async function addBannedWord() {
+      const input = document.getElementById("banned-word-input");
+      const word = input.value.trim();
+      if (!word) { showMsg("banned-word-msg", "単語を入力してください", false); return; }
+      const data = await apiFetch("/api/banned-words", { word, _msgId: "banned-word-msg" });
+      if (!data) return;
+      if (data.ok) {
+        input.value = "";
+        showMsg("banned-word-msg", "追加しました", true);
+        loadBannedWords();
+      } else {
+        showMsg("banned-word-msg", data.error || "エラーが発生しました", false);
+      }
+    }
+
+    async function removeBannedWord(word) {
+      const data = await apiFetch("/api/banned-words-delete", { word, _msgId: "banned-word-msg" });
+      if (!data) return;
+      if (data.ok) {
+        showMsg("banned-word-msg", "削除しました", true);
+        loadBannedWords();
+      } else {
+        showMsg("banned-word-msg", "削除に失敗しました", false);
+      }
     }
   </script>
 </body>

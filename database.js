@@ -1035,6 +1035,14 @@ async function getBlockedAuthors(blocker) {
   return rows.map(r => r.blocked);
 }
 
+/** blockerがblockedをブロックしているかどうか */
+async function isAuthorBlocked(blocker, blocked) {
+  const { rows } = await pool.query(
+    "SELECT 1 FROM chat_blocks WHERE blocker=$1 AND blocked=$2", [blocker, blocked]
+  );
+  return rows.length > 0;
+}
+
 module.exports = {
   initDB, pool,
   saveCourse, getCourseById,
@@ -1056,5 +1064,5 @@ module.exports = {
   getRecentlyDeletedChatIds, getRecentlyDeletedDMIds,
   banChatAuthor, isChatBanned, createChatReport, listChatReports, resolveChatReport,
   deleteChatMessage, deleteDMMessage,
-  blockAuthor, unblockAuthor, getBlockedAuthors,
+  blockAuthor, unblockAuthor, getBlockedAuthors, isAuthorBlocked,
 };

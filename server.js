@@ -798,11 +798,16 @@ async function handleChatAPI(req, res) {
   }
 
   // GET /api/chat/messages?after=ID  （全体チャットは誰でも閲覧可、ログイン不要）
+  // ログイン中の場合はトークンから確実に自分のメッセージかどうか(self)を判定して返す
   if (req.method === "GET" && pathname === "/api/chat/messages") {
     try {
       const afterId = parseInt(url.searchParams.get("after") || "0", 10);
+      const token = getBearerToken(req);
+      const currentAuthor = token ? await db.getAuthorByToken(token) : null;
       const messages = await db.getChatMessages(afterId, 100);
-      return sendJson(res, 200, { ok: true, messages });
+      const enriched = messages.map(m => ({ ...m, self: currentAuthor ? m.author === currentAuthor : false }));
+      const deletedIds = await db.getRecentlyDeletedChatIds(120);
+      return sendJson(res, 200, { ok: true, messages: enriched, deletedIds });
     } catch (e) {
       return sendJson(res, 500, { error: e.message });
     }
@@ -842,6 +847,7 @@ async function handleChatAPI(req, res) {
   }
 
   // GET /api/chat/dm/messages?with=author&after=ID （ログイン必須）
+  // 送信者=自分のトークンかどうかで確実にself判定を行う
   if (req.method === "GET" && pathname === "/api/chat/dm/messages") {
     const author = await requireChatAuth(req, res);
     if (!author) return;
@@ -850,7 +856,9 @@ async function handleChatAPI(req, res) {
       if (!isValidStr(withAuthor)) return sendJson(res, 400, { error: "withは必須です" });
       const afterId = parseInt(url.searchParams.get("after") || "0", 10);
       const messages = await db.getDMMessages(author, withAuthor, afterId, 100);
-      return sendJson(res, 200, { ok: true, messages });
+      const enriched = messages.map(m => ({ ...m, self: m.from === author }));
+      const deletedIds = await db.getRecentlyDeletedDMIds(author, withAuthor, 120);
+      return sendJson(res, 200, { ok: true, messages: enriched, deletedIds });
     } catch (e) {
       return sendJson(res, 500, { error: e.message });
     }

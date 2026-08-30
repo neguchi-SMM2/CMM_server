@@ -751,6 +751,13 @@ function getBearerToken(req) {
   return m ? m[1] : null;
 }
 
+// RenderはプロキシごしなのでX-Forwarded-Forの先頭を実クライアントIPとして扱う
+function getClientIp(req) {
+  const xff = req.headers["x-forwarded-for"];
+  if (xff) return xff.split(",")[0].trim();
+  return req.socket?.remoteAddress || null;
+}
+
 function sendJson(res, status, obj) {
   res.writeHead(status, { "Content-Type": "application/json" });
   res.end(JSON.stringify(obj));
@@ -782,7 +789,8 @@ async function handleChatAPI(req, res) {
       if (!isValidStr(author) || !isValidStr(password)) {
         return sendJson(res, 400, { error: "author, password は必須です" });
       }
-      const result = await db.chatLogin(author, password);
+      const ip = getClientIp(req);
+      const result = await db.chatLogin(author, password, ip);
       if (result.error) return sendJson(res, 401, { error: result.error });
       return sendJson(res, 200, { ok: true, token: result.token, author: result.author });
     } catch (e) {
@@ -894,11 +902,13 @@ async function handleChatAPI(req, res) {
     const author = await requireChatAuth(req, res);
     if (!author) return;
     try {
-      const { target_author, reason } = await readJsonBody(req);
+      const { target_author, reason, message_id, kind } = await readJsonBody(req);
       if (!isValidStr(target_author) || !isValidStr(reason)) {
         return sendJson(res, 400, { error: "target_author, reason は必須です" });
       }
-      await db.createChatReport(author, target_author, reason.slice(0, 500));
+      const validKind = (kind === "global" || kind === "dm") ? kind : null;
+      const validMessageId = validKind && Number.isInteger(message_id) ? message_id : null;
+      await db.createChatReport(author, target_author, reason.slice(0, 500), validKind, validMessageId);
       return sendJson(res, 200, { ok: true });
     } catch (e) {
       return sendJson(res, 500, { error: e.message });

@@ -720,6 +720,65 @@ async function handleManageAPI(req, res) {
     return;
   }
 
+  // GET /api/banned-words (禁止ワード一覧)
+  if (req.method === "GET" && pathname === "/api/banned-words") {
+    try {
+      const words = await db.listBannedWords();
+      res.writeHead(200, { "Content-Type": "application/json" });
+      res.end(JSON.stringify({ ok: true, words }));
+    } catch (e) {
+      res.writeHead(500, { "Content-Type": "application/json" });
+      res.end(JSON.stringify({ error: e.message }));
+    }
+    return;
+  }
+
+  // POST /api/banned-words (禁止ワード追加)
+  if (req.method === "POST" && pathname === "/api/banned-words") {
+    let body = "";
+    req.on("data", d => body += d);
+    req.on("end", async () => {
+      try {
+        const { word } = JSON.parse(body);
+        if (!word || typeof word !== "string" || !word.trim()) {
+          res.writeHead(400, { "Content-Type": "application/json" });
+          res.end(JSON.stringify({ error: "word は必須です" }));
+          return;
+        }
+        await db.addBannedWord(word.trim());
+        res.writeHead(200, { "Content-Type": "application/json" });
+        res.end(JSON.stringify({ ok: true }));
+      } catch (e) {
+        res.writeHead(500, { "Content-Type": "application/json" });
+        res.end(JSON.stringify({ error: e.message }));
+      }
+    });
+    return;
+  }
+
+  // POST /api/banned-words-delete (禁止ワード削除)
+  if (req.method === "POST" && pathname === "/api/banned-words-delete") {
+    let body = "";
+    req.on("data", d => body += d);
+    req.on("end", async () => {
+      try {
+        const { word } = JSON.parse(body);
+        if (!word) {
+          res.writeHead(400, { "Content-Type": "application/json" });
+          res.end(JSON.stringify({ error: "word は必須です" }));
+          return;
+        }
+        const ok = await db.removeBannedWord(word);
+        res.writeHead(200, { "Content-Type": "application/json" });
+        res.end(JSON.stringify({ ok }));
+      } catch (e) {
+        res.writeHead(500, { "Content-Type": "application/json" });
+        res.end(JSON.stringify({ error: e.message }));
+      }
+    });
+    return;
+  }
+
   res.writeHead(404, { "Content-Type": "application/json" });
   res.end(JSON.stringify({ error: "not found" }));
 }
@@ -732,6 +791,20 @@ async function handleManageAPI(req, res) {
 const chatLastSentAt = new Map();
 const CHAT_MIN_INTERVAL_MS = 3000; // 最短送信間隔
 const CHAT_MAX_LENGTH = 300;       // 1メッセージの最大文字数
+
+// ── 禁止ワード（NGワード）チェック ──
+// 単語リストはコードに直書きせず、DB(chat_banned_words)で管理する。管理ページから追加・削除できる。
+function normalizeForBanCheck(text) {
+  // 全角/半角・大文字小文字の表記ゆれを吸収してから比較する
+  return text.normalize("NFKC").toLowerCase();
+}
+
+async function containsBannedWord(text) {
+  const words = await db.listBannedWords();
+  if (!words.length) return false;
+  const normalizedText = normalizeForBanCheck(text);
+  return words.some(w => normalizedText.includes(normalizeForBanCheck(w)));
+}
 
 function readJsonBody(req) {
   return new Promise((resolve, reject) => {
@@ -830,6 +903,9 @@ async function handleChatAPI(req, res) {
       if (!isValidStr(text) || text.length > CHAT_MAX_LENGTH) {
         return sendJson(res, 400, { error: "不正なメッセージです" });
       }
+      if (await containsBannedWord(text)) {
+        return sendJson(res, 400, { error: "inappropriate_content" });
+      }
       const lastSent = chatLastSentAt.get(author) || 0;
       if (Date.now() - lastSent < CHAT_MIN_INTERVAL_MS) {
         return sendJson(res, 429, { error: "送信間隔が短すぎます" });
@@ -856,6 +932,7 @@ async function handleChatAPI(req, res) {
 
   // GET /api/chat/dm/messages?with=author&after=ID （ログイン必須）
   // 送信者=自分のトークンかどうかで確実にself判定を行う
+  // このスレッドを開いた＝既読とみなし、既読位置を更新する（LINEのような未読数表示のため）
   if (req.method === "GET" && pathname === "/api/chat/dm/messages") {
     const author = await requireChatAuth(req, res);
     if (!author) return;
@@ -866,6 +943,7 @@ async function handleChatAPI(req, res) {
       const messages = await db.getDMMessages(author, withAuthor, afterId, 100);
       const enriched = messages.map(m => ({ ...m, self: m.from === author }));
       const deletedIds = await db.getRecentlyDeletedDMIds(author, withAuthor, 120);
+      await db.markDMRead(author, withAuthor);
       return sendJson(res, 200, { ok: true, messages: enriched, deletedIds });
     } catch (e) {
       return sendJson(res, 500, { error: e.message });
@@ -884,6 +962,9 @@ async function handleChatAPI(req, res) {
       if (to === author) return sendJson(res, 400, { error: "自分自身には送信できません" });
       if (await db.isAuthorBlocked(author, to)) {
         return sendJson(res, 403, { error: "blocked_recipient" });
+      }
+      if (await containsBannedWord(text)) {
+        return sendJson(res, 400, { error: "inappropriate_content" });
       }
       const lastSent = chatLastSentAt.get(author) || 0;
       if (Date.now() - lastSent < CHAT_MIN_INTERVAL_MS) {

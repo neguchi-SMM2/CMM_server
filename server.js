@@ -874,6 +874,9 @@ async function handleChatAPI(req, res) {
         return sendJson(res, 400, { error: "不正なメッセージです" });
       }
       if (to === author) return sendJson(res, 400, { error: "自分自身には送信できません" });
+      if (await db.isAuthorBlocked(author, to)) {
+        return sendJson(res, 403, { error: "blocked_recipient" });
+      }
       const lastSent = chatLastSentAt.get(author) || 0;
       if (Date.now() - lastSent < CHAT_MIN_INTERVAL_MS) {
         return sendJson(res, 429, { error: "送信間隔が短すぎます" });

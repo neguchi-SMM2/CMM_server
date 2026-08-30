@@ -148,6 +148,18 @@ async function initDB() {
       PRIMARY KEY (blocker, blocked)
     );
 
+    CREATE TABLE IF NOT EXISTS chat_banned_words (
+      word       TEXT    PRIMARY KEY,
+      created_at BIGINT  NOT NULL DEFAULT EXTRACT(EPOCH FROM NOW())::BIGINT
+    );
+
+    CREATE TABLE IF NOT EXISTS chat_dm_reads (
+      author       TEXT    NOT NULL,
+      partner      TEXT    NOT NULL,
+      last_read_id INT     NOT NULL DEFAULT 0,
+      PRIMARY KEY (author, partner)
+    );
+
     CREATE INDEX IF NOT EXISTS idx_courses_likes   ON courses(like_count DESC);
     CREATE INDEX IF NOT EXISTS idx_courses_posted  ON courses(posted_at DESC);
     CREATE INDEX IF NOT EXISTS idx_courses_author  ON courses(author);
@@ -939,18 +951,41 @@ async function getRecentlyDeletedDMIds(authorA, authorB, sinceSeconds = 120) {
 }
 
 /** DM相手一覧（最新メッセージ時刻順） */
+/** DM相手一覧（最新メッセージ時刻順・未読件数つき） */
 async function getDMPartners(author) {
   const { rows } = await pool.query(
-    `SELECT partner, MAX(created_at) AS last_at FROM (
-       SELECT to_author AS partner, created_at FROM chat_dm WHERE from_author=$1
+    `SELECT t.partner, MAX(t.created_at) AS last_at,
+            COUNT(*) FILTER (
+              WHERE t.from_author = t.partner
+                AND t.id > COALESCE(r.last_read_id, 0)
+            ) AS unread_count
+     FROM (
+       SELECT id, to_author AS partner, from_author, created_at FROM chat_dm WHERE from_author=$1 AND deleted=FALSE
        UNION ALL
-       SELECT from_author AS partner, created_at FROM chat_dm WHERE to_author=$1
+       SELECT id, from_author AS partner, from_author, created_at FROM chat_dm WHERE to_author=$1 AND deleted=FALSE
      ) t
-     GROUP BY partner
+     LEFT JOIN chat_dm_reads r ON r.author=$1 AND r.partner=t.partner
+     GROUP BY t.partner
      ORDER BY last_at DESC`,
     [author]
   );
-  return rows.map(r => ({ author: r.partner, last_at: parseInt(r.last_at, 10) }));
+  return rows.map(r => ({
+    author: r.partner,
+    last_at: parseInt(r.last_at, 10),
+    unread_count: parseInt(r.unread_count, 10),
+  }));
+}
+
+/** そのDM相手との会話を既読にする（現時点までの最新メッセージIDを記録） */
+async function markDMRead(author, partner) {
+  await pool.query(
+    `INSERT INTO chat_dm_reads (author, partner, last_read_id)
+     SELECT $1, $2, COALESCE(MAX(id), 0) FROM chat_dm
+     WHERE (from_author=$1 AND to_author=$2) OR (from_author=$2 AND to_author=$1)
+     ON CONFLICT (author, partner) DO UPDATE SET
+       last_read_id = GREATEST(chat_dm_reads.last_read_id, EXCLUDED.last_read_id)`,
+    [author, partner]
+  );
 }
 
 // ─────────────────────────────────────────────
@@ -1086,6 +1121,32 @@ async function isAuthorBlocked(blocker, blocked) {
   return rows.length > 0;
 }
 
+// ─────────────────────────────────────────────
+// 禁止ワード（NGワード）
+// リストはコードに直書きせず、DBで管理する。管理ページから追加・削除する。
+// ─────────────────────────────────────────────
+
+async function listBannedWords() {
+  const { rows } = await pool.query(
+    "SELECT word FROM chat_banned_words ORDER BY created_at ASC"
+  );
+  return rows.map(r => r.word);
+}
+
+async function addBannedWord(word) {
+  await pool.query(
+    "INSERT INTO chat_banned_words (word) VALUES ($1) ON CONFLICT (word) DO NOTHING",
+    [word]
+  );
+}
+
+async function removeBannedWord(word) {
+  const { rowCount } = await pool.query(
+    "DELETE FROM chat_banned_words WHERE word=$1", [word]
+  );
+  return rowCount > 0;
+}
+
 module.exports = {
   initDB, pool,
   saveCourse, getCourseById,
@@ -1103,9 +1164,10 @@ module.exports = {
   listPendingMakers, approvePendingMaker, rejectPendingMaker, cleanupInactiveMakers,
   calcMakerPointAllTime, calcMakerPointWeekly,
   chatLogin, getAuthorByToken, chatLogout,
-  saveChatMessage, getChatMessages, saveDM, getDMMessages, getDMPartners,
+  saveChatMessage, getChatMessages, saveDM, getDMMessages, getDMPartners, markDMRead,
   getRecentlyDeletedChatIds, getRecentlyDeletedDMIds,
   banChatAuthor, isChatBanned, createChatReport, listChatReports, resolveChatReport,
   deleteChatMessage, deleteDMMessage,
   blockAuthor, unblockAuthor, getBlockedAuthors, isAuthorBlocked,
+  listBannedWords, addBannedWord, removeBannedWord,
 };

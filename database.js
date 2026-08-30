@@ -94,17 +94,26 @@ async function initDB() {
       id         SERIAL  PRIMARY KEY,
       author     TEXT    NOT NULL,
       body       BYTEA   NOT NULL,
-      created_at BIGINT  NOT NULL DEFAULT EXTRACT(EPOCH FROM NOW())::BIGINT
+      created_at BIGINT  NOT NULL DEFAULT EXTRACT(EPOCH FROM NOW())::BIGINT,
+      deleted    BOOLEAN NOT NULL DEFAULT FALSE,
+      deleted_at BIGINT
     );
+    ALTER TABLE chat_messages ADD COLUMN IF NOT EXISTS deleted BOOLEAN NOT NULL DEFAULT FALSE;
+    ALTER TABLE chat_messages ADD COLUMN IF NOT EXISTS deleted_at BIGINT;
     CREATE INDEX IF NOT EXISTS idx_chat_messages_created ON chat_messages(created_at DESC);
+    CREATE INDEX IF NOT EXISTS idx_chat_messages_deleted ON chat_messages(deleted, deleted_at);
 
     CREATE TABLE IF NOT EXISTS chat_dm (
       id          SERIAL  PRIMARY KEY,
       from_author TEXT    NOT NULL,
       to_author   TEXT    NOT NULL,
       body        BYTEA   NOT NULL,
-      created_at  BIGINT  NOT NULL DEFAULT EXTRACT(EPOCH FROM NOW())::BIGINT
+      created_at  BIGINT  NOT NULL DEFAULT EXTRACT(EPOCH FROM NOW())::BIGINT,
+      deleted     BOOLEAN NOT NULL DEFAULT FALSE,
+      deleted_at  BIGINT
     );
+    ALTER TABLE chat_dm ADD COLUMN IF NOT EXISTS deleted BOOLEAN NOT NULL DEFAULT FALSE;
+    ALTER TABLE chat_dm ADD COLUMN IF NOT EXISTS deleted_at BIGINT;
     CREATE INDEX IF NOT EXISTS idx_chat_dm_from ON chat_dm(from_author, to_author, created_at DESC);
     CREATE INDEX IF NOT EXISTS idx_chat_dm_to   ON chat_dm(to_author, from_author, created_at DESC);
 
@@ -867,12 +876,21 @@ async function saveChatMessage(author, text) {
 /** 全体チャットの取得（idが afterId より大きいものを古い順、最大limit件） */
 async function getChatMessages(afterId, limit) {
   const { rows } = await pool.query(
-    "SELECT id, author, body, created_at FROM chat_messages WHERE id > $1 ORDER BY id ASC LIMIT $2",
+    "SELECT id, author, body, created_at FROM chat_messages WHERE id > $1 AND deleted=FALSE ORDER BY id ASC LIMIT $2",
     [afterId || 0, limit]
   );
   return rows.map(r => ({
     id: r.id, author: r.author, text: decompressText(r.body), created_at: parseInt(r.created_at, 10),
   }));
+}
+
+/** 直近sinceSeconds秒以内に削除された全体チャットのメッセージID一覧 */
+async function getRecentlyDeletedChatIds(sinceSeconds = 120) {
+  const cutoff = Math.floor(Date.now() / 1000) - sinceSeconds;
+  const { rows } = await pool.query(
+    "SELECT id FROM chat_messages WHERE deleted=TRUE AND deleted_at >= $1", [cutoff]
+  );
+  return rows.map(r => r.id);
 }
 
 /** DM送信 */
@@ -890,7 +908,7 @@ async function getDMMessages(authorA, authorB, afterId, limit) {
   const { rows } = await pool.query(
     `SELECT id, from_author, to_author, body, created_at FROM chat_dm
      WHERE ((from_author=$1 AND to_author=$2) OR (from_author=$2 AND to_author=$1))
-       AND id > $3
+       AND id > $3 AND deleted=FALSE
      ORDER BY id ASC LIMIT $4`,
     [authorA, authorB, afterId || 0, limit]
   );
@@ -898,6 +916,18 @@ async function getDMMessages(authorA, authorB, afterId, limit) {
     id: r.id, from: r.from_author, to: r.to_author,
     text: decompressText(r.body), created_at: parseInt(r.created_at, 10),
   }));
+}
+
+/** 2者間のDMで直近sinceSeconds秒以内に削除されたメッセージID一覧 */
+async function getRecentlyDeletedDMIds(authorA, authorB, sinceSeconds = 120) {
+  const cutoff = Math.floor(Date.now() / 1000) - sinceSeconds;
+  const { rows } = await pool.query(
+    `SELECT id FROM chat_dm
+     WHERE ((from_author=$1 AND to_author=$2) OR (from_author=$2 AND to_author=$1))
+       AND deleted=TRUE AND deleted_at >= $3`,
+    [authorA, authorB, cutoff]
+  );
+  return rows.map(r => r.id);
 }
 
 /** DM相手一覧（最新メッセージ時刻順） */
@@ -964,14 +994,18 @@ async function resolveChatReport(id) {
 
 async function deleteChatMessage(id, author) {
   const { rowCount } = await pool.query(
-    "DELETE FROM chat_messages WHERE id=$1 AND author=$2", [id, author]
+    `UPDATE chat_messages SET deleted=TRUE, deleted_at=EXTRACT(EPOCH FROM NOW())::BIGINT
+     WHERE id=$1 AND author=$2 AND deleted=FALSE`,
+    [id, author]
   );
   return rowCount > 0;
 }
 
 async function deleteDMMessage(id, author) {
   const { rowCount } = await pool.query(
-    "DELETE FROM chat_dm WHERE id=$1 AND from_author=$2", [id, author]
+    `UPDATE chat_dm SET deleted=TRUE, deleted_at=EXTRACT(EPOCH FROM NOW())::BIGINT
+     WHERE id=$1 AND from_author=$2 AND deleted=FALSE`,
+    [id, author]
   );
   return rowCount > 0;
 }
@@ -1019,6 +1053,7 @@ module.exports = {
   calcMakerPointAllTime, calcMakerPointWeekly,
   chatLogin, getAuthorByToken, chatLogout,
   saveChatMessage, getChatMessages, saveDM, getDMMessages, getDMPartners,
+  getRecentlyDeletedChatIds, getRecentlyDeletedDMIds,
   banChatAuthor, isChatBanned, createChatReport, listChatReports, resolveChatReport,
   deleteChatMessage, deleteDMMessage,
   blockAuthor, unblockAuthor, getBlockedAuthors,

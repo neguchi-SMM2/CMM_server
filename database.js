@@ -160,13 +160,46 @@ async function initDB() {
       PRIMARY KEY (author, partner)
     );
 
+    CREATE TABLE IF NOT EXISTS chat_daily_usage (
+      author      TEXT    NOT NULL,
+      usage_date  TEXT    NOT NULL,
+      char_count  INT     NOT NULL DEFAULT 0,
+      PRIMARY KEY (author, usage_date)
+    );
+
     CREATE INDEX IF NOT EXISTS idx_courses_likes   ON courses(like_count DESC);
     CREATE INDEX IF NOT EXISTS idx_courses_posted  ON courses(posted_at DESC);
     CREATE INDEX IF NOT EXISTS idx_courses_author  ON courses(author);
     CREATE INDEX IF NOT EXISTS idx_courses_title   ON courses(title);
     CREATE INDEX IF NOT EXISTS idx_likes_course    ON likes(course_id);
     CREATE INDEX IF NOT EXISTS idx_likes_created   ON likes(created_at DESC);
+
+    CREATE TABLE IF NOT EXISTS like_fraud_incidents (
+      id            SERIAL  PRIMARY KEY,
+      course_id     TEXT    NOT NULL,
+      author        TEXT    NOT NULL,
+      removed_count INT     NOT NULL,
+      action        TEXT    NOT NULL,
+      detected_at   BIGINT  NOT NULL DEFAULT EXTRACT(EPOCH FROM NOW())::BIGINT
+    );
+    CREATE INDEX IF NOT EXISTS idx_fraud_detected ON like_fraud_incidents(detected_at DESC);
   `);
+
+  // Supabaseの自動REST API(PostgREST)経由でのアクセスを塞ぐため、
+  // publicスキーマの全テーブルでRLSを有効化する（ポリシーは追加しない=全面拒否）。
+  // このアプリはDATABASE_URL経由の直接接続のみを使用しており、テーブル所有者ロールは
+  // RLSを自動的にバイパスするため、サーバー自身の動作には影響しない。
+  await pool.query(`
+    DO $$
+    DECLARE r RECORD;
+    BEGIN
+      FOR r IN SELECT tablename FROM pg_tables WHERE schemaname = 'public'
+      LOOP
+        EXECUTE format('ALTER TABLE public.%I ENABLE ROW LEVEL SECURITY;', r.tablename);
+      END LOOP;
+    END $$;
+  `);
+
   console.log("✅ DB初期化完了");
 }
 
@@ -767,6 +800,116 @@ async function resetWeeklyLikes() {
 }
 
 // ─────────────────────────────────────────────
+// 不正いいね検知・自動修復
+// ─────────────────────────────────────────────
+
+const LIKE_FRAUD_BURST_GAP_SECONDS = 120;  // この秒数以内の間隔で連続していれば同じ"塊(バースト)"とみなす
+const LIKE_FRAUD_MIN_BURST_SIZE    = 6;    // 1つの塊がこの件数以上なら不正とみなして削除する
+const LIKE_FRAUD_EXTREME_SIZE      = 50;   // 1つの塊がこの件数以上なら重大な不正として厳しく対応する
+const LIKE_FRAUD_LOOKBACK_HOURS    = 6;    // 直近何時間分のいいねを対象に検査するか
+const LIKE_FRAUD_BAN_DURATION_SEC  = 7 * 24 * 60 * 60; // 重大な不正を行った職人のチャットBAN期間（7日）
+
+/**
+ * 「同じコースに、短時間で・複数の異なるユーザー名から・連続していいねが押される」パターン
+ * （＝ユーザー名を変えながらの自作自演いいね連打）を検知し、自動で修復する。
+ *
+ * - 検知した不正いいねの塊はlikesテーブルから削除し、courses.like_countも実態に合わせて補正する。
+ * - 1回の塊がLIKE_FRAUD_EXTREME_SIZE件以上という極端な規模だった場合は、
+ *   該当コースのいいね数を実カウントにリセットし、投稿者(職人)のチャットログインを一定期間停止する。
+ */
+async function detectAndCleanSuspiciousLikes() {
+  const since = Math.floor(Date.now() / 1000) - LIKE_FRAUD_LOOKBACK_HOURS * 3600;
+  const { rows } = await pool.query(
+    `SELECT id, username, course_id, created_at FROM likes
+     WHERE created_at >= $1
+     ORDER BY course_id, created_at ASC`,
+    [since]
+  );
+
+  // コースごとにグループ化する
+  const byCourse = new Map();
+  for (const r of rows) {
+    if (!byCourse.has(r.course_id)) byCourse.set(r.course_id, []);
+    byCourse.get(r.course_id).push(r);
+  }
+
+  const incidents = [];
+  for (const [courseId, likeRows] of byCourse) {
+    // 時系列順に並んだいいねを、間隔がLIKE_FRAUD_BURST_GAP_SECONDS以内なら同じ塊としてまとめる
+    let clusterStart = 0;
+    for (let i = 1; i <= likeRows.length; i++) {
+      const prev = likeRows[i - 1];
+      const cur = likeRows[i];
+      const isBoundary = !cur || (cur.created_at - prev.created_at) > LIKE_FRAUD_BURST_GAP_SECONDS;
+      if (isBoundary) {
+        const cluster = likeRows.slice(clusterStart, i);
+        if (cluster.length >= LIKE_FRAUD_MIN_BURST_SIZE) {
+          incidents.push({ courseId, cluster });
+        }
+        clusterStart = i;
+      }
+    }
+  }
+
+  const results = [];
+  for (const { courseId, cluster } of incidents) {
+    const ids = cluster.map(r => r.id);
+    const size = ids.length;
+
+    const { rows: courseRows } = await pool.query(
+      "SELECT author FROM courses WHERE id=$1", [courseId]
+    );
+    if (!courseRows.length) continue; // 既に削除済みのコースなどはスキップ
+    const author = courseRows[0].author;
+
+    // 不正と判定したいいねを削除する
+    await pool.query("DELETE FROM likes WHERE id = ANY($1::int[])", [ids]);
+
+    if (size >= LIKE_FRAUD_EXTREME_SIZE) {
+      // 重大な不正: いいね数を実カウントにリセットし、職人のチャットログインを停止する
+      const { rows: countRows } = await pool.query(
+        "SELECT COUNT(*) FROM likes WHERE course_id=$1", [courseId]
+      );
+      const actualCount = parseInt(countRows[0].count, 10);
+      await pool.query("UPDATE courses SET like_count=$1 WHERE id=$2", [actualCount, courseId]);
+
+      const expiresAt = Math.floor(Date.now() / 1000) + LIKE_FRAUD_BAN_DURATION_SEC;
+      await banChatAuthor(author, expiresAt, `不正いいね自動検知（${size}件の異常ないいねを一度に検知）`);
+
+      await pool.query(
+        `INSERT INTO like_fraud_incidents (course_id, author, removed_count, action)
+         VALUES ($1, $2, $3, $4)`,
+        [courseId, author, size, "reset_and_ban"]
+      );
+      results.push({ courseId, author, removedCount: size, action: "reset_and_ban" });
+    } else {
+      // 通常の不正: 不正分だけ差し引く
+      await pool.query(
+        "UPDATE courses SET like_count = GREATEST(like_count - $1, 0) WHERE id=$2",
+        [size, courseId]
+      );
+      await pool.query(
+        `INSERT INTO like_fraud_incidents (course_id, author, removed_count, action)
+         VALUES ($1, $2, $3, $4)`,
+        [courseId, author, size, "trim"]
+      );
+      results.push({ courseId, author, removedCount: size, action: "trim" });
+    }
+  }
+
+  return results;
+}
+
+/** 不正いいね検知の履歴一覧（管理ページ表示用） */
+async function listLikeFraudIncidents(limit = 100) {
+  const { rows } = await pool.query(
+    "SELECT id, course_id, author, removed_count, action, detected_at FROM like_fraud_incidents ORDER BY detected_at DESC LIMIT $1",
+    [limit]
+  );
+  return rows;
+}
+
+// ─────────────────────────────────────────────
 // 通知
 // ─────────────────────────────────────────────
 async function upsertNotification(username, cmd) {
@@ -989,6 +1132,68 @@ async function markDMRead(author, partner) {
 }
 
 // ─────────────────────────────────────────────
+// チャット: 1日あたりの送信文字数制限
+// ─────────────────────────────────────────────
+
+/** 日本時間(JST)での今日の日付文字列 'YYYY-MM-DD' を返す */
+function getJstDateString() {
+  const jst = new Date(Date.now() + 9 * 60 * 60 * 1000);
+  const y = jst.getUTCFullYear();
+  const m = String(jst.getUTCMonth() + 1).padStart(2, "0");
+  const d = String(jst.getUTCDate()).padStart(2, "0");
+  return `${y}-${m}-${d}`;
+}
+
+/** その職人が今日(JST)に送信した文字数の合計を取得する */
+async function getDailyCharCount(author) {
+  const day = getJstDateString();
+  const { rows } = await pool.query(
+    "SELECT char_count FROM chat_daily_usage WHERE author=$1 AND usage_date=$2",
+    [author, day]
+  );
+  return rows.length ? rows[0].char_count : 0;
+}
+
+/** 今日(JST)の送信文字数を加算する */
+async function addDailyCharCount(author, addChars) {
+  const day = getJstDateString();
+  await pool.query(
+    `INSERT INTO chat_daily_usage (author, usage_date, char_count) VALUES ($1, $2, $3)
+     ON CONFLICT (author, usage_date) DO UPDATE SET
+       char_count = chat_daily_usage.char_count + EXCLUDED.char_count`,
+    [author, day, addChars]
+  );
+}
+
+/** 古い日次使用量の記録を削除する（今日以外は不要なため） */
+async function cleanupOldDailyUsage() {
+  const today = getJstDateString();
+  const { rowCount } = await pool.query(
+    "DELETE FROM chat_daily_usage WHERE usage_date <> $1", [today]
+  );
+  if (rowCount > 0) console.log(`🗑️ 古いチャット日次使用量を ${rowCount} 件削除しました`);
+}
+
+// ─────────────────────────────────────────────
+// チャット: 古いメッセージの削除（DB容量対策）
+// ─────────────────────────────────────────────
+
+/** retentionDays日より古いチャットメッセージ・DMを削除する */
+async function deleteOldChatMessages(retentionDays = 90) {
+  const cutoff = Math.floor(Date.now() / 1000) - retentionDays * 24 * 60 * 60;
+  const { rowCount: msgCount } = await pool.query(
+    "DELETE FROM chat_messages WHERE created_at < $1", [cutoff]
+  );
+  const { rowCount: dmCount } = await pool.query(
+    "DELETE FROM chat_dm WHERE created_at < $1", [cutoff]
+  );
+  if (msgCount > 0 || dmCount > 0) {
+    console.log(`🗑️ 古いチャットデータを削除しました（全体チャット: ${msgCount}件, DM: ${dmCount}件）`);
+  }
+  return { deletedMessages: msgCount, deletedDMs: dmCount };
+}
+
+// ─────────────────────────────────────────────
 // チャットBAN・通報
 // ─────────────────────────────────────────────
 
@@ -1028,6 +1233,14 @@ async function isChatBanned(author, ipAddress = null) {
     if (ipRows.length > 0) return true;
   }
   return false;
+}
+
+/** チャットBANを解除する（誤検知時などに管理者が使う） */
+async function unbanChatAuthor(author) {
+  const { rowCount } = await pool.query(
+    "DELETE FROM chat_bans WHERE author=$1", [author]
+  );
+  return rowCount > 0;
 }
 
 /**
@@ -1165,8 +1378,10 @@ module.exports = {
   calcMakerPointAllTime, calcMakerPointWeekly,
   chatLogin, getAuthorByToken, chatLogout,
   saveChatMessage, getChatMessages, saveDM, getDMMessages, getDMPartners, markDMRead,
+  getDailyCharCount, addDailyCharCount, cleanupOldDailyUsage, deleteOldChatMessages,
   getRecentlyDeletedChatIds, getRecentlyDeletedDMIds,
-  banChatAuthor, isChatBanned, createChatReport, listChatReports, resolveChatReport,
+  banChatAuthor, unbanChatAuthor, isChatBanned, createChatReport, listChatReports, resolveChatReport,
+  detectAndCleanSuspiciousLikes, listLikeFraudIncidents,
   deleteChatMessage, deleteDMMessage,
   blockAuthor, unblockAuthor, getBlockedAuthors, isAuthorBlocked,
   listBannedWords, addBannedWord, removeBannedWord,

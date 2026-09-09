@@ -779,6 +779,55 @@ async function handleManageAPI(req, res) {
     return;
   }
 
+  // GET /api/like-fraud-incidents (不正いいね自動検知の履歴一覧)
+  if (req.method === "GET" && pathname === "/api/like-fraud-incidents") {
+    try {
+      const incidents = await db.listLikeFraudIncidents(100);
+      res.writeHead(200, { "Content-Type": "application/json" });
+      res.end(JSON.stringify({ ok: true, incidents }));
+    } catch (e) {
+      res.writeHead(500, { "Content-Type": "application/json" });
+      res.end(JSON.stringify({ error: e.message }));
+    }
+    return;
+  }
+
+  // POST /api/like-fraud-scan-now (不正いいね検知を今すぐ手動実行)
+  if (req.method === "POST" && pathname === "/api/like-fraud-scan-now") {
+    try {
+      const results = await db.detectAndCleanSuspiciousLikes();
+      res.writeHead(200, { "Content-Type": "application/json" });
+      res.end(JSON.stringify({ ok: true, results }));
+    } catch (e) {
+      res.writeHead(500, { "Content-Type": "application/json" });
+      res.end(JSON.stringify({ error: e.message }));
+    }
+    return;
+  }
+
+  // POST /api/chat-unban (チャットBANの解除。自動検知の誤検知対応など)
+  if (req.method === "POST" && pathname === "/api/chat-unban") {
+    let body = "";
+    req.on("data", d => body += d);
+    req.on("end", async () => {
+      try {
+        const { author } = JSON.parse(body);
+        if (!author) {
+          res.writeHead(400, { "Content-Type": "application/json" });
+          res.end(JSON.stringify({ error: "author は必須です" }));
+          return;
+        }
+        const ok = await db.unbanChatAuthor(author);
+        res.writeHead(200, { "Content-Type": "application/json" });
+        res.end(JSON.stringify({ ok }));
+      } catch (e) {
+        res.writeHead(500, { "Content-Type": "application/json" });
+        res.end(JSON.stringify({ error: e.message }));
+      }
+    });
+    return;
+  }
+
   res.writeHead(404, { "Content-Type": "application/json" });
   res.end(JSON.stringify({ error: "not found" }));
 }
@@ -789,8 +838,20 @@ async function handleManageAPI(req, res) {
 
 // 連投対策: authorごとに直近送信時刻を記録し、最小送信間隔を強制する
 const chatLastSentAt = new Map();
-const CHAT_MIN_INTERVAL_MS = 3000; // 最短送信間隔
-const CHAT_MAX_LENGTH = 300;       // 1メッセージの最大文字数
+const CHAT_MIN_INTERVAL_MS = 60 * 1000; // 最短送信間隔（全体チャット・DM共通で1分）
+const CHAT_MAX_LENGTH = 100;            // 1メッセージの最大文字数
+const CHAT_DAILY_CHAR_LIMIT = 5000;     // 1職人が1日(JST)に送信できる合計文字数
+const CHAT_NIGHT_START_HOUR = 1;        // この時刻(JST)から
+const CHAT_NIGHT_END_HOUR   = 6;        // この時刻(JST)までチャット送信を停止する
+
+/** 現在が深夜停止時間帯(JST 1:00〜6:00)かどうか */
+function isChatNightMode() {
+  const jstHour = parseInt(
+    new Intl.DateTimeFormat("en-US", { timeZone: "Asia/Tokyo", hour: "2-digit", hourCycle: "H23" }).format(new Date()),
+    10
+  );
+  return jstHour >= CHAT_NIGHT_START_HOUR && jstHour < CHAT_NIGHT_END_HOUR;
+}
 
 // ── 禁止ワード（NGワード）チェック ──
 // 単語リストはコードに直書きせず、DB(chat_banned_words)で管理する。管理ページから追加・削除できる。
@@ -899,6 +960,9 @@ async function handleChatAPI(req, res) {
     const author = await requireChatAuth(req, res);
     if (!author) return;
     try {
+      if (isChatNightMode()) {
+        return sendJson(res, 403, { error: "night_mode" });
+      }
       const { text } = await readJsonBody(req);
       if (!isValidStr(text) || text.length > CHAT_MAX_LENGTH) {
         return sendJson(res, 400, { error: "不正なメッセージです" });
@@ -910,8 +974,13 @@ async function handleChatAPI(req, res) {
       if (Date.now() - lastSent < CHAT_MIN_INTERVAL_MS) {
         return sendJson(res, 429, { error: "送信間隔が短すぎます" });
       }
+      const todayChars = await db.getDailyCharCount(author);
+      if (todayChars + text.length > CHAT_DAILY_CHAR_LIMIT) {
+        return sendJson(res, 400, { error: "daily_limit_exceeded" });
+      }
       chatLastSentAt.set(author, Date.now());
       const saved = await db.saveChatMessage(author, text.trim());
+      await db.addDailyCharCount(author, text.length);
       return sendJson(res, 200, { ok: true, id: saved.id, created_at: parseInt(saved.created_at, 10) });
     } catch (e) {
       return sendJson(res, 500, { error: e.message });
@@ -955,6 +1024,9 @@ async function handleChatAPI(req, res) {
     const author = await requireChatAuth(req, res);
     if (!author) return;
     try {
+      if (isChatNightMode()) {
+        return sendJson(res, 403, { error: "night_mode" });
+      }
       const { to, text } = await readJsonBody(req);
       if (!isValidStr(to) || !isValidStr(text) || text.length > CHAT_MAX_LENGTH) {
         return sendJson(res, 400, { error: "不正なメッセージです" });
@@ -970,8 +1042,13 @@ async function handleChatAPI(req, res) {
       if (Date.now() - lastSent < CHAT_MIN_INTERVAL_MS) {
         return sendJson(res, 429, { error: "送信間隔が短すぎます" });
       }
+      const todayChars = await db.getDailyCharCount(author);
+      if (todayChars + text.length > CHAT_DAILY_CHAR_LIMIT) {
+        return sendJson(res, 400, { error: "daily_limit_exceeded" });
+      }
       chatLastSentAt.set(author, Date.now());
       const saved = await db.saveDM(author, to, text.trim());
+      await db.addDailyCharCount(author, text.length);
       return sendJson(res, 200, { ok: true, id: saved.id, created_at: parseInt(saved.created_at, 10) });
     } catch (e) {
       return sendJson(res, 500, { error: e.message });
@@ -1328,6 +1405,34 @@ class CloudManager {
     console.log("📅 非アクティブ職人クリーンアップ: 1日ごとに実行");
   }
 
+  scheduleLikeFraudDetection() {
+    setInterval(async () => {
+      try {
+        const results = await db.detectAndCleanSuspiciousLikes();
+        for (const r of results) {
+          console.log(`🚨 不正いいね検知: course=${r.courseId} author=${r.author} removed=${r.removedCount} action=${r.action}`);
+        }
+      } catch (e) {
+        console.error("不正いいね検知処理失敗:", e);
+      }
+    }, 10 * 60 * 1000);
+    console.log("📅 不正いいね検知: 10分ごとに実行");
+  }
+
+  scheduleChatCleanup() {
+    // DBの容量を圧迫しないよう、古いチャットデータを定期的に削除する（1日ごと）
+    const CHAT_RETENTION_DAYS = 90; // 全体チャット・DMの保存期間
+    setInterval(async () => {
+      try {
+        await db.deleteOldChatMessages(CHAT_RETENTION_DAYS);
+        await db.cleanupOldDailyUsage();
+      } catch (e) {
+        console.error("チャットデータクリーンアップ失敗:", e);
+      }
+    }, 24 * 60 * 60 * 1000);
+    console.log(`📅 チャットデータクリーンアップ: 1日ごとに実行（保持期間 ${CHAT_RETENTION_DAYS}日）`);
+  }
+
   async start() {
     let lastUncaughtMsg = null;
     let uncaughtCount = 0;
@@ -1355,6 +1460,8 @@ class CloudManager {
     await Promise.allSettled([this.connectScratch(), Promise.resolve(this.connectTurboWarp())]);
     this.scheduleWeeklyReset();
     this.scheduleMakerCleanup();
+    this.scheduleLikeFraudDetection();
+    this.scheduleChatCleanup();
 
     const server = http.createServer(async (req, res) => {
       const url = new URL(req.url, `http://localhost`);

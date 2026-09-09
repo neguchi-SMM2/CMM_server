@@ -847,7 +847,7 @@ const CHAT_NIGHT_END_HOUR   = 6;        // この時刻(JST)までチャット�
 /** 現在が深夜停止時間帯(JST 1:00〜6:00)かどうか */
 function isChatNightMode() {
   const jstHour = parseInt(
-    new Intl.DateTimeFormat("en-US", { timeZone: "Asia/Tokyo", hour: "2-digit", hourCycle: "H23" }).format(new Date()),
+    new Intl.DateTimeFormat("en-US", { timeZone: "Asia/Tokyo", hour: "2-digit", hourCycle: "h23" }).format(new Date()),
     10
   );
   return jstHour >= CHAT_NIGHT_START_HOUR && jstHour < CHAT_NIGHT_END_HOUR;

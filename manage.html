@@ -95,6 +95,40 @@
       <div id="chat-ban-msg" class="msg"></div>
     </div>
 
+    <!-- 職人チャットBAN解除 -->
+    <div class="card">
+      <h2>🔓 職人チャットBAN解除</h2>
+      <p style="font-size:0.85rem;color:#94a3b8;margin-bottom:0.75rem;">
+        不正いいねの自動検知など、誤ってBANされた場合の解除に使用します。
+      </p>
+      <label>職人名 (author)</label>
+      <input id="chat-unban-author" type="text" placeholder="author">
+      <button class="btn-neutral" onclick="unbanChatAuthor()">BAN解除</button>
+      <div id="chat-unban-msg" class="msg"></div>
+    </div>
+
+    <!-- 不正いいね検知履歴 -->
+    <div class="card wide">
+      <h2>⚠️ 不正いいね自動検知履歴</h2>
+      <p style="font-size:0.85rem;color:#94a3b8;margin-bottom:0.75rem;">
+        同一コースへ短時間・複数ユーザー名から連続していいねが押されるパターンを10分ごとに自動検知し、
+        不正分の削除といいね数の補正を行っています。50件以上を一度に検知した場合は、いいね数のリセットと
+        該当職人のチャットBAN（7日間）を自動で行います。
+      </p>
+      <button class="btn-neutral" onclick="loadFraudIncidents()">履歴を読み込む</button>
+      <button class="btn-warn" onclick="scanFraudNow()">今すぐ検知を実行</button>
+      <div id="fraud-msg" class="msg"></div>
+      <div id="fraud-empty" class="empty" style="display:none;">検知履歴はありません</div>
+      <div class="table-wrap">
+        <table id="fraud-table" style="display:none;">
+          <thead>
+            <tr><th>コースID</th><th>職人</th><th>削除件数</th><th>対応</th><th>検知日時</th></tr>
+          </thead>
+          <tbody id="fraud-tbody"></tbody>
+        </table>
+      </div>
+    </div>
+
     <!-- チャット通報一覧 -->
     <div class="card wide">
       <h2>🚨 チャット通報一覧</h2>
@@ -283,6 +317,82 @@
       const div = document.createElement("div");
       div.textContent = str;
       return div.innerHTML;
+    }
+
+    // ── チャットBAN解除 ──
+    async function unbanChatAuthor() {
+      const author = document.getElementById("chat-unban-author").value.trim();
+      if (!author) { showMsg("chat-unban-msg", "職人名を入力してください", false); return; }
+      const data = await apiFetch("/api/chat-unban", { author, _msgId: "chat-unban-msg" });
+      if (!data) return;
+      if (data.ok) showMsg("chat-unban-msg", "BANを解除しました", true);
+      else showMsg("chat-unban-msg", "対象のBANが見つかりませんでした", false);
+    }
+
+    // ── 不正いいね検知履歴 ──
+    function formatDetectedAt(unixSeconds) {
+      return new Date(unixSeconds * 1000).toLocaleString("ja-JP");
+    }
+
+    const FRAUD_ACTION_LABELS = {
+      trim: "不正分のみ削除",
+      reset_and_ban: "いいね数リセット＋職人BAN",
+    };
+
+    async function loadFraudIncidents() {
+      const data = await apiGet("/api/like-fraud-incidents", "fraud-msg");
+      if (!data) return;
+      if (!data.ok) { showMsg("fraud-msg", data.error || "取得に失敗しました", false); return; }
+
+      const tbody = document.getElementById("fraud-tbody");
+      const table = document.getElementById("fraud-table");
+      const empty = document.getElementById("fraud-empty");
+      tbody.innerHTML = "";
+
+      if (!data.incidents.length) {
+        table.style.display = "none";
+        empty.style.display = "block";
+        return;
+      }
+
+      table.style.display = "table";
+      empty.style.display = "none";
+
+      for (const inc of data.incidents) {
+        const tr = document.createElement("tr");
+        tr.innerHTML = `
+          <td>${escapeHtml(inc.course_id)}</td>
+          <td>${escapeHtml(inc.author)}</td>
+          <td>${inc.removed_count}</td>
+          <td>${FRAUD_ACTION_LABELS[inc.action] || escapeHtml(inc.action)}</td>
+          <td>${formatDetectedAt(inc.detected_at)}</td>
+        `;
+        tbody.appendChild(tr);
+      }
+    }
+
+    async function scanFraudNow() {
+      showMsg("fraud-msg", "検知を実行しています…", true);
+      let auth = getAuth();
+      if (!auth) {
+        const pass = prompt("管理パスワードを入力してください:");
+        if (!pass) return;
+        sessionStorage.setItem("admin_pass", pass);
+        auth = "Basic " + btoa("admin:" + pass);
+      }
+      const res = await fetch("/api/like-fraud-scan-now", { method: "POST", headers: { "Authorization": auth } });
+      if (res.status === 401) {
+        sessionStorage.removeItem("admin_pass");
+        showMsg("fraud-msg", "パスワードが違います", false);
+        return;
+      }
+      const data = await res.json();
+      if (data.ok) {
+        showMsg("fraud-msg", `検知を実行しました（${data.results.length}件の不正いいねを処理）`, true);
+        loadFraudIncidents();
+      } else {
+        showMsg("fraud-msg", data.error || "エラーが発生しました", false);
+      }
     }
 
     // ── 禁止ワード管理 ──

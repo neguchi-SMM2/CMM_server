@@ -991,11 +991,35 @@ async function getStats() {
 // 職人チャット
 // ─────────────────────────────────────────────
 
+// 保存形式: 先頭1バイトをフラグとして使う
+//   0x00 = 無圧縮（以降がUTF-8のテキストそのもの）
+//   0x01 = gzip圧縮（以降がgzipデータ）
+// 短いメッセージはgzipのヘッダー/フッターの固定コストで逆に肥大化するため、
+// 圧縮した方が実際に小さくなる場合だけgzipを使う。
+const RAW_FLAG  = Buffer.from([0x00]);
+const GZIP_FLAG = Buffer.from([0x01]);
+
 function compressText(text) {
-  return zlib.gzipSync(Buffer.from(text, "utf8"));
+  const raw = Buffer.from(text, "utf8");
+  const gzipped = zlib.gzipSync(raw);
+  if (gzipped.length + GZIP_FLAG.length < raw.length + RAW_FLAG.length) {
+    return Buffer.concat([GZIP_FLAG, gzipped]);
+  }
+  return Buffer.concat([RAW_FLAG, raw]);
 }
+
 function decompressText(buf) {
-  return zlib.gunzipSync(buf).toString("utf8");
+  // 後方互換: 以前のバージョンはフラグなしで常にgzip保存していたため、
+  // gzipのマジックナンバー(0x1f 0x8b)で始まる場合はフラグなしの旧形式とみなす
+  if (buf.length >= 2 && buf[0] === 0x1f && buf[1] === 0x8b) {
+    return zlib.gunzipSync(buf).toString("utf8");
+  }
+  const flag = buf[0];
+  const body = buf.subarray(1);
+  if (flag === GZIP_FLAG[0]) {
+    return zlib.gunzipSync(body).toString("utf8");
+  }
+  return body.toString("utf8");
 }
 
 /** ログイン: 本登録済み職人のみ。トークンを発行してchat_sessionsに保存する */

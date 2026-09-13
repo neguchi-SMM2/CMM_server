@@ -175,13 +175,19 @@ async function initDB() {
     CREATE INDEX IF NOT EXISTS idx_likes_created   ON likes(created_at DESC);
 
     CREATE TABLE IF NOT EXISTS like_fraud_incidents (
-      id            SERIAL  PRIMARY KEY,
-      course_id     TEXT    NOT NULL,
-      author        TEXT    NOT NULL,
-      removed_count INT     NOT NULL,
-      action        TEXT    NOT NULL,
-      detected_at   BIGINT  NOT NULL DEFAULT EXTRACT(EPOCH FROM NOW())::BIGINT
+      id                   SERIAL  PRIMARY KEY,
+      course_id            TEXT    NOT NULL,
+      author               TEXT    NOT NULL,
+      removed_count        INT     NOT NULL,
+      action               TEXT    NOT NULL,
+      disposable_ratio     REAL,
+      prior_incident_count INT     NOT NULL DEFAULT 0,
+      ban_days             INT,
+      detected_at          BIGINT  NOT NULL DEFAULT EXTRACT(EPOCH FROM NOW())::BIGINT
     );
+    ALTER TABLE like_fraud_incidents ADD COLUMN IF NOT EXISTS disposable_ratio REAL;
+    ALTER TABLE like_fraud_incidents ADD COLUMN IF NOT EXISTS prior_incident_count INT NOT NULL DEFAULT 0;
+    ALTER TABLE like_fraud_incidents ADD COLUMN IF NOT EXISTS ban_days INT;
     CREATE INDEX IF NOT EXISTS idx_fraud_detected ON like_fraud_incidents(detected_at DESC);
   `);
 
@@ -304,7 +310,7 @@ const INFO_COLS = `id, title, author, like_count, play_count, attempt_count, cle
 
 async function getRandomCourses(limit) {
   const { rows } = await pool.query(
-    `SELECT ${INFO_COLS} FROM courses ORDER BY RANDOM() LIMIT $1`, [limit]
+    `SELECT ${INFO_COLS} FROM courses ORDER BY posted_at + (RANDOM() * 2880) DESC LIMIT $1`, [limit]
   );
   return rows;
 }
@@ -803,19 +809,69 @@ async function resetWeeklyLikes() {
 // 不正いいね検知・自動修復
 // ─────────────────────────────────────────────
 
-const LIKE_FRAUD_BURST_GAP_SECONDS = 120;  // この秒数以内の間隔で連続していれば同じ"塊(バースト)"とみなす
-const LIKE_FRAUD_MIN_BURST_SIZE    = 6;    // 1つの塊がこの件数以上なら不正とみなして削除する
-const LIKE_FRAUD_EXTREME_SIZE      = 50;   // 1つの塊がこの件数以上なら重大な不正として厳しく対応する
-const LIKE_FRAUD_LOOKBACK_HOURS    = 6;    // 直近何時間分のいいねを対象に検査するか
-const LIKE_FRAUD_BAN_DURATION_SEC  = 7 * 24 * 60 * 60; // 重大な不正を行った職人のチャットBAN期間（7日）
+const LIKE_FRAUD_BURST_GAP_SECONDS       = 120;  // この秒数以内の間隔で連続していれば同じ"塊(バースト)"とみなす
+const LIKE_FRAUD_MIN_BURST_SIZE          = 6;    // 通常、1つの塊がこの件数以上なら不正とみなす
+const LIKE_FRAUD_SUSPICIOUS_MIN_SIZE     = 3;    // 使い捨てユーザー名比率が高い場合、この件数まで閾値を下げる
+const LIKE_FRAUD_DISPOSABLE_RATIO_THRESHOLD = 0.7; // 塊の中でこの割合以上が「使い捨てユーザー名」なら閾値緩和の対象にする
+const LIKE_FRAUD_LOOKBACK_HOURS          = 6;    // 直近何時間分のいいねを対象に検査するか
+const LIKE_FRAUD_REPEAT_WINDOW_DAYS      = 30;   // 常習犯判定に使う「過去何日以内の検知件数」
+
+// 常習犯エスカレーション設定（今回が何回目の検知かによって、重大判定の基準と対応を厳しくする）
+// priorCount: このコース作者が過去LIKE_FRAUD_REPEAT_WINDOW_DAYS日以内に検知された回数
+const LIKE_FRAUD_ESCALATION_LEVELS = [
+  { minPriorCount: 0, extremeSize: 50, banDays: 7,  alwaysBan: false }, // 1回目
+  { minPriorCount: 1, extremeSize: 20, banDays: 14, alwaysBan: false }, // 2回目
+  { minPriorCount: 2, extremeSize: 10, banDays: 30, alwaysBan: true  }, // 3回目以降: 小規模でも即BAN
+];
+
+function getEscalationLevel(priorCount) {
+  let level = LIKE_FRAUD_ESCALATION_LEVELS[0];
+  for (const l of LIKE_FRAUD_ESCALATION_LEVELS) {
+    if (priorCount >= l.minPriorCount) level = l;
+  }
+  return level;
+}
+
+/** 過去LIKE_FRAUD_REPEAT_WINDOW_DAYS日以内に、その職人が検知された回数を取得する */
+async function countRecentFraudIncidents(author) {
+  const since = Math.floor(Date.now() / 1000) - LIKE_FRAUD_REPEAT_WINDOW_DAYS * 24 * 60 * 60;
+  const { rows } = await pool.query(
+    "SELECT COUNT(*) FROM like_fraud_incidents WHERE author=$1 AND detected_at >= $2",
+    [author, since]
+  );
+  return parseInt(rows[0].count, 10);
+}
+
+/**
+ * 塊(cluster)内のユーザー名のうち、「そのいいね以外に一度も他のいいね履歴がない」
+ * ＝使い捨てユーザー名とみなせる割合を計算する
+ */
+async function calcDisposableUsernameRatio(cluster) {
+  const usernames = [...new Set(cluster.map(r => r.username))];
+  const ids = cluster.map(r => r.id);
+  if (!usernames.length) return 0;
+
+  const { rows } = await pool.query(
+    `SELECT username, COUNT(*) AS other_count
+     FROM likes
+     WHERE username = ANY($1::text[]) AND id <> ALL($2::int[])
+     GROUP BY username`,
+    [usernames, ids]
+  );
+  const hasOtherHistory = new Set(rows.filter(r => parseInt(r.other_count, 10) > 0).map(r => r.username));
+  const disposableCount = usernames.filter(u => !hasOtherHistory.has(u)).length;
+  return disposableCount / usernames.length;
+}
 
 /**
  * 「同じコースに、短時間で・複数の異なるユーザー名から・連続していいねが押される」パターン
  * （＝ユーザー名を変えながらの自作自演いいね連打）を検知し、自動で修復する。
  *
  * - 検知した不正いいねの塊はlikesテーブルから削除し、courses.like_countも実態に合わせて補正する。
- * - 1回の塊がLIKE_FRAUD_EXTREME_SIZE件以上という極端な規模だった場合は、
+ * - 塊のサイズが基準（常習度に応じて変動）以上という重大な規模だった場合は、
  *   該当コースのいいね数を実カウントにリセットし、投稿者(職人)のチャットログインを一定期間停止する。
+ * - 塊が使い捨てユーザー名ばかりで構成されている場合、通常より小さい塊でも不正と判定する。
+ * - 過去に何度も検知されている職人（常習犯）ほど、判定基準を厳しくする。
  */
 async function detectAndCleanSuspiciousLikes() {
   const since = Math.floor(Date.now() / 1000) - LIKE_FRAUD_LOOKBACK_HOURS * 3600;
@@ -833,9 +889,9 @@ async function detectAndCleanSuspiciousLikes() {
     byCourse.get(r.course_id).push(r);
   }
 
-  const incidents = [];
+  // 時系列順に並んだいいねを、間隔がLIKE_FRAUD_BURST_GAP_SECONDS以内なら同じ塊としてまとめる
+  const candidateClusters = [];
   for (const [courseId, likeRows] of byCourse) {
-    // 時系列順に並んだいいねを、間隔がLIKE_FRAUD_BURST_GAP_SECONDS以内なら同じ塊としてまとめる
     let clusterStart = 0;
     for (let i = 1; i <= likeRows.length; i++) {
       const prev = likeRows[i - 1];
@@ -843,16 +899,32 @@ async function detectAndCleanSuspiciousLikes() {
       const isBoundary = !cur || (cur.created_at - prev.created_at) > LIKE_FRAUD_BURST_GAP_SECONDS;
       if (isBoundary) {
         const cluster = likeRows.slice(clusterStart, i);
-        if (cluster.length >= LIKE_FRAUD_MIN_BURST_SIZE) {
-          incidents.push({ courseId, cluster });
+        if (cluster.length >= LIKE_FRAUD_SUSPICIOUS_MIN_SIZE) {
+          candidateClusters.push({ courseId, cluster });
         }
         clusterStart = i;
       }
     }
   }
 
+  // ② 使い捨てユーザー名比率をもとに、不正とみなす塊を確定する
+  const incidents = [];
+  for (const { courseId, cluster } of candidateClusters) {
+    const size = cluster.length;
+    if (size >= LIKE_FRAUD_MIN_BURST_SIZE) {
+      // 通常の基準を満たしていれば、比率を見るまでもなく不正
+      incidents.push({ courseId, cluster, disposableRatio: null });
+      continue;
+    }
+    // 通常基準未満(3〜5件)は、使い捨てユーザー名の比率が高い場合のみ不正とみなす
+    const disposableRatio = await calcDisposableUsernameRatio(cluster);
+    if (disposableRatio >= LIKE_FRAUD_DISPOSABLE_RATIO_THRESHOLD) {
+      incidents.push({ courseId, cluster, disposableRatio });
+    }
+  }
+
   const results = [];
-  for (const { courseId, cluster } of incidents) {
+  for (const { courseId, cluster, disposableRatio } of incidents) {
     const ids = cluster.map(r => r.id);
     const size = ids.length;
 
@@ -862,10 +934,18 @@ async function detectAndCleanSuspiciousLikes() {
     if (!courseRows.length) continue; // 既に削除済みのコースなどはスキップ
     const author = courseRows[0].author;
 
+    // ③ 常習犯エスカレーション: 過去の検知回数から今回の判定基準を決める
+    const priorCount = await countRecentFraudIncidents(author);
+    const escalation = getEscalationLevel(priorCount);
+    const isExtreme = size >= escalation.extremeSize || escalation.alwaysBan;
+
     // 不正と判定したいいねを削除する
     await pool.query("DELETE FROM likes WHERE id = ANY($1::int[])", [ids]);
 
-    if (size >= LIKE_FRAUD_EXTREME_SIZE) {
+    // ②のため未計算だった場合（通常基準で確定した塊）も、記録用に比率を算出しておく
+    const finalDisposableRatio = disposableRatio !== null ? disposableRatio : await calcDisposableUsernameRatio(cluster);
+
+    if (isExtreme) {
       // 重大な不正: いいね数を実カウントにリセットし、職人のチャットログインを停止する
       const { rows: countRows } = await pool.query(
         "SELECT COUNT(*) FROM likes WHERE course_id=$1", [courseId]
@@ -873,15 +953,20 @@ async function detectAndCleanSuspiciousLikes() {
       const actualCount = parseInt(countRows[0].count, 10);
       await pool.query("UPDATE courses SET like_count=$1 WHERE id=$2", [actualCount, courseId]);
 
-      const expiresAt = Math.floor(Date.now() / 1000) + LIKE_FRAUD_BAN_DURATION_SEC;
-      await banChatAuthor(author, expiresAt, `不正いいね自動検知（${size}件の異常ないいねを一度に検知）`);
+      const banDays = escalation.banDays;
+      const expiresAt = Math.floor(Date.now() / 1000) + banDays * 24 * 60 * 60;
+      await banChatAuthor(
+        author, expiresAt,
+        `不正いいね自動検知（${size}件、通算${priorCount + 1}回目の検知）`
+      );
 
       await pool.query(
-        `INSERT INTO like_fraud_incidents (course_id, author, removed_count, action)
-         VALUES ($1, $2, $3, $4)`,
-        [courseId, author, size, "reset_and_ban"]
+        `INSERT INTO like_fraud_incidents
+           (course_id, author, removed_count, action, disposable_ratio, prior_incident_count, ban_days)
+         VALUES ($1, $2, $3, $4, $5, $6, $7)`,
+        [courseId, author, size, "reset_and_ban", finalDisposableRatio, priorCount, banDays]
       );
-      results.push({ courseId, author, removedCount: size, action: "reset_and_ban" });
+      results.push({ courseId, author, removedCount: size, action: "reset_and_ban", priorCount, banDays });
     } else {
       // 通常の不正: 不正分だけ差し引く
       await pool.query(
@@ -889,11 +974,12 @@ async function detectAndCleanSuspiciousLikes() {
         [size, courseId]
       );
       await pool.query(
-        `INSERT INTO like_fraud_incidents (course_id, author, removed_count, action)
-         VALUES ($1, $2, $3, $4)`,
-        [courseId, author, size, "trim"]
+        `INSERT INTO like_fraud_incidents
+           (course_id, author, removed_count, action, disposable_ratio, prior_incident_count)
+         VALUES ($1, $2, $3, $4, $5, $6)`,
+        [courseId, author, size, "trim", finalDisposableRatio, priorCount]
       );
-      results.push({ courseId, author, removedCount: size, action: "trim" });
+      results.push({ courseId, author, removedCount: size, action: "trim", priorCount, banDays: null });
     }
   }
 
@@ -903,7 +989,8 @@ async function detectAndCleanSuspiciousLikes() {
 /** 不正いいね検知の履歴一覧（管理ページ表示用） */
 async function listLikeFraudIncidents(limit = 100) {
   const { rows } = await pool.query(
-    "SELECT id, course_id, author, removed_count, action, detected_at FROM like_fraud_incidents ORDER BY detected_at DESC LIMIT $1",
+    `SELECT id, course_id, author, removed_count, action, disposable_ratio, prior_incident_count, ban_days, detected_at
+     FROM like_fraud_incidents ORDER BY detected_at DESC LIMIT $1`,
     [limit]
   );
   return rows;

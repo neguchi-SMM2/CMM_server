@@ -112,8 +112,10 @@
       <h2>⚠️ 不正いいね自動検知履歴</h2>
       <p style="font-size:0.85rem;color:#94a3b8;margin-bottom:0.75rem;">
         同一コースへ短時間・複数ユーザー名から連続していいねが押されるパターンを10分ごとに自動検知し、
-        不正分の削除といいね数の補正を行っています。50件以上を一度に検知した場合は、いいね数のリセットと
-        該当職人のチャットBAN（7日間）を自動で行います。
+        不正分の削除といいね数の補正を行っています。使い捨てユーザー名（他に利用履歴のない名前）の比率が
+        高い場合は、通常より少ない件数でも不正と判定します。また過去30日以内の検知回数が多い職人ほど、
+        重大判定の基準を厳しくし、BAN期間も長くします（1回目:50件以上で7日, 2回目:20件以上で14日,
+        3回目以降:10件以上またはどんな規模でも即BAN・30日）。
       </p>
       <button class="btn-neutral" onclick="loadFraudIncidents()">履歴を読み込む</button>
       <button class="btn-warn" onclick="scanFraudNow()">今すぐ検知を実行</button>
@@ -122,7 +124,7 @@
       <div class="table-wrap">
         <table id="fraud-table" style="display:none;">
           <thead>
-            <tr><th>コースID</th><th>職人</th><th>削除件数</th><th>対応</th><th>検知日時</th></tr>
+            <tr><th>コースID</th><th>職人</th><th>削除件数</th><th>使い捨て比率</th><th>通算回数</th><th>対応</th><th>BAN日数</th><th>検知日時</th></tr>
           </thead>
           <tbody id="fraud-tbody"></tbody>
         </table>
@@ -360,11 +362,18 @@
 
       for (const inc of data.incidents) {
         const tr = document.createElement("tr");
+        const ratioText = inc.disposable_ratio !== null && inc.disposable_ratio !== undefined
+          ? Math.round(inc.disposable_ratio * 100) + "%"
+          : "-";
+        const banDaysText = inc.ban_days ? inc.ban_days + "日" : "-";
         tr.innerHTML = `
           <td>${escapeHtml(inc.course_id)}</td>
           <td>${escapeHtml(inc.author)}</td>
           <td>${inc.removed_count}</td>
+          <td>${ratioText}</td>
+          <td>${inc.prior_incident_count + 1}回目</td>
           <td>${FRAUD_ACTION_LABELS[inc.action] || escapeHtml(inc.action)}</td>
+          <td>${banDaysText}</td>
           <td>${formatDetectedAt(inc.detected_at)}</td>
         `;
         tbody.appendChild(tr);

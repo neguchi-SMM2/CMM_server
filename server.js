@@ -844,6 +844,10 @@ const CHAT_DAILY_CHAR_LIMIT = 5000;     // 1職人が1日(JST)に送信できる
 const CHAT_NIGHT_START_HOUR = 1;        // この時刻(JST)から
 const CHAT_NIGHT_END_HOUR   = 6;        // この時刻(JST)までチャット送信を停止する
 
+// 通報の連投対策: 通報者ごとに直近の通報時刻を記録し、最短間隔を強制する
+const chatReportLastAt = new Map();
+const CHAT_REPORT_COOLDOWN_MS = 10 * 60 * 1000; // 通報のクールダウン（10分）
+
 /** 現在が深夜停止時間帯(JST 1:00〜6:00)かどうか */
 function isChatNightMode() {
   const jstHour = parseInt(
@@ -946,7 +950,10 @@ async function handleChatAPI(req, res) {
       const afterId = parseInt(url.searchParams.get("after") || "0", 10);
       const token = getBearerToken(req);
       const currentAuthor = token ? await db.getAuthorByToken(token) : null;
-      const messages = await db.getChatMessages(afterId, 100);
+      // 初回読み込み(after未指定/0)は一番古いメッセージからではなく、最新分から表示する
+      const messages = afterId > 0
+        ? await db.getChatMessages(afterId, 100)
+        : await db.getLatestChatMessages(50);
       const enriched = messages.map(m => ({ ...m, self: currentAuthor ? m.author === currentAuthor : false }));
       const deletedIds = await db.getRecentlyDeletedChatIds(120);
       return sendJson(res, 200, { ok: true, messages: enriched, deletedIds });
@@ -1009,7 +1016,10 @@ async function handleChatAPI(req, res) {
       const withAuthor = url.searchParams.get("with");
       if (!isValidStr(withAuthor)) return sendJson(res, 400, { error: "withは必須です" });
       const afterId = parseInt(url.searchParams.get("after") || "0", 10);
-      const messages = await db.getDMMessages(author, withAuthor, afterId, 100);
+      // 初回読み込み(after未指定/0)は一番古いメッセージからではなく、最新分から表示する
+      const messages = afterId > 0
+        ? await db.getDMMessages(author, withAuthor, afterId, 100)
+        : await db.getLatestDMMessages(author, withAuthor, 50);
       const enriched = messages.map(m => ({ ...m, self: m.from === author }));
       const deletedIds = await db.getRecentlyDeletedDMIds(author, withAuthor, 120);
       await db.markDMRead(author, withAuthor);
@@ -1064,9 +1074,17 @@ async function handleChatAPI(req, res) {
       if (!isValidStr(target_author) || !isValidStr(reason)) {
         return sendJson(res, 400, { error: "target_author, reason は必須です" });
       }
+      const lastReportAt = chatReportLastAt.get(author) || 0;
+      if (Date.now() - lastReportAt < CHAT_REPORT_COOLDOWN_MS) {
+        return sendJson(res, 429, { error: "report_cooldown" });
+      }
       const validKind = (kind === "global" || kind === "dm") ? kind : null;
       const validMessageId = validKind && Number.isInteger(message_id) ? message_id : null;
-      await db.createChatReport(author, target_author, reason.slice(0, 500), validKind, validMessageId);
+      const created = await db.createChatReport(author, target_author, reason.slice(0, 500), validKind, validMessageId);
+      if (!created) {
+        return sendJson(res, 400, { error: "already_reported" });
+      }
+      chatReportLastAt.set(author, Date.now());
       return sendJson(res, 200, { ok: true });
     } catch (e) {
       return sendJson(res, 500, { error: e.message });

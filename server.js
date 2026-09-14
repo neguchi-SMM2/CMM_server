@@ -840,7 +840,7 @@ async function handleManageAPI(req, res) {
 const chatLastSentAt = new Map();
 const CHAT_MIN_INTERVAL_MS = 60 * 1000; // 最短送信間隔（全体チャット・DM共通で1分）
 const CHAT_MAX_LENGTH = 100;            // 1メッセージの最大文字数
-const CHAT_DAILY_CHAR_LIMIT = 5000;     // 1職人が1日(JST)に送信できる合計文字数
+const CHAT_DAILY_CHAR_LIMIT = 1000;     // 1職人が1日(JST)に送信できる合計文字数
 const CHAT_NIGHT_START_HOUR = 1;        // この時刻(JST)から
 const CHAT_NIGHT_END_HOUR   = 6;        // この時刻(JST)までチャット送信を停止する
 

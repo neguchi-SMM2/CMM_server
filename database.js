@@ -140,6 +140,10 @@ async function initDB() {
     ALTER TABLE chat_reports ADD COLUMN IF NOT EXISTS message_id INT;
     ALTER TABLE chat_reports ADD COLUMN IF NOT EXISTS message_text TEXT;
     CREATE INDEX IF NOT EXISTS idx_chat_reports_resolved ON chat_reports(resolved, created_at DESC);
+    -- 同じ人が同じメッセージを二重に通報できないようにする（message_idがある場合のみ）
+    CREATE UNIQUE INDEX IF NOT EXISTS idx_chat_reports_unique_msg
+      ON chat_reports (reporter, message_kind, message_id)
+      WHERE message_id IS NOT NULL;
 
     CREATE TABLE IF NOT EXISTS chat_blocks (
       blocker    TEXT    NOT NULL,
@@ -1158,6 +1162,17 @@ async function getChatMessages(afterId, limit) {
   }));
 }
 
+/** 初回読み込み用: 最新limit件を、古い→新しい の順で返す（一番古いメッセージから表示されるのを防ぐため） */
+async function getLatestChatMessages(limit) {
+  const { rows } = await pool.query(
+    "SELECT id, author, body, created_at FROM chat_messages WHERE deleted=FALSE ORDER BY id DESC LIMIT $1",
+    [limit]
+  );
+  return rows.reverse().map(r => ({
+    id: r.id, author: r.author, text: decompressText(r.body), created_at: parseInt(r.created_at, 10),
+  }));
+}
+
 /** 直近sinceSeconds秒以内に削除された全体チャットのメッセージID一覧 */
 async function getRecentlyDeletedChatIds(sinceSeconds = 120) {
   const cutoff = Math.floor(Date.now() / 1000) - sinceSeconds;
@@ -1187,6 +1202,21 @@ async function getDMMessages(authorA, authorB, afterId, limit) {
     [authorA, authorB, afterId || 0, limit]
   );
   return rows.map(r => ({
+    id: r.id, from: r.from_author, to: r.to_author,
+    text: decompressText(r.body), created_at: parseInt(r.created_at, 10),
+  }));
+}
+
+/** 初回読み込み用: 最新limit件を、古い→新しい の順で返す */
+async function getLatestDMMessages(authorA, authorB, limit) {
+  const { rows } = await pool.query(
+    `SELECT id, from_author, to_author, body, created_at FROM chat_dm
+     WHERE ((from_author=$1 AND to_author=$2) OR (from_author=$2 AND to_author=$1))
+       AND deleted=FALSE
+     ORDER BY id DESC LIMIT $3`,
+    [authorA, authorB, limit]
+  );
+  return rows.reverse().map(r => ({
     id: r.id, from: r.from_author, to: r.to_author,
     text: decompressText(r.body), created_at: parseInt(r.created_at, 10),
   }));
@@ -1358,6 +1388,9 @@ async function unbanChatAuthor(author) {
  * 通報を作成する。kind('global'/'dm')とmessageIdが指定された場合、
  * 通報された時点のメッセージ本文をサーバー側で取得してスナップショット保存する
  * （後でメッセージが削除されても、通報された内容を確認できるようにするため）
+ *
+ * 同じ人が同じメッセージ(kind+messageId)を既に通報済みの場合は何もせず false を返す。
+ * 通報を新規作成できた場合は true を返す。
  */
 async function createChatReport(reporter, targetAuthor, reason, kind = null, messageId = null) {
   let messageText = null;
@@ -1368,11 +1401,13 @@ async function createChatReport(reporter, targetAuthor, reason, kind = null, mes
     const { rows } = await pool.query("SELECT body FROM chat_dm WHERE id=$1", [messageId]);
     if (rows.length) messageText = decompressText(rows[0].body);
   }
-  await pool.query(
+  const { rowCount } = await pool.query(
     `INSERT INTO chat_reports (reporter, target_author, reason, message_kind, message_id, message_text)
-     VALUES ($1, $2, $3, $4, $5, $6)`,
+     VALUES ($1, $2, $3, $4, $5, $6)
+     ON CONFLICT (reporter, message_kind, message_id) WHERE message_id IS NOT NULL DO NOTHING`,
     [reporter, targetAuthor, reason, kind, messageId || null, messageText]
   );
+  return rowCount > 0;
 }
 
 async function listChatReports() {
@@ -1488,7 +1523,8 @@ module.exports = {
   listPendingMakers, approvePendingMaker, rejectPendingMaker, cleanupInactiveMakers,
   calcMakerPointAllTime, calcMakerPointWeekly,
   chatLogin, getAuthorByToken, chatLogout,
-  saveChatMessage, getChatMessages, saveDM, getDMMessages, getDMPartners, markDMRead,
+  saveChatMessage, getChatMessages, getLatestChatMessages,
+  saveDM, getDMMessages, getLatestDMMessages, getDMPartners, markDMRead,
   getDailyCharCount, addDailyCharCount, cleanupOldDailyUsage, deleteOldChatMessages,
   getRecentlyDeletedChatIds, getRecentlyDeletedDMIds,
   banChatAuthor, unbanChatAuthor, isChatBanned, createChatReport, listChatReports, resolveChatReport,

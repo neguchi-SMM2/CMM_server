@@ -140,6 +140,15 @@ async function initDB() {
     ALTER TABLE chat_reports ADD COLUMN IF NOT EXISTS message_id INT;
     ALTER TABLE chat_reports ADD COLUMN IF NOT EXISTS message_text TEXT;
     CREATE INDEX IF NOT EXISTS idx_chat_reports_resolved ON chat_reports(resolved, created_at DESC);
+    -- ユニークインデックス作成前に、既存の重複通報（同じ人が同じメッセージを複数回通報したもの）を
+    -- 一番古い1件だけ残して削除しておく（重複が残っているとユニークインデックスの作成に失敗するため）
+    DELETE FROM chat_reports a
+    USING chat_reports b
+    WHERE a.message_id IS NOT NULL
+      AND a.reporter = b.reporter
+      AND a.message_kind = b.message_kind
+      AND a.message_id = b.message_id
+      AND a.id > b.id;
     -- 同じ人が同じメッセージを二重に通報できないようにする（message_idがある場合のみ）
     CREATE UNIQUE INDEX IF NOT EXISTS idx_chat_reports_unique_msg
       ON chat_reports (reporter, message_kind, message_id)

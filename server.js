@@ -840,7 +840,7 @@ async function handleManageAPI(req, res) {
 const chatLastSentAt = new Map();
 const CHAT_MIN_INTERVAL_MS = 60 * 1000; // 最短送信間隔（全体チャット・DM共通で1分）
 const CHAT_MAX_LENGTH = 100;            // 1メッセージの最大文字数
-const CHAT_DAILY_CHAR_LIMIT = 1000;     // 1職人が1日(JST)に送信できる合計文字数
+const CHAT_DAILY_CHAR_LIMIT = 5000;     // 1職人が1日(JST)に送信できる合計文字数
 const CHAT_NIGHT_START_HOUR = 1;        // この時刻(JST)から
 const CHAT_NIGHT_END_HOUR   = 6;        // この時刻(JST)までチャット送信を停止する
 
@@ -1227,6 +1227,25 @@ class CloudManager {
     this.queue      = [];
     this.processing = false;
     this.recentUsers = new Map();
+    // 営業日ごとに、既にDB記録済みのusernameを覚えておき、無駄なDB書き込みを減らす
+    this.recordedBusinessDay = null;
+    this.recordedUsernamesToday = new Set();
+  }
+
+  // 営業日(6:00〜翌1:00)に訪れたユーザーとしてusernameをDBに記録する（fire-and-forget）
+  recordDailyVisit(username) {
+    const businessDay = db.getBusinessDayForRecording();
+    if (!businessDay) return; // 1:00〜5:59の空白時間は記録しない
+    if (businessDay !== this.recordedBusinessDay) {
+      // 営業日が切り替わったら、記録済みセットをリセットする
+      this.recordedBusinessDay = businessDay;
+      this.recordedUsernamesToday = new Set();
+    }
+    if (this.recordedUsernamesToday.has(username)) return; // このプロセス内では既に記録済み
+    this.recordedUsernamesToday.add(username);
+    db.recordDailyActiveUser(username, businessDay).catch(e => {
+      console.error("訪問ユーザー記録失敗:", e.message);
+    });
   }
 
   trackUser(s) {
@@ -1235,12 +1254,16 @@ class CloudManager {
       const { cmd, next: p2 } = parseCmd(s, p1);
       if (cmd === CMD.UPLOAD) {
         const { value: username } = decodeAlphabet(s, p2);
-        if (isValidStr(username)) this.recentUsers.set(username, Math.floor(Date.now() / 1000));
+        if (isValidStr(username)) {
+          this.recentUsers.set(username, Math.floor(Date.now() / 1000));
+          this.recordDailyVisit(username);
+        }
         return;
       }
       const { value: username } = decodeAlphabet(s, p2);
       if (isValidStr(username)) {
         this.recentUsers.set(username, Math.floor(Date.now() / 1000));
+        this.recordDailyVisit(username);
       }
     } catch (_) {}
   }
@@ -1440,10 +1463,12 @@ class CloudManager {
   scheduleChatCleanup() {
     // DBの容量を圧迫しないよう、古いチャットデータを定期的に削除する（1日ごと）
     const CHAT_RETENTION_DAYS = 90; // 全体チャット・DMの保存期間
+    const DAU_RETENTION_DAYS  = 30; // 営業日ごとの訪問ユーザー記録の保存期間
     setInterval(async () => {
       try {
         await db.deleteOldChatMessages(CHAT_RETENTION_DAYS);
         await db.cleanupOldDailyUsage();
+        await db.cleanupOldDailyActiveUsers(DAU_RETENTION_DAYS);
       } catch (e) {
         console.error("チャットデータクリーンアップ失敗:", e);
       }
@@ -1508,6 +1533,8 @@ class CloudManager {
       }
 
       res.writeHead(200, { "Content-Type": "application/json" });
+      const businessDay = db.getBusinessDayForDisplay();
+      const dailyActiveUsers = await db.countDailyActiveUsers(businessDay).catch(() => null);
       res.end(JSON.stringify({
         status:    "ok",
         scratch:   this.scratch.conn?.readyState === WebSocket.OPEN ? "connected" : "disconnected",
@@ -1515,6 +1542,8 @@ class CloudManager {
         queue:     this.queue.length,
         onlineUsers: this.getOnlineUsers(),
         onlineUsernames: this.getOnlineUsernames(),
+        businessDay: businessDay,          // 対象の営業日（6:00〜翌1:00）
+        dailyActiveUsers: dailyActiveUsers, // その営業日に訪れたユニークユーザー数
         uptime:    process.uptime(),
       }));
     });

@@ -189,6 +189,14 @@ async function initDB() {
       PRIMARY KEY (author, usage_date)
     );
 
+    CREATE TABLE IF NOT EXISTS daily_active_users (
+      username     TEXT    NOT NULL,
+      business_day TEXT    NOT NULL,
+      first_seen_at BIGINT NOT NULL DEFAULT EXTRACT(EPOCH FROM NOW())::BIGINT,
+      PRIMARY KEY (username, business_day)
+    );
+    CREATE INDEX IF NOT EXISTS idx_dau_business_day ON daily_active_users(business_day);
+
     CREATE INDEX IF NOT EXISTS idx_courses_likes   ON courses(like_count DESC);
     CREATE INDEX IF NOT EXISTS idx_courses_posted  ON courses(posted_at DESC);
     CREATE INDEX IF NOT EXISTS idx_courses_author  ON courses(author);
@@ -1334,6 +1342,70 @@ async function cleanupOldDailyUsage() {
 }
 
 // ─────────────────────────────────────────────
+// 営業日（6:00〜翌1:00）ごとの訪問ユーザー記録
+// ─────────────────────────────────────────────
+
+function pad2(n) { return String(n).padStart(2, "0"); }
+function jstDateToString(y, m, d) { return `${y}-${pad2(m + 1)}-${pad2(d)}`; }
+
+/**
+ * 現在時刻(JST)がどの営業日(6:00〜翌1:00)に属するかを返す。
+ * 1:00〜5:59の間は営業日と営業日の間の「空白時間」のため null を返す（記録対象外）。
+ */
+function getBusinessDayForRecording() {
+  const jst = new Date(Date.now() + 9 * 60 * 60 * 1000);
+  const hour = jst.getUTCHours();
+  const y = jst.getUTCFullYear(), m = jst.getUTCMonth(), d = jst.getUTCDate();
+
+  if (hour >= 6) {
+    // 今日の6:00に始まった営業日
+    return jstDateToString(y, m, d);
+  }
+  if (hour < 1) {
+    // 昨日の6:00に始まり、今日の1:00まで続いている営業日
+    const yesterday = new Date(Date.UTC(y, m, d - 1));
+    return jstDateToString(yesterday.getUTCFullYear(), yesterday.getUTCMonth(), yesterday.getUTCDate());
+  }
+  return null; // 1:00〜5:59: どの営業日にも属さない
+}
+
+/** 表示用: 現在が空白時間(1:00〜5:59)なら、直前に終わった営業日を返す */
+function getBusinessDayForDisplay() {
+  const recording = getBusinessDayForRecording();
+  if (recording) return recording;
+  const jst = new Date(Date.now() + 9 * 60 * 60 * 1000);
+  const y = jst.getUTCFullYear(), m = jst.getUTCMonth(), d = jst.getUTCDate();
+  const yesterday = new Date(Date.UTC(y, m, d - 1));
+  return jstDateToString(yesterday.getUTCFullYear(), yesterday.getUTCMonth(), yesterday.getUTCDate());
+}
+
+/** その営業日に訪れたユーザーとしてusernameを記録する（同じ営業日内の重複は無視される） */
+async function recordDailyActiveUser(username, businessDay) {
+  await pool.query(
+    `INSERT INTO daily_active_users (username, business_day) VALUES ($1, $2)
+     ON CONFLICT (username, business_day) DO NOTHING`,
+    [username, businessDay]
+  );
+}
+
+/** 指定した営業日に訪れたユーザーの人数（重複なし）を取得する */
+async function countDailyActiveUsers(businessDay) {
+  const { rows } = await pool.query(
+    "SELECT COUNT(*) FROM daily_active_users WHERE business_day=$1", [businessDay]
+  );
+  return parseInt(rows[0].count, 10);
+}
+
+/** 古い営業日の記録を削除する（DB容量対策） */
+async function cleanupOldDailyActiveUsers(retentionDays = 30) {
+  const cutoff = Math.floor(Date.now() / 1000) - retentionDays * 24 * 60 * 60;
+  const { rowCount } = await pool.query(
+    "DELETE FROM daily_active_users WHERE first_seen_at < $1", [cutoff]
+  );
+  if (rowCount > 0) console.log(`🗑️ 古い訪問ユーザー記録を ${rowCount} 件削除しました`);
+}
+
+// ─────────────────────────────────────────────
 // チャット: 古いメッセージの削除（DB容量対策）
 // ─────────────────────────────────────────────
 
@@ -1544,6 +1616,8 @@ module.exports = {
   saveChatMessage, getChatMessages, getLatestChatMessages,
   saveDM, getDMMessages, getLatestDMMessages, getDMPartners, markDMRead,
   getDailyCharCount, addDailyCharCount, cleanupOldDailyUsage, deleteOldChatMessages,
+  getBusinessDayForRecording, getBusinessDayForDisplay,
+  recordDailyActiveUser, countDailyActiveUsers, cleanupOldDailyActiveUsers,
   getRecentlyDeletedChatIds, getRecentlyDeletedDMIds,
   banChatAuthor, unbanChatAuthor, isChatBanned, createChatReport, listChatReports, resolveChatReport,
   detectAndCleanSuspiciousLikes, listLikeFraudIncidents,

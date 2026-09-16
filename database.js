@@ -142,17 +142,26 @@ async function initDB() {
     CREATE INDEX IF NOT EXISTS idx_chat_reports_resolved ON chat_reports(resolved, created_at DESC);
     -- ユニークインデックス作成前に、既存の重複通報（同じ人が同じメッセージを複数回通報したもの）を
     -- 一番古い1件だけ残して削除しておく（重複が残っているとユニークインデックスの作成に失敗するため）
+    -- message_kindがNULL同士の行も正しく重複とみなせるよう IS NOT DISTINCT FROM を使う
     DELETE FROM chat_reports a
     USING chat_reports b
     WHERE a.message_id IS NOT NULL
       AND a.reporter = b.reporter
-      AND a.message_kind = b.message_kind
+      AND a.message_kind IS NOT DISTINCT FROM b.message_kind
       AND a.message_id = b.message_id
       AND a.id > b.id;
+
     -- 同じ人が同じメッセージを二重に通報できないようにする（message_idがある場合のみ）
-    CREATE UNIQUE INDEX IF NOT EXISTS idx_chat_reports_unique_msg
-      ON chat_reports (reporter, message_kind, message_id)
-      WHERE message_id IS NOT NULL;
+    -- 万が一まだ重複が残っていて作成に失敗しても、サーバー起動自体は止めずに警告だけ出す
+    DO $do$
+    BEGIN
+      CREATE UNIQUE INDEX IF NOT EXISTS idx_chat_reports_unique_msg
+        ON chat_reports (reporter, message_kind, message_id)
+        WHERE message_id IS NOT NULL;
+    EXCEPTION WHEN OTHERS THEN
+      RAISE NOTICE 'idx_chat_reports_unique_msg の作成に失敗しました（重複データが残っている可能性があります）: %', SQLERRM;
+    END;
+    $do$;
 
     CREATE TABLE IF NOT EXISTS chat_blocks (
       blocker    TEXT    NOT NULL,

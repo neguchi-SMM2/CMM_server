@@ -1097,8 +1097,7 @@ async function getStats() {
       COALESCE(SUM(like_count), 0)                      AS total_likes,
       COALESCE(SUM(clear_count), 0)                     AS total_clears,
       COALESCE(SUM(attempt_count), 0)                   AS total_attempts,
-      COUNT(*) FILTER (WHERE posted_at >= $1)           AS weekly_courses,
-      (SELECT id FROM courses ORDER BY posted_at DESC LIMIT 1) AS latest_course_id
+      COUNT(*) FILTER (WHERE posted_at >= $1)           AS weekly_courses
     FROM courses
   `, [weekAgo]);
   return rows[0];

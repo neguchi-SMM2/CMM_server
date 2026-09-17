@@ -34,6 +34,7 @@ const CLOUD_VARS   = [
 
 const CMD = {
   UPLOAD:          1,
+  DELETE_COURSE:   2,
   RANDOM:         10,
   WEEKLY:         11,
   ALL_TIME:       12,
@@ -193,6 +194,23 @@ async function handleRequest(s, setter, getOnlineUsers) {
       return;
     }
     console.warn("⚠️ 不正なusername:", username); return;
+  }
+
+  // CMD=2: コース削除（クライアントを信頼し、権限チェックは行わない）
+  if (cmd === CMD.DELETE_COURSE) {
+    const { value: courseId } = decodeAlphabet(s, pos);
+    let success = false;
+    if (isValidStr(courseId)) {
+      try {
+        const deleted = await db.deleteCourse(courseId);
+        success = !!deleted;
+      } catch (e) {
+        console.error("コース削除失敗:", e.message);
+        success = false;
+      }
+    }
+    await sendCloud(setter, randomCloud(), encodeLenLen(parseInt(userId)) + encodeLen(CMD.DELETE_COURSE) + encodeLen(success ? 1 : 0));
+    return;
   }
 
   if (cmd === CMD.RANDOM || cmd === CMD.WEEKLY || cmd === CMD.ALL_TIME || cmd === CMD.NEW_ARRIVAL) {
@@ -410,6 +428,8 @@ async function handleRequest(s, setter, getOnlineUsers) {
 
   if (cmd === CMD.GET_STATS) {
     const stats = await db.getStats();
+    const businessDay = db.getBusinessDayForDisplay();
+    const dailyActiveUsers = await db.countDailyActiveUsers(businessDay).catch(() => 0);
     const payload = encodeLenLen(parseInt(userId))
       + encodeLen(CMD.GET_STATS)
       + encodeLen(parseInt(stats.total_courses))
@@ -419,7 +439,7 @@ async function handleRequest(s, setter, getOnlineUsers) {
       + encodeLen(parseInt(stats.total_attempts))
       + encodeLen(parseInt(stats.weekly_courses))
       + encodeLen(getOnlineUsers())
-      + (stats.latest_course_id ? encodeAlphabet(stats.latest_course_id) : encodeAlphabet("000-000-000"));
+      + encodeLen(dailyActiveUsers || 0);
     await sendCloud(setter, randomCloud(), payload);
     return;
   }

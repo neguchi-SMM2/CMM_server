@@ -340,7 +340,11 @@ const INFO_COLS = `id, title, author, like_count, play_count, attempt_count, cle
 
 async function getRandomCourses(limit) {
   const { rows } = await pool.query(
-    `SELECT ${INFO_COLS} FROM courses ORDER BY posted_at + (RANDOM() * 2880) DESC LIMIT $1`, [limit]
+    `SELECT ${INFO_COLS} FROM courses 
+     WHERE id IN (
+       SELECT id FROM courses ORDER BY RANDOM() LIMIT $1
+     )
+     ORDER BY posted_at DESC`, [limit]
   );
   return rows;
 }

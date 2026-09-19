@@ -59,6 +59,7 @@ const CMD = {
   GET_STATS:      90,
   GET_ANNOUNCEMENT:91,
   BAN_USERNAME:  600,
+  END_MARKER:   1000,
 };
 
 const SEND_INTERVAL = 120;
@@ -77,6 +78,11 @@ function parseCmd(s, pos) {
 async function sendCloud(setter, name, value) {
   await setter(name, String(value));
   await sleep(SEND_INTERVAL);
+}
+
+// CMD=10〜19のデータを全件送り終えたことをクライアントに知らせる（基礎データのみ）
+async function sendEndMarker(setter, userId) {
+  await sendCloud(setter, randomCloud(), encodeLenLen(parseInt(userId)) + encodeLen(CMD.END_MARKER));
 }
 
 async function sendEncodedItems(setter, userId, cmd, items) {
@@ -222,6 +228,7 @@ async function handleRequest(s, setter, getOnlineUsers) {
     else if (cmd === CMD.NEW_ARRIVAL) rows = await db.getNewArrivalCourses(limit);
     else                               rows = await db.getAllTimeRanking(limit);
     await sendCourseList(setter, userId, cmd, rows);
+    await sendEndMarker(setter, userId);
     return;
   }
 
@@ -234,6 +241,7 @@ async function handleRequest(s, setter, getOnlineUsers) {
       return;
     }
     await sendCourseList(setter, userId, cmd, rows);
+    await sendEndMarker(setter, userId);
     return;
   }
 
@@ -248,6 +256,7 @@ async function handleRequest(s, setter, getOnlineUsers) {
       return;
     }
     await sendCourseList(setter, userId, cmd, rows);
+    await sendEndMarker(setter, userId);
     return;
   }
 
@@ -258,6 +267,7 @@ async function handleRequest(s, setter, getOnlineUsers) {
       ? await db.getMakerRankingWeek(limit)
       : await db.getMakerRankingAllTime(limit);
     await sendMakerRankingList(setter, userId, cmd, rows);
+    await sendEndMarker(setter, userId);
     return;
   }
 
@@ -271,6 +281,7 @@ async function handleRequest(s, setter, getOnlineUsers) {
     }
     const payload = encodeLenLen(parseInt(userId)) + encodeLen(CMD.MAKER_INFO) + encodeMakerInfo(info);
     await sendCloud(setter, randomCloud(), payload);
+    await sendEndMarker(setter, userId);
     return;
   }
 
@@ -279,6 +290,7 @@ async function handleRequest(s, setter, getOnlineUsers) {
     if (!isValidNum(limit) || limit <= 0) { console.warn("⚠️ 不正なlimit:", limit); return; }
     const rows = await db.getOfficialMakers(limit);
     await sendMakerRankingList(setter, userId, cmd, rows);
+    await sendEndMarker(setter, userId);
     return;
   }
 

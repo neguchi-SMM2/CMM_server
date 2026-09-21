@@ -295,6 +295,15 @@ async function saveCourse(title, author, username, stageData, ipAddress = null) 
     }
   }
 
+  // 1職人あたり最大100コースまで
+  const MAX_COURSES_PER_AUTHOR = 100;
+  const { rows: authorCountRows } = await pool.query(
+    "SELECT COUNT(*) FROM courses WHERE author=$1", [safeAuthor]
+  );
+  if (parseInt(authorCountRows[0].count, 10) >= MAX_COURSES_PER_AUTHOR) {
+    return { limitReached: true };
+  }
+
   const postedAt = minutesSince2000();
 
   const { rows: lastRows } = await pool.query(
@@ -340,7 +349,7 @@ const INFO_COLS = `id, title, author, like_count, play_count, attempt_count, cle
 
 async function getRandomCourses(limit) {
   const { rows } = await pool.query(
-    `SELECT ${INFO_COLS} FROM courses ORDER BY RANDOM() LIMIT $1`, [limit]
+    `SELECT ${INFO_COLS} FROM courses ORDER BY posted_at + (RANDOM() * 2880) DESC LIMIT $1`, [limit]
   );
   return rows;
 }
@@ -1198,6 +1207,17 @@ async function getLatestChatMessages(limit) {
   }));
 }
 
+/** 「過去にさかのぼって読み込む」用: beforeIdより古いメッセージをlimit件、古い→新しい の順で返す */
+async function getChatMessagesBefore(beforeId, limit) {
+  const { rows } = await pool.query(
+    "SELECT id, author, body, created_at FROM chat_messages WHERE id < $1 AND deleted=FALSE ORDER BY id DESC LIMIT $2",
+    [beforeId, limit]
+  );
+  return rows.reverse().map(r => ({
+    id: r.id, author: r.author, text: decompressText(r.body), created_at: parseInt(r.created_at, 10),
+  }));
+}
+
 /** 直近sinceSeconds秒以内に削除された全体チャットのメッセージID一覧 */
 async function getRecentlyDeletedChatIds(sinceSeconds = 120) {
   const cutoff = Math.floor(Date.now() / 1000) - sinceSeconds;
@@ -1240,6 +1260,21 @@ async function getLatestDMMessages(authorA, authorB, limit) {
        AND deleted=FALSE
      ORDER BY id DESC LIMIT $3`,
     [authorA, authorB, limit]
+  );
+  return rows.reverse().map(r => ({
+    id: r.id, from: r.from_author, to: r.to_author,
+    text: decompressText(r.body), created_at: parseInt(r.created_at, 10),
+  }));
+}
+
+/** 「過去にさかのぼって読み込む」用: beforeIdより古いDMをlimit件、古い→新しい の順で返す */
+async function getDMMessagesBefore(authorA, authorB, beforeId, limit) {
+  const { rows } = await pool.query(
+    `SELECT id, from_author, to_author, body, created_at FROM chat_dm
+     WHERE ((from_author=$1 AND to_author=$2) OR (from_author=$2 AND to_author=$1))
+       AND id < $3 AND deleted=FALSE
+     ORDER BY id DESC LIMIT $4`,
+    [authorA, authorB, beforeId, limit]
   );
   return rows.reverse().map(r => ({
     id: r.id, from: r.from_author, to: r.to_author,
@@ -1612,8 +1647,8 @@ module.exports = {
   listPendingMakers, approvePendingMaker, rejectPendingMaker, cleanupInactiveMakers,
   calcMakerPointAllTime, calcMakerPointWeekly,
   chatLogin, getAuthorByToken, chatLogout,
-  saveChatMessage, getChatMessages, getLatestChatMessages,
-  saveDM, getDMMessages, getLatestDMMessages, getDMPartners, markDMRead,
+  saveChatMessage, getChatMessages, getLatestChatMessages, getChatMessagesBefore,
+  saveDM, getDMMessages, getLatestDMMessages, getDMMessagesBefore, getDMPartners, markDMRead,
   getDailyCharCount, addDailyCharCount, cleanupOldDailyUsage, deleteOldChatMessages,
   getBusinessDayForRecording, getBusinessDayForDisplay,
   recordDailyActiveUser, countDailyActiveUsers, cleanupOldDailyActiveUsers,

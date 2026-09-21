@@ -535,6 +535,8 @@ async function handleUploadChunk(s, setter) {
           await sendCloud(setter, randomCloud(), encodeLenLen(parseInt(userId)) + encodeLen(102));
         } else if (result.tooSoon) {
           await sendCloud(setter, randomCloud(), encodeLenLen(parseInt(userId)) + encodeLen(101));
+        } else if (result.limitReached) {
+          await sendCloud(setter, randomCloud(), encodeLenLen(parseInt(userId)) + encodeLen(105));
         } else {
           await sendCloud(setter, randomCloud(), encodeLenLen(parseInt(userId)) + encodeLen(100) + encodeAlphabet(result.id));
         }
@@ -979,15 +981,22 @@ async function handleChatAPI(req, res) {
   // ログイン中の場合はトークンから確実に自分のメッセージかどうか(self)を判定して返す
   if (req.method === "GET" && pathname === "/api/chat/messages") {
     try {
+      const beforeId = parseInt(url.searchParams.get("before") || "0", 10);
       const afterId = parseInt(url.searchParams.get("after") || "0", 10);
       const token = getBearerToken(req);
       const currentAuthor = token ? await db.getAuthorByToken(token) : null;
-      // 初回読み込み(after未指定/0)は一番古いメッセージからではなく、最新分から表示する
-      const messages = afterId > 0
-        ? await db.getChatMessages(afterId, 100)
-        : await db.getLatestChatMessages(50);
+      let messages;
+      if (beforeId > 0) {
+        // 「過去のメッセージを読み込む」: beforeIdより古いものをさかのぼって取得
+        messages = await db.getChatMessagesBefore(beforeId, 50);
+      } else if (afterId > 0) {
+        messages = await db.getChatMessages(afterId, 100);
+      } else {
+        // 初回読み込み(after未指定/0)は一番古いメッセージからではなく、最新分から表示する
+        messages = await db.getLatestChatMessages(50);
+      }
       const enriched = messages.map(m => ({ ...m, self: currentAuthor ? m.author === currentAuthor : false }));
-      const deletedIds = await db.getRecentlyDeletedChatIds(120);
+      const deletedIds = beforeId > 0 ? [] : await db.getRecentlyDeletedChatIds(120);
       return sendJson(res, 200, { ok: true, messages: enriched, deletedIds });
     } catch (e) {
       return sendJson(res, 500, { error: e.message });
@@ -1047,14 +1056,21 @@ async function handleChatAPI(req, res) {
     try {
       const withAuthor = url.searchParams.get("with");
       if (!isValidStr(withAuthor)) return sendJson(res, 400, { error: "withは必須です" });
+      const beforeId = parseInt(url.searchParams.get("before") || "0", 10);
       const afterId = parseInt(url.searchParams.get("after") || "0", 10);
-      // 初回読み込み(after未指定/0)は一番古いメッセージからではなく、最新分から表示する
-      const messages = afterId > 0
-        ? await db.getDMMessages(author, withAuthor, afterId, 100)
-        : await db.getLatestDMMessages(author, withAuthor, 50);
+      let messages;
+      if (beforeId > 0) {
+        // 「過去のメッセージを読み込む」: beforeIdより古いものをさかのぼって取得
+        messages = await db.getDMMessagesBefore(author, withAuthor, beforeId, 50);
+      } else if (afterId > 0) {
+        messages = await db.getDMMessages(author, withAuthor, afterId, 100);
+      } else {
+        // 初回読み込み(after未指定/0)は一番古いメッセージからではなく、最新分から表示する
+        messages = await db.getLatestDMMessages(author, withAuthor, 50);
+      }
       const enriched = messages.map(m => ({ ...m, self: m.from === author }));
-      const deletedIds = await db.getRecentlyDeletedDMIds(author, withAuthor, 120);
-      await db.markDMRead(author, withAuthor);
+      const deletedIds = beforeId > 0 ? [] : await db.getRecentlyDeletedDMIds(author, withAuthor, 120);
+      if (beforeId === 0) await db.markDMRead(author, withAuthor); // 過去読み込み時は既読更新しない
       return sendJson(res, 200, { ok: true, messages: enriched, deletedIds });
     } catch (e) {
       return sendJson(res, 500, { error: e.message });

@@ -269,14 +269,6 @@ async function isOfficialMaker(name) {
   return rows.length > 0;
 }
 
-async function hasPostedAsAuthor(author, username) {
-  const { rows } = await pool.query(
-    "SELECT 1 FROM courses WHERE author=$1 AND username=$2 LIMIT 1",
-    [author, username]
-  );
-  return rows.length > 0;
-}
-
 // ─────────────────────────────────────────────
 // コース保存
 // ─────────────────────────────────────────────
@@ -286,19 +278,10 @@ async function saveCourse(title, author, username, stageData, ipAddress = null) 
   );
   if (dupRows.length) return { duplicate: true };
 
-  let safeAuthor = author;
-  const official = await isOfficialMaker(author);
-  if (official) {
-    const alreadyPostedAsThis = await hasPostedAsAuthor(author, username);
-    if (!alreadyPostedAsThis) {
-      safeAuthor = `${author}_temp`;
-    }
-  }
-
   // 1職人あたり最大100コースまで
   const MAX_COURSES_PER_AUTHOR = 100;
   const { rows: authorCountRows } = await pool.query(
-    "SELECT COUNT(*) FROM courses WHERE author=$1", [safeAuthor]
+    "SELECT COUNT(*) FROM courses WHERE author=$1", [author]
   );
   if (parseInt(authorCountRows[0].count, 10) >= MAX_COURSES_PER_AUTHOR) {
     return { limitReached: true };
@@ -308,7 +291,7 @@ async function saveCourse(title, author, username, stageData, ipAddress = null) 
 
   const { rows: lastRows } = await pool.query(
     "SELECT posted_at FROM courses WHERE author=$1 ORDER BY posted_at DESC LIMIT 1",
-    [safeAuthor]
+    [author]
   );
   if (lastRows.length && (postedAt - lastRows[0].posted_at) < 10) {
     return { tooSoon: true };
@@ -329,7 +312,7 @@ async function saveCourse(title, author, username, stageData, ipAddress = null) 
   await pool.query(
     `INSERT INTO courses (id, title, author, username, stage_data, posted_at, ip_address, red)
      VALUES ($1, $2, $3, $4, $5, $6, $7, $8)`,
-    [id, title, safeAuthor, username, stageData, postedAt, ipAddress || null, red]
+    [id, title, author, username, stageData, postedAt, ipAddress || null, red]
   );
   return { id };
 }
@@ -1639,7 +1622,7 @@ module.exports = {
   resetWeeklyLikes, deleteOldLikes, minutesSince2000, countRecentLikesForAuthor,
   upsertNotification, getAndDeleteNotification,
   banUser, isUserBanned, deleteCourse, getStats,
-  isOfficialMaker, hasPostedAsAuthor,
+  isOfficialMaker,
   getMakerRankingWeek, getMakerRankingAllTime, getMakerInfo, getOfficialMakers,
   getLatestAnnouncement,
   isAuthorConfirmed, isAuthorUsedBeforeCutoff, hasUsernameUsedAuthorBeforeCutoff,

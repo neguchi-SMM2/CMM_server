@@ -225,6 +225,13 @@ async function initDB() {
       cmd        INT     PRIMARY KEY,
       created_at BIGINT  NOT NULL DEFAULT EXTRACT(EPOCH FROM NOW())::BIGINT
     );
+
+    -- メンテナンス用の特別ユーザー名（id=1の1行しか持てない＝常に最大1つ）
+    CREATE TABLE IF NOT EXISTS bypass_username (
+      id         INT     PRIMARY KEY CHECK (id = 1),
+      username   TEXT    NOT NULL,
+      issued_at  BIGINT  NOT NULL DEFAULT EXTRACT(EPOCH FROM NOW())::BIGINT
+    );
   `);
 
   // Supabaseの自動REST API(PostgREST)経由でのアクセスを塞ぐため、
@@ -1660,6 +1667,68 @@ async function removeDisabledCmd(cmd) {
   return rowCount > 0;
 }
 
+// ─────────────────────────────────────────────
+// メンテナンス用 特別ユーザー名
+// 使用不可CMDがあっても、このユーザー名からのリクエストは全CMD使用可能にする。
+// 10文字の英小文字+数字（クライアントのalphabetエンコードが小文字のみ対応のため）。
+// 常に最大1つ。再発行すると前のものは上書きされて無効になる。
+// ─────────────────────────────────────────────
+const BYPASS_USERNAME_LENGTH = 10;
+const BYPASS_USERNAME_CHARS  = "abcdefghijklmnopqrstuvwxyz0123456789";
+const BYPASS_CACHE_MS = 5000;
+let bypassCache = { info: null, loadedAt: 0 };
+
+function generateBypassUsername() {
+  let s = "";
+  for (let i = 0; i < BYPASS_USERNAME_LENGTH; i++) {
+    s += BYPASS_USERNAME_CHARS[crypto.randomInt(BYPASS_USERNAME_CHARS.length)];
+  }
+  return s;
+}
+
+/** 現在の特別ユーザー名情報 { username, issued_at } を返す（なければ null）。5秒キャッシュ。 */
+async function getBypassInfo() {
+  const now = Date.now();
+  if (now - bypassCache.loadedAt < BYPASS_CACHE_MS) return bypassCache.info;
+  try {
+    const { rows } = await pool.query("SELECT username, issued_at FROM bypass_username WHERE id=1");
+    bypassCache = {
+      info: rows[0] ? { username: rows[0].username, issued_at: parseInt(rows[0].issued_at, 10) } : null,
+      loadedAt: now,
+    };
+  } catch (e) {
+    // DB障害時は直前のキャッシュで動かし続ける
+    console.error("特別ユーザー名取得失敗:", e.message);
+  }
+  return bypassCache.info;
+}
+
+async function getBypassUsername() {
+  const info = await getBypassInfo();
+  return info ? info.username : null;
+}
+
+/** 特別ユーザー名を発行（再発行）する。前のユーザー名は上書きされて使えなくなる。 */
+async function issueBypassUsername() {
+  const username = generateBypassUsername();
+  const { rows } = await pool.query(
+    `INSERT INTO bypass_username (id, username, issued_at)
+     VALUES (1, $1, EXTRACT(EPOCH FROM NOW())::BIGINT)
+     ON CONFLICT (id) DO UPDATE SET username = EXCLUDED.username, issued_at = EXCLUDED.issued_at
+     RETURNING username, issued_at`,
+    [username]
+  );
+  bypassCache = { info: null, loadedAt: 0 }; // 即時反映
+  return { username: rows[0].username, issued_at: parseInt(rows[0].issued_at, 10) };
+}
+
+/** 特別ユーザー名を削除する（メンテナンス終了時など） */
+async function clearBypassUsername() {
+  const { rowCount } = await pool.query("DELETE FROM bypass_username WHERE id=1");
+  bypassCache = { info: null, loadedAt: 0 };
+  return rowCount > 0;
+}
+
 module.exports = {
   initDB, pool,
   saveCourse, getCourseById,
@@ -1689,4 +1758,5 @@ module.exports = {
   blockAuthor, unblockAuthor, getBlockedAuthors, isAuthorBlocked,
   listBannedWords, addBannedWord, removeBannedWord,
   isCmdDisabled, listDisabledCmds, addDisabledCmd, removeDisabledCmd,
+  getBypassInfo, getBypassUsername, issueBypassUsername, clearBypassUsername,
 };

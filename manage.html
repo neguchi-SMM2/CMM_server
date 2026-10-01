@@ -219,6 +219,24 @@
       </div>
     </div>
 
+    <!-- 特別ユーザー名（メンテナンス用） -->
+    <div class="card wide">
+      <h2>🔑 特別ユーザー名（メンテナンス用）</h2>
+      <p style="font-size:0.85rem;color:#94a3b8;margin-bottom:0.75rem;">
+        使用不可CMDがあっても、このユーザー名からのリクエストだけは全CMDを使用できます（約5秒以内に反映）。
+        10文字の英小文字・数字で、常に1つだけ存在します。再発行すると前のユーザー名は無効になります。
+        他人に知られないよう管理してください。
+      </p>
+      <div style="font-size:1.4rem;font-family:monospace;letter-spacing:0.15em;color:#f8fafc;margin:0.5rem 0;" id="bypass-username">（未読み込み）</div>
+      <div style="font-size:0.8rem;color:#64748b;" id="bypass-issued"></div>
+      <div style="display:flex;gap:0.5rem;">
+        <button class="btn-neutral" onclick="loadBypassUsername()">現在の値を読み込む</button>
+        <button class="btn-warn" onclick="issueBypassUsername()">発行 / 再発行</button>
+        <button class="btn-danger" onclick="deleteBypassUsername()">削除</button>
+      </div>
+      <div id="bypass-msg" class="msg"></div>
+    </div>
+
   </div>
 
   <script>
@@ -576,6 +594,45 @@
         loadDisabledCmds();
       } else {
         showMsg("disabled-cmd-msg", "処理に失敗しました", false);
+      }
+    }
+
+    // ── 特別ユーザー名（メンテナンス用） ──
+    function renderBypassUsername(username, issuedAt) {
+      document.getElementById("bypass-username").textContent = username || "（発行されていません）";
+      document.getElementById("bypass-issued").textContent =
+        username && issuedAt ? "発行日時: " + formatCreatedAt(issuedAt) : "";
+    }
+
+    async function loadBypassUsername() {
+      const data = await apiGet("/api/bypass-username", "bypass-msg");
+      if (!data) return;
+      if (!data.ok) { showMsg("bypass-msg", data.error || "取得に失敗しました", false); return; }
+      renderBypassUsername(data.username, data.issued_at);
+      document.getElementById("bypass-msg").className = "msg";
+    }
+
+    async function issueBypassUsername() {
+      if (!confirm("特別ユーザー名を発行（再発行）します。以前のユーザー名は使えなくなります。よろしいですか？")) return;
+      const data = await apiFetch("/api/bypass-username", { _msgId: "bypass-msg" });
+      if (!data) return;
+      if (data.ok) {
+        renderBypassUsername(data.username, data.issued_at);
+        showMsg("bypass-msg", "発行しました", true);
+      } else {
+        showMsg("bypass-msg", data.error || "エラーが発生しました", false);
+      }
+    }
+
+    async function deleteBypassUsername() {
+      if (!confirm("特別ユーザー名を削除します。よろしいですか？")) return;
+      const data = await apiFetch("/api/bypass-username-delete", { _msgId: "bypass-msg" });
+      if (!data) return;
+      if (data.ok) {
+        renderBypassUsername(null, null);
+        showMsg("bypass-msg", "削除しました", true);
+      } else {
+        showMsg("bypass-msg", "削除対象がありませんでした", false);
       }
     }
   </script>

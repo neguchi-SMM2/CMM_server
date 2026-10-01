@@ -603,6 +603,19 @@ async function replyCmdDisabled(s, pos, cmd, userId, setter) {
   await sendCloud(setter, randomCloud(), encodeLenLen(parseInt(userId)) + encodeLen(CMD.DISABLED));
 }
 
+// リクエスト内のusernameが、管理者が発行した特別ユーザー名かどうか
+// （usernameはcmdの直後に必ず入っている。デコードに失敗したら特別ユーザーではない）
+async function isBypassUser(s, pos) {
+  try {
+    const { value: username } = decodeAlphabet(s, pos);
+    if (!isValidStr(username)) return false;
+    const bypass = await db.getBypassUsername();
+    return !!bypass && username === bypass;
+  } catch (_) {
+    return false;
+  }
+}
+
 async function onMessage(name, value, setter, getOnlineUsers) {
   const s = String(value);
   if (!s || s.length < 3) return;
@@ -613,7 +626,8 @@ async function onMessage(name, value, setter, getOnlineUsers) {
     if (!isUpload && !REQUEST_VARS.includes(name)) return;
     if (!userId || isNaN(parseInt(userId))) return;
 
-    if (await db.isCmdDisabled(cmd)) {
+    // 使用不可CMDでも、特別ユーザー名(メンテナンス用)からのリクエストは通す
+    if (await db.isCmdDisabled(cmd) && !(await isBypassUser(s, p1))) {
       await replyCmdDisabled(s, p1, cmd, userId, setter);
       return;
     }
@@ -975,6 +989,45 @@ async function handleManageAPI(req, res) {
         res.end(JSON.stringify({ error: e.message }));
       }
     });
+    return;
+  }
+
+  // GET /api/bypass-username (現在の特別ユーザー名)
+  if (req.method === "GET" && pathname === "/api/bypass-username") {
+    try {
+      const info = await db.getBypassInfo();
+      res.writeHead(200, { "Content-Type": "application/json" });
+      res.end(JSON.stringify({ ok: true, username: info ? info.username : null, issued_at: info ? info.issued_at : null }));
+    } catch (e) {
+      res.writeHead(500, { "Content-Type": "application/json" });
+      res.end(JSON.stringify({ error: e.message }));
+    }
+    return;
+  }
+
+  // POST /api/bypass-username (発行・再発行。前の特別ユーザー名は無効になる)
+  if (req.method === "POST" && pathname === "/api/bypass-username") {
+    try {
+      const info = await db.issueBypassUsername();
+      res.writeHead(200, { "Content-Type": "application/json" });
+      res.end(JSON.stringify({ ok: true, username: info.username, issued_at: info.issued_at }));
+    } catch (e) {
+      res.writeHead(500, { "Content-Type": "application/json" });
+      res.end(JSON.stringify({ error: e.message }));
+    }
+    return;
+  }
+
+  // POST /api/bypass-username-delete (特別ユーザー名を削除。メンテナンス終了時用)
+  if (req.method === "POST" && pathname === "/api/bypass-username-delete") {
+    try {
+      const ok = await db.clearBypassUsername();
+      res.writeHead(200, { "Content-Type": "application/json" });
+      res.end(JSON.stringify({ ok }));
+    } catch (e) {
+      res.writeHead(500, { "Content-Type": "application/json" });
+      res.end(JSON.stringify({ error: e.message }));
+    }
     return;
   }
 

@@ -219,6 +219,12 @@ async function initDB() {
     ALTER TABLE like_fraud_incidents ADD COLUMN IF NOT EXISTS prior_incident_count INT NOT NULL DEFAULT 0;
     ALTER TABLE like_fraud_incidents ADD COLUMN IF NOT EXISTS ban_days INT;
     CREATE INDEX IF NOT EXISTS idx_fraud_detected ON like_fraud_incidents(detected_at DESC);
+
+    -- 管理ページで設定する「使用不可CMD」
+    CREATE TABLE IF NOT EXISTS disabled_cmds (
+      cmd        INT     PRIMARY KEY,
+      created_at BIGINT  NOT NULL DEFAULT EXTRACT(EPOCH FROM NOW())::BIGINT
+    );
   `);
 
   // Supabaseの自動REST API(PostgREST)経由でのアクセスを塞ぐため、
@@ -1277,7 +1283,6 @@ async function getRecentlyDeletedDMIds(authorA, authorB, sinceSeconds = 120) {
   return rows.map(r => r.id);
 }
 
-/** DM相手一覧（最新メッセージ時刻順） */
 /** DM相手一覧（最新メッセージ時刻順・未読件数つき） */
 async function getDMPartners(author) {
   const { rows } = await pool.query(
@@ -1613,6 +1618,48 @@ async function removeBannedWord(word) {
   return rowCount > 0;
 }
 
+// ─────────────────────────────────────────────
+// 使用不可CMD（管理ページで設定）
+// リクエストごとにDBを叩かないよう、短時間キャッシュする
+// ─────────────────────────────────────────────
+const DISABLED_CMD_CACHE_MS = 5000;
+let disabledCmdCache = { set: new Set(), loadedAt: 0 };
+
+async function getDisabledCmdSet() {
+  const now = Date.now();
+  if (now - disabledCmdCache.loadedAt < DISABLED_CMD_CACHE_MS) return disabledCmdCache.set;
+  try {
+    const { rows } = await pool.query("SELECT cmd FROM disabled_cmds");
+    disabledCmdCache = { set: new Set(rows.map(r => r.cmd)), loadedAt: now };
+  } catch (e) {
+    // DB障害時は直前のキャッシュで動かし続ける（全CMDが止まるのを防ぐ）
+    console.error("使用不可CMD取得失敗:", e.message);
+  }
+  return disabledCmdCache.set;
+}
+
+async function isCmdDisabled(cmd) {
+  return (await getDisabledCmdSet()).has(cmd);
+}
+
+async function listDisabledCmds() {
+  const { rows } = await pool.query("SELECT cmd FROM disabled_cmds ORDER BY cmd ASC");
+  return rows.map(r => r.cmd);
+}
+
+async function addDisabledCmd(cmd) {
+  await pool.query(
+    "INSERT INTO disabled_cmds (cmd) VALUES ($1) ON CONFLICT (cmd) DO NOTHING", [cmd]
+  );
+  disabledCmdCache.loadedAt = 0; // 即時反映
+}
+
+async function removeDisabledCmd(cmd) {
+  const { rowCount } = await pool.query("DELETE FROM disabled_cmds WHERE cmd=$1", [cmd]);
+  disabledCmdCache.loadedAt = 0;
+  return rowCount > 0;
+}
+
 module.exports = {
   initDB, pool,
   saveCourse, getCourseById,
@@ -1641,4 +1688,5 @@ module.exports = {
   deleteChatMessage, deleteDMMessage,
   blockAuthor, unblockAuthor, getBlockedAuthors, isAuthorBlocked,
   listBannedWords, addBannedWord, removeBannedWord,
+  isCmdDisabled, listDisabledCmds, addDisabledCmd, removeDisabledCmd,
 };

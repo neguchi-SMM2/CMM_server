@@ -60,11 +60,36 @@ const CMD = {
   GET_ANNOUNCEMENT:91,
   BAN_USERNAME:  600,
   END_MARKER:   1000,
+  DISABLED:     1001,   // 使用不可CMDを受信したときの返信
 };
+
+// 管理ページで使用不可に設定できるCMD（返信専用コードは除外）
+const KNOWN_CMDS = Object.fromEntries(
+  Object.entries(CMD).filter(([k]) => k !== "END_MARKER" && k !== "DISABLED")
+);
 
 const SEND_INTERVAL = 120;
 function sleep(ms) { return new Promise(r => setTimeout(r, ms)); }
 function randomCloud() { return CLOUD_VARS[Math.floor(Math.random() * CLOUD_VARS.length)]; }
+
+// ── CMD=54 成功の記録（CMD=2の認可用）──
+const LOGIN_VALID_MS = 5 * 60 * 1000;          // ログイン有効時間（5分）
+const DELETE_REQUIRE_AUTHOR_MATCH = true;      // trueなら「ログインした職人名＝コースの作者」も要求
+const loginVerified = new Map();               // username -> { author, at }
+
+function recordLoginSuccess(username, author) {
+  loginVerified.set(username, { author, at: Date.now() });
+}
+function getValidLogin(username) {
+  const e = loginVerified.get(username);
+  if (!e) return null;
+  if (Date.now() - e.at > LOGIN_VALID_MS) { loginVerified.delete(username); return null; }
+  return e;
+}
+setInterval(() => {
+  const now = Date.now();
+  for (const [u, e] of loginVerified) if (now - e.at > LOGIN_VALID_MS) loginVerified.delete(u);
+}, 60 * 1000).unref();
 
 function parseUserId(s, pos = 0) {
   const { value, next } = decodeLenLen(s, pos);
@@ -202,14 +227,25 @@ async function handleRequest(s, setter, getOnlineUsers) {
     console.warn("⚠️ 不正なusername:", username); return;
   }
 
-  // CMD=2: コース削除（クライアントを信頼し、権限チェックは行わない）
+  // CMD=2: コース削除（CMD=54でログイン成功してから5分以内のみ有効）
   if (cmd === CMD.DELETE_COURSE) {
     const { value: courseId } = decodeAlphabet(s, pos);
     let success = false;
-    if (isValidStr(courseId)) {
+    const login = getValidLogin(username);
+    if (!login) {
+      console.warn(`⚠️ 削除拒否(CMD=54未認証/期限切れ): ${username}`);
+    } else if (isValidStr(courseId)) {
       try {
-        const deleted = await db.deleteCourse(courseId);
-        success = !!deleted;
+        if (DELETE_REQUIRE_AUTHOR_MATCH) {
+          const course = await db.getCourseById(courseId);
+          if (course && course.author === login.author) {
+            success = !!(await db.deleteCourse(courseId));
+          } else {
+            console.warn(`⚠️ 削除拒否(作者不一致): ${username} -> ${courseId}`);
+          }
+        } else {
+          success = !!(await db.deleteCourse(courseId));
+        }
       } catch (e) {
         console.error("コース削除失敗:", e.message);
         success = false;
@@ -378,6 +414,7 @@ async function handleRequest(s, setter, getOnlineUsers) {
     const { value: password } = decodeAlphabet(s, q1);
     if (!isValidStr(targetAuthor) || !isValidStr(password)) { console.warn("⚠️ 不正なログイン要求"); return; }
     const ok = await db.verifyMakerPassword(targetAuthor, password);
+    if (ok) recordLoginSuccess(username, targetAuthor); // CMD=2の認可用に記録（5分間有効）
     await sendCloud(setter, randomCloud(), encodeLenLen(parseInt(userId)) + encodeLen(CMD.REGISTER_LOGIN) + encodeLen(ok ? 1 : 0));
     return;
   }
@@ -552,17 +589,37 @@ async function handleUploadChunk(s, setter) {
   }
 }
 
+// 使用不可CMDを受信したときにCMD=1001を返す
+async function replyCmdDisabled(s, pos, cmd, userId, setter) {
+  if (cmd === CMD.UPLOAD) {
+    // 投稿は分割送信なので、最終パケット(seq=0)のときだけ1回返す
+    try {
+      const { next: a } = decodeAlphabet(s, pos);   // username
+      const { next: b } = decodeLen(s, a);          // totalChunks
+      const { value: seq } = decodeLen(s, b);       // seq
+      if (seq !== 0) return;
+    } catch (_) { return; }
+  }
+  await sendCloud(setter, randomCloud(), encodeLenLen(parseInt(userId)) + encodeLen(CMD.DISABLED));
+}
+
 async function onMessage(name, value, setter, getOnlineUsers) {
   const s = String(value);
   if (!s || s.length < 3) return;
   try {
-    const { next: p1 } = parseUserId(s, 0);
-    const { cmd }      = parseCmd(s, p1);
-    if (cmd === CMD.UPLOAD) {
-      await handleUploadChunk(s, setter);
-    } else if (REQUEST_VARS.includes(name)) {
-      await handleRequest(s, setter, getOnlineUsers);
+    const { userId, next: p0 } = parseUserId(s, 0);
+    const { cmd, next: p1 }    = parseCmd(s, p0);
+    const isUpload = cmd === CMD.UPLOAD;
+    if (!isUpload && !REQUEST_VARS.includes(name)) return;
+    if (!userId || isNaN(parseInt(userId))) return;
+
+    if (await db.isCmdDisabled(cmd)) {
+      await replyCmdDisabled(s, p1, cmd, userId, setter);
+      return;
     }
+
+    if (isUpload) await handleUploadChunk(s, setter);
+    else          await handleRequest(s, setter, getOnlineUsers);
   } catch (e) {
     console.error(`❌ メッセージ処理エラー (${name}):`, e.message);
   }
@@ -852,6 +909,65 @@ async function handleManageAPI(req, res) {
           return;
         }
         const ok = await db.unbanChatAuthor(author);
+        res.writeHead(200, { "Content-Type": "application/json" });
+        res.end(JSON.stringify({ ok }));
+      } catch (e) {
+        res.writeHead(500, { "Content-Type": "application/json" });
+        res.end(JSON.stringify({ error: e.message }));
+      }
+    });
+    return;
+  }
+
+  // GET /api/disabled-cmds (使用不可CMD一覧)
+  if (req.method === "GET" && pathname === "/api/disabled-cmds") {
+    try {
+      const cmds = await db.listDisabledCmds();
+      res.writeHead(200, { "Content-Type": "application/json" });
+      res.end(JSON.stringify({ ok: true, cmds, known: KNOWN_CMDS }));
+    } catch (e) {
+      res.writeHead(500, { "Content-Type": "application/json" });
+      res.end(JSON.stringify({ error: e.message }));
+    }
+    return;
+  }
+
+  // POST /api/disabled-cmds (使用不可CMDを追加)
+  if (req.method === "POST" && pathname === "/api/disabled-cmds") {
+    let body = "";
+    req.on("data", d => body += d);
+    req.on("end", async () => {
+      try {
+        const { cmd } = JSON.parse(body);
+        if (!Number.isInteger(cmd) || !Object.values(KNOWN_CMDS).includes(cmd)) {
+          res.writeHead(400, { "Content-Type": "application/json" });
+          res.end(JSON.stringify({ error: "不正なCMDです" }));
+          return;
+        }
+        await db.addDisabledCmd(cmd);
+        res.writeHead(200, { "Content-Type": "application/json" });
+        res.end(JSON.stringify({ ok: true }));
+      } catch (e) {
+        res.writeHead(500, { "Content-Type": "application/json" });
+        res.end(JSON.stringify({ error: e.message }));
+      }
+    });
+    return;
+  }
+
+  // POST /api/disabled-cmds-delete (使用不可CMDを解除)
+  if (req.method === "POST" && pathname === "/api/disabled-cmds-delete") {
+    let body = "";
+    req.on("data", d => body += d);
+    req.on("end", async () => {
+      try {
+        const { cmd } = JSON.parse(body);
+        if (!Number.isInteger(cmd)) {
+          res.writeHead(400, { "Content-Type": "application/json" });
+          res.end(JSON.stringify({ error: "cmd は必須です" }));
+          return;
+        }
+        const ok = await db.removeDisabledCmd(cmd);
         res.writeHead(200, { "Content-Type": "application/json" });
         res.end(JSON.stringify({ ok }));
       } catch (e) {

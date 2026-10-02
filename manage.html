@@ -237,6 +237,35 @@
       <div id="bypass-msg" class="msg"></div>
     </div>
 
+    <!-- 使い捨てユーザーからのいいねが多いコース -->
+    <div class="card wide">
+      <h2>🕵️ 使い捨てユーザーのいいねが多いコース</h2>
+      <p style="font-size:0.85rem;color:#94a3b8;margin-bottom:0.75rem;">
+        「使い捨てユーザー」は、likesテーブル内でそのコースへの1件以外にいいね履歴がないユーザー名です
+        （不正いいね自動検知と同じ定義）。likesは約7日分しか保持されないため、集計対象は直近約7日分です。
+        使い捨て数の多い順に表示します。
+      </p>
+      <div style="display:flex;gap:0.5rem;align-items:center;">
+        <select id="disposable-limit" style="width:auto;">
+          <option value="20">上位20件</option>
+          <option value="50" selected>上位50件</option>
+          <option value="100">上位100件</option>
+          <option value="200">上位200件</option>
+        </select>
+        <button class="btn-neutral" style="margin-top:0;" onclick="loadDisposableCourses()">一覧を読み込む</button>
+      </div>
+      <div id="disposable-msg" class="msg"></div>
+      <div id="disposable-empty" class="empty" style="display:none;">該当するコースはありません</div>
+      <div class="table-wrap">
+        <table id="disposable-table" style="display:none;">
+          <thead>
+            <tr><th>コースID</th><th>タイトル</th><th>職人</th><th>使い捨て数</th><th>いいね数(直近)</th><th>使い捨て比率</th><th>表示いいね数</th></tr>
+          </thead>
+          <tbody id="disposable-tbody"></tbody>
+        </table>
+      </div>
+    </div>
+
   </div>
 
   <script>
@@ -633,6 +662,43 @@
         showMsg("bypass-msg", "削除しました", true);
       } else {
         showMsg("bypass-msg", "削除対象がありませんでした", false);
+      }
+    }
+
+    // ── 使い捨てユーザーのいいねが多いコース ──
+    async function loadDisposableCourses() {
+      const limit = document.getElementById("disposable-limit").value;
+      const data = await apiGet("/api/disposable-like-courses?limit=" + encodeURIComponent(limit), "disposable-msg");
+      if (!data) return;
+      if (!data.ok) { showMsg("disposable-msg", data.error || "取得に失敗しました", false); return; }
+
+      const tbody = document.getElementById("disposable-tbody");
+      const table = document.getElementById("disposable-table");
+      const empty = document.getElementById("disposable-empty");
+      tbody.innerHTML = "";
+      document.getElementById("disposable-msg").className = "msg";
+
+      if (!data.courses.length) {
+        table.style.display = "none";
+        empty.style.display = "block";
+        return;
+      }
+
+      table.style.display = "table";
+      empty.style.display = "none";
+
+      for (const c of data.courses) {
+        const tr = document.createElement("tr");
+        tr.innerHTML = `
+          <td>${escapeHtml(c.course_id)}</td>
+          <td>${escapeHtml(c.title)}</td>
+          <td>${escapeHtml(c.author)}</td>
+          <td><strong>${c.disposable_count}</strong></td>
+          <td>${c.likes_in_table}</td>
+          <td>${Math.round(c.disposable_ratio * 100)}%</td>
+          <td>${c.like_count}</td>
+        `;
+        tbody.appendChild(tr);
       }
     }
   </script>

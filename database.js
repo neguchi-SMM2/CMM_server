@@ -1729,6 +1729,47 @@ async function clearBypassUsername() {
   return rowCount > 0;
 }
 
+// ─────────────────────────────────────────────
+// 使い捨てユーザーが多いコースの一覧（管理ページ表示用）
+// 「使い捨てユーザー」= likesテーブル内で、いいね履歴がそのコースへの1件だけのusername
+// （不正いいね検知のcalcDisposableUsernameRatioと同じ定義）。
+// ※likesテーブルは7日より古いものが削除されるため、集計対象は直近約7日分。
+// ─────────────────────────────────────────────
+async function listCoursesByDisposableLikers(limit = 50) {
+  const { rows } = await pool.query(
+    `WITH user_counts AS (
+       SELECT username, COUNT(*) AS cnt FROM likes GROUP BY username
+     )
+     SELECT l.course_id,
+            c.title,
+            c.author,
+            c.like_count,
+            COUNT(*)                                  AS likes_in_table,
+            COUNT(*) FILTER (WHERE uc.cnt = 1)        AS disposable_count
+     FROM likes l
+     JOIN user_counts uc ON uc.username = l.username
+     JOIN courses c      ON c.id = l.course_id
+     GROUP BY l.course_id, c.title, c.author, c.like_count
+     HAVING COUNT(*) FILTER (WHERE uc.cnt = 1) > 0
+     ORDER BY disposable_count DESC, likes_in_table DESC
+     LIMIT $1`,
+    [limit]
+  );
+  return rows.map(r => {
+    const likesInTable = parseInt(r.likes_in_table, 10);
+    const disposable   = parseInt(r.disposable_count, 10);
+    return {
+      course_id: r.course_id,
+      title: r.title,
+      author: r.author,
+      like_count: r.like_count,
+      likes_in_table: likesInTable,
+      disposable_count: disposable,
+      disposable_ratio: likesInTable > 0 ? disposable / likesInTable : 0,
+    };
+  });
+}
+
 module.exports = {
   initDB, pool,
   saveCourse, getCourseById,
@@ -1759,4 +1800,5 @@ module.exports = {
   listBannedWords, addBannedWord, removeBannedWord,
   isCmdDisabled, listDisabledCmds, addDisabledCmd, removeDisabledCmd,
   getBypassInfo, getBypassUsername, issueBypassUsername, clearBypassUsername,
+  listCoursesByDisposableLikers,
 };

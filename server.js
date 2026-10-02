@@ -1031,6 +1031,22 @@ async function handleManageAPI(req, res) {
     return;
   }
 
+  // GET /api/disposable-like-courses?limit=50 (使い捨てユーザーからのいいねが多いコース一覧)
+  if (req.method === "GET" && pathname === "/api/disposable-like-courses") {
+    try {
+      let limit = parseInt(url.searchParams.get("limit") || "50", 10);
+      if (!Number.isInteger(limit) || limit <= 0) limit = 50;
+      limit = Math.min(limit, 200);
+      const courses = await db.listCoursesByDisposableLikers(limit);
+      res.writeHead(200, { "Content-Type": "application/json" });
+      res.end(JSON.stringify({ ok: true, courses }));
+    } catch (e) {
+      res.writeHead(500, { "Content-Type": "application/json" });
+      res.end(JSON.stringify({ error: e.message }));
+    }
+    return;
+  }
+
   res.writeHead(404, { "Content-Type": "application/json" });
   res.end(JSON.stringify({ error: "not found" }));
 }

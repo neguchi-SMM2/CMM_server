@@ -226,6 +226,13 @@ async function initDB() {
       created_at BIGINT  NOT NULL DEFAULT EXTRACT(EPOCH FROM NOW())::BIGINT
     );
 
+    -- 運営おすすめコース（CMD=3で返す）。コースが削除されたら自動で外れる
+    CREATE TABLE IF NOT EXISTS recommended_courses (
+      course_id  TEXT    PRIMARY KEY REFERENCES courses(id) ON DELETE CASCADE,
+      added_at   BIGINT  NOT NULL DEFAULT EXTRACT(EPOCH FROM NOW())::BIGINT
+    );
+    CREATE INDEX IF NOT EXISTS idx_recommended_added ON recommended_courses(added_at DESC);
+
     -- メンテナンス用の特別ユーザー名（id=1の1行しか持てない＝常に最大1つ）
     CREATE TABLE IF NOT EXISTS bypass_username (
       id         INT     PRIMARY KEY CHECK (id = 1),
@@ -391,6 +398,20 @@ async function searchByAuthor(author, limit) {
 async function getNewArrivalCourses(limit) {
   const { rows } = await pool.query(
     `SELECT ${INFO_COLS} FROM courses ORDER BY posted_at DESC LIMIT $1`, [limit]
+  );
+  return rows;
+}
+
+// CMD=3: 運営おすすめコース（おすすめに追加した日時が新しい順）
+async function getRecommendedCourses(limit) {
+  const { rows } = await pool.query(
+    `SELECT c.id, c.title, c.author, c.like_count, c.play_count,
+            c.attempt_count, c.clear_count, c.posted_at, c.red
+     FROM recommended_courses r
+     JOIN courses c ON c.id = r.course_id
+     ORDER BY r.added_at DESC
+     LIMIT $1`,
+    [limit]
   );
   return rows;
 }
@@ -1801,4 +1822,5 @@ module.exports = {
   isCmdDisabled, listDisabledCmds, addDisabledCmd, removeDisabledCmd,
   getBypassInfo, getBypassUsername, issueBypassUsername, clearBypassUsername,
   listCoursesByDisposableLikers,
+  getRecommendedCourses,
 };

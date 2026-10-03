@@ -35,6 +35,7 @@ const CLOUD_VARS   = [
 const CMD = {
   UPLOAD:          1,
   DELETE_COURSE:   2,
+  RECOMMENDED:     3,   // 運営おすすめコースの取得（リクエスト形式はCMD=10と同じ）
   RANDOM:         10,
   WEEKLY:         11,
   ALL_TIME:       12,
@@ -255,13 +256,14 @@ async function handleRequest(s, setter, getOnlineUsers) {
     return;
   }
 
-  if (cmd === CMD.RANDOM || cmd === CMD.WEEKLY || cmd === CMD.ALL_TIME || cmd === CMD.NEW_ARRIVAL) {
+  if (cmd === CMD.RANDOM || cmd === CMD.WEEKLY || cmd === CMD.ALL_TIME || cmd === CMD.NEW_ARRIVAL || cmd === CMD.RECOMMENDED) {
     const { value: limit, next: p3 } = decodeLen(s, pos); pos = p3;
     if (!isValidNum(limit) || limit <= 0) { console.warn("⚠️ 不正なlimit:", limit); return; }
     let rows;
     if      (cmd === CMD.RANDOM)      rows = await db.getRandomCourses(limit);
     else if (cmd === CMD.WEEKLY)      rows = await db.getWeeklyRanking(limit);
     else if (cmd === CMD.NEW_ARRIVAL) rows = await db.getNewArrivalCourses(limit);
+    else if (cmd === CMD.RECOMMENDED) rows = await db.getRecommendedCourses(limit);
     else                               rows = await db.getAllTimeRanking(limit);
     await sendCourseList(setter, userId, cmd, rows);
     await sendEndMarker(setter, userId);

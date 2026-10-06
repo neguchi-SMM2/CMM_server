@@ -409,7 +409,7 @@ async function getRecommendedCourses(limit) {
             c.attempt_count, c.clear_count, c.posted_at, c.red
      FROM recommended_courses r
      JOIN courses c ON c.id = r.course_id
-     ORDER BY r.added_at ASC
+     ORDER BY r.added_at DESC
      LIMIT $1`,
     [limit]
   );
@@ -1831,24 +1831,41 @@ async function listAuthorLikerSummary(limit = 50) {
   };
 }
 
-/** 指定した職人のコースにいいねしているユーザー名の一覧（いいねしたコース数の多い順） */
+/**
+ * 指定した職人のコースにいいねしているユーザー名の一覧（いいねしたコース数の多い順）。
+ * 各ユーザー名について以下も返す:
+ *  - is_disposable: 使い捨てユーザー名か（likesテーブル全体でいいね履歴が1件だけ）
+ *  - posted_authors: そのユーザー名でコースを投稿している場合に使っている職人名（なければ空配列）
+ *    ※現在DBに残っているコースのみが対象（削除済みコースの履歴は残らない）
+ */
 async function listLikersForAuthor(author, limit = 500) {
   const { rows } = await pool.query(
-    `SELECT l.username,
-            COUNT(DISTINCT l.course_id) AS course_count,
-            MAX(l.created_at)           AS last_liked_at
-     FROM likes l
-     JOIN courses c ON c.id = l.course_id
-     WHERE c.author = $1
-     GROUP BY l.username
-     ORDER BY course_count DESC, last_liked_at DESC
-     LIMIT $2`,
+    `WITH likers AS (
+       SELECT l.username,
+              COUNT(DISTINCT l.course_id) AS course_count,
+              MAX(l.created_at)           AS last_liked_at
+       FROM likes l
+       JOIN courses c ON c.id = l.course_id
+       WHERE c.author = $1
+       GROUP BY l.username
+       ORDER BY course_count DESC, last_liked_at DESC
+       LIMIT $2
+     )
+     SELECT k.username, k.course_count, k.last_liked_at,
+            (SELECT COUNT(*) FROM likes x WHERE x.username = k.username) AS total_likes,
+            (SELECT COALESCE(array_agg(DISTINCT c2.author ORDER BY c2.author), '{}')
+               FROM courses c2 WHERE c2.username = k.username)            AS posted_authors
+     FROM likers k
+     ORDER BY k.course_count DESC, k.last_liked_at DESC`,
     [author, limit]
   );
   return rows.map(r => ({
     username: r.username,
     course_count: parseInt(r.course_count, 10),
     last_liked_at: parseInt(r.last_liked_at, 10),
+    total_likes: parseInt(r.total_likes, 10),
+    is_disposable: parseInt(r.total_likes, 10) === 1,
+    posted_authors: r.posted_authors || [],
   }));
 }
 

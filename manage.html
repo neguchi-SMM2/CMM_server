@@ -303,7 +303,7 @@
         <div class="table-wrap">
           <table>
             <thead>
-              <tr><th>ユーザー名</th><th>いいねしたコース数</th><th>最後にいいねした日時</th></tr>
+              <tr><th>ユーザー名</th><th>ラベル</th><th>いいねしたコース数</th><th>最後にいいねした日時</th><th>このユーザー名で投稿している職人名</th></tr>
             </thead>
             <tbody id="liker-detail-tbody"></tbody>
           </table>
@@ -807,15 +807,23 @@
       detail.style.display = "block";
 
       if (!data.likers.length) {
-        tbody.innerHTML = `<tr><td colspan="3" style="color:#64748b;">該当するユーザーはいません</td></tr>`;
+        tbody.innerHTML = `<tr><td colspan="5" style="color:#64748b;">該当するユーザーはいません</td></tr>`;
         return;
       }
       for (const l of data.likers) {
         const tr = document.createElement("tr");
+        const label = l.is_disposable
+          ? `<span style="background:#7f1d1d;color:#fca5a5;padding:0.15rem 0.5rem;border-radius:999px;font-size:0.75rem;white-space:nowrap;">使い捨て</span>`
+          : "";
+        const authorsCell = l.posted_authors && l.posted_authors.length
+          ? l.posted_authors.map(a => escapeHtml(a)).join(", ")
+          : `<span style="color:#64748b;">-</span>`;
         tr.innerHTML = `
           <td>${escapeHtml(l.username)}</td>
+          <td>${label}</td>
           <td>${l.course_count}</td>
           <td>${formatCreatedAt(l.last_liked_at)}</td>
+          <td>${authorsCell}</td>
         `;
         tbody.appendChild(tr);
       }

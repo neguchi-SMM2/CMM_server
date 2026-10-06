@@ -300,6 +300,11 @@
       </div>
       <div id="liker-detail" style="display:none;margin-top:1.5rem;">
         <h2 id="liker-detail-title" style="margin-bottom:0.25rem;"></h2>
+        <p style="font-size:0.85rem;color:#94a3b8;margin:0.5rem 0;">
+          「削除対象」は、①この職人名で投稿したことがあるユーザー名、②どの職人名でも投稿履歴がないユーザー名、のいずれかです。
+          ボタンを押すと、この職人のコースについた該当ユーザー名のいいねを削除し、いいね数も同じ件数だけ減らします（実行前に件数を確認できます）。
+        </p>
+        <button class="btn-danger" style="margin-top:0.5rem;width:auto;padding:0.6rem 1.2rem;" onclick="purgeAuthorLikes()">この職人の不正分いいねを削除</button>
         <div class="table-wrap">
           <table>
             <thead>
@@ -748,6 +753,42 @@
     }
 
     // ── 職人別 いいねしているユーザー名 ──
+    let currentLikerAuthor = null; // 詳細表示中の職人名
+
+    // 不正分いいねの削除: まず件数だけ確認(dryRun)し、確認ダイアログを出してから実行する
+    async function purgeAuthorLikes() {
+      const author = currentLikerAuthor;
+      if (!author) { showMsg("liker-msg", "先に職人のユーザー名一覧を表示してください", false); return; }
+
+      const preview = await apiFetch("/api/purge-author-likes", { author, dryRun: true, _msgId: "liker-msg" });
+      if (!preview) return;
+      if (!preview.ok) { showMsg("liker-msg", preview.error || "エラーが発生しました", false); return; }
+      const p = preview.result;
+      if (p.removed_count === 0) {
+        showMsg("liker-msg", `${author} に削除対象のいいねはありません（現在のいいね ${p.total_likes} 件）`, true);
+        return;
+      }
+
+      const ok = confirm(
+        `${author} のコースについたいいね ${p.total_likes} 件のうち、${p.removed_count} 件（${p.user_count}ユーザー名 / ${p.course_count}コース）を削除します。\n\n` +
+        `・この職人名で投稿したユーザー名のいいね: ${p.posted_as_author_count} 件\n` +
+        `・投稿履歴がないユーザー名のいいね: ${p.no_history_count} 件\n\n` +
+        `いいね数も同じ件数だけ減らします。この操作は取り消せません。実行しますか？`
+      );
+      if (!ok) return;
+
+      const data = await apiFetch("/api/purge-author-likes", { author, dryRun: false, _msgId: "liker-msg" });
+      if (!data) return;
+      if (data.ok) {
+        // 再読み込みでメッセージ欄がリセットされるため、読み込み完了後に完了メッセージを表示する
+        await loadLikersForAuthor(author);
+        if (document.getElementById("liker-table").style.display !== "none") await loadAuthorLikers();
+        showMsg("liker-msg", `${author} の不正分いいねを ${data.result.removed_count} 件削除しました`, true);
+      } else {
+        showMsg("liker-msg", data.error || "エラーが発生しました", false);
+      }
+    }
+
     async function loadAuthorLikers() {
       const limit = document.getElementById("liker-limit").value;
       const data = await apiGet("/api/author-likers?limit=" + encodeURIComponent(limit), "liker-msg");
@@ -799,6 +840,7 @@
       if (!data.ok) { showMsg("liker-msg", data.error || "取得に失敗しました", false); return; }
 
       document.getElementById("liker-msg").className = "msg";
+      currentLikerAuthor = author;
       const detail = document.getElementById("liker-detail");
       const tbody = document.getElementById("liker-detail-tbody");
       tbody.innerHTML = "";
@@ -812,9 +854,15 @@
       }
       for (const l of data.likers) {
         const tr = document.createElement("tr");
-        const label = l.is_disposable
+        const disposableBadge = l.is_disposable
           ? `<span style="background:#7f1d1d;color:#fca5a5;padding:0.15rem 0.5rem;border-radius:999px;font-size:0.75rem;white-space:nowrap;">使い捨て</span>`
           : "";
+        const posted = l.posted_authors || [];
+        const isPurgeTarget = posted.includes(author) || posted.length === 0;
+        const purgeBadge = isPurgeTarget
+          ? `<span style="background:#78350f;color:#fcd34d;padding:0.15rem 0.5rem;border-radius:999px;font-size:0.75rem;white-space:nowrap;">削除対象</span>`
+          : "";
+        const label = `${disposableBadge} ${purgeBadge}`;
         const authorsCell = l.posted_authors && l.posted_authors.length
           ? l.posted_authors.map(a => escapeHtml(a)).join(", ")
           : `<span style="color:#64748b;">-</span>`;

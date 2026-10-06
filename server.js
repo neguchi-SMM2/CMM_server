@@ -1084,6 +1084,34 @@ async function handleManageAPI(req, res) {
     return;
   }
 
+  // POST /api/purge-author-likes { author, dryRun }
+  // 指定職人のコースについた不正分いいね（その職人名で投稿したユーザー名 / 投稿履歴のないユーザー名）を削除する。
+  // dryRun=true のときは件数だけ返して何も削除しない。
+  if (req.method === "POST" && pathname === "/api/purge-author-likes") {
+    let body = "";
+    req.on("data", d => body += d);
+    req.on("end", async () => {
+      try {
+        const { author, dryRun } = JSON.parse(body);
+        if (!isValidStr(author)) {
+          res.writeHead(400, { "Content-Type": "application/json" });
+          res.end(JSON.stringify({ error: "author は必須です" }));
+          return;
+        }
+        const result = await db.purgeSuspiciousLikesForAuthor(author, dryRun === true);
+        if (!result.dry_run) {
+          console.log(`🧹 手動で不正いいねを削除: author=${author} removed=${result.removed_count}`);
+        }
+        res.writeHead(200, { "Content-Type": "application/json" });
+        res.end(JSON.stringify({ ok: true, result }));
+      } catch (e) {
+        res.writeHead(500, { "Content-Type": "application/json" });
+        res.end(JSON.stringify({ error: e.message }));
+      }
+    });
+    return;
+  }
+
   res.writeHead(404, { "Content-Type": "application/json" });
   res.end(JSON.stringify({ error: "not found" }));
 }

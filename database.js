@@ -1869,6 +1869,66 @@ async function listLikersForAuthor(author, limit = 500) {
   }));
 }
 
+/**
+ * 指定した職人のコースについた「不正分」のいいねを手動で削除する（管理ページ用）。
+ * 削除対象:
+ *   ① その職人名で投稿したことがあるユーザー名からのいいね（自作自演）
+ *   ② どの職人名でも投稿履歴がない（coursesに一度も現れない）ユーザー名からのいいね
+ * 削除したぶん、該当コースの courses.like_count も同じ件数だけ減らす（0未満にはしない）。
+ * dryRun=true のときは件数だけ返し、何も削除しない。
+ * ※対象はlikesテーブルに残っているいいね（約7日分）のみ。
+ * ※投稿履歴は現在DBに残っているコースから判定する（削除済みコースの履歴は残らない）。
+ */
+async function purgeSuspiciousLikesForAuthor(author, dryRun = false) {
+  const client = await pool.connect();
+  try {
+    await client.query("BEGIN");
+    const { rows } = await client.query(
+      `SELECT l.id, l.course_id, l.username,
+              EXISTS (SELECT 1 FROM courses o WHERE o.author = $1 AND o.username = l.username) AS posted_as_author,
+              NOT EXISTS (SELECT 1 FROM courses p WHERE p.username = l.username)               AS no_post_history
+       FROM likes l
+       JOIN courses c ON c.id = l.course_id
+       WHERE c.author = $1`,
+      [author]
+    );
+    const targets = rows.filter(r => r.posted_as_author || r.no_post_history);
+
+    const stats = {
+      author,
+      dry_run: dryRun,
+      total_likes: rows.length,                                              // この職人のコースについているいいね(likesテーブル内)
+      removed_count: targets.length,                                         // 削除対象(削除した)件数
+      posted_as_author_count: targets.filter(r => r.posted_as_author).length, // ①の件数
+      no_history_count: targets.filter(r => !r.posted_as_author).length,      // ②の件数
+      user_count: new Set(targets.map(r => r.username)).size,
+      course_count: new Set(targets.map(r => r.course_id)).size,
+    };
+
+    if (!dryRun && targets.length > 0) {
+      await client.query("DELETE FROM likes WHERE id = ANY($1::int[])", [targets.map(r => r.id)]);
+
+      const perCourse = new Map();
+      for (const t of targets) perCourse.set(t.course_id, (perCourse.get(t.course_id) || 0) + 1);
+      await client.query(
+        `UPDATE courses c
+         SET like_count = GREATEST(c.like_count - d.n, 0)
+         FROM (SELECT unnest($1::text[]) AS id, unnest($2::int[]) AS n) d
+         WHERE c.id = d.id`,
+        [[...perCourse.keys()], [...perCourse.values()]]
+      );
+    }
+
+    await client.query("COMMIT");
+    return stats;
+  } catch (e) {
+    await client.query("ROLLBACK").catch(() => {});
+    throw e;
+  } finally {
+    client.release();
+  }
+}
+
 module.exports = {
   initDB, pool,
   saveCourse, getCourseById,
@@ -1901,5 +1961,5 @@ module.exports = {
   getBypassInfo, getBypassUsername, issueBypassUsername, clearBypassUsername,
   listCoursesByDisposableLikers,
   getRecommendedCourses,
-  listAuthorLikerSummary, listLikersForAuthor,
+  listAuthorLikerSummary, listLikersForAuthor, purgeSuspiciousLikesForAuthor,
 };

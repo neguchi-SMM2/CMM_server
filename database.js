@@ -1791,6 +1791,67 @@ async function listCoursesByDisposableLikers(limit = 50) {
   });
 }
 
+// ─────────────────────────────────────────────
+// 職人ごとの「いいねしているユーザー名」集計（管理ページ表示用）
+// 同じユーザーが同じ職人の複数コースにいいねしていても、その職人に対しては1人とカウントする。
+// ※likesテーブルは約7日分しか保持されないため、集計対象は直近約7日分。
+// ─────────────────────────────────────────────
+
+/**
+ * 職人ごとに、いいねしたユーザー名の人数(重複なし)を集計する。人数の多い順。
+ * total_pairs は「職人×ユーザー名」の組み合わせ総数（=各職人のuser_countの合計）。
+ */
+async function listAuthorLikerSummary(limit = 50) {
+  const { rows } = await pool.query(
+    `SELECT c.author,
+            COUNT(DISTINCT l.username)  AS user_count,
+            COUNT(DISTINCT l.course_id) AS course_count,
+            COUNT(*)                    AS like_count
+     FROM likes l
+     JOIN courses c ON c.id = l.course_id
+     GROUP BY c.author
+     ORDER BY user_count DESC, like_count DESC
+     LIMIT $1`,
+    [limit]
+  );
+  const { rows: totalRows } = await pool.query(
+    `SELECT COUNT(*) AS total_pairs FROM (
+       SELECT DISTINCT c.author, l.username
+       FROM likes l JOIN courses c ON c.id = l.course_id
+     ) t`
+  );
+  return {
+    authors: rows.map(r => ({
+      author: r.author,
+      user_count: parseInt(r.user_count, 10),
+      course_count: parseInt(r.course_count, 10),
+      like_count: parseInt(r.like_count, 10),
+    })),
+    total_pairs: parseInt(totalRows[0].total_pairs, 10),
+  };
+}
+
+/** 指定した職人のコースにいいねしているユーザー名の一覧（いいねしたコース数の多い順） */
+async function listLikersForAuthor(author, limit = 500) {
+  const { rows } = await pool.query(
+    `SELECT l.username,
+            COUNT(DISTINCT l.course_id) AS course_count,
+            MAX(l.created_at)           AS last_liked_at
+     FROM likes l
+     JOIN courses c ON c.id = l.course_id
+     WHERE c.author = $1
+     GROUP BY l.username
+     ORDER BY course_count DESC, last_liked_at DESC
+     LIMIT $2`,
+    [author, limit]
+  );
+  return rows.map(r => ({
+    username: r.username,
+    course_count: parseInt(r.course_count, 10),
+    last_liked_at: parseInt(r.last_liked_at, 10),
+  }));
+}
+
 module.exports = {
   initDB, pool,
   saveCourse, getCourseById,
@@ -1823,4 +1884,5 @@ module.exports = {
   getBypassInfo, getBypassUsername, issueBypassUsername, clearBypassUsername,
   listCoursesByDisposableLikers,
   getRecommendedCourses,
+  listAuthorLikerSummary, listLikersForAuthor,
 };

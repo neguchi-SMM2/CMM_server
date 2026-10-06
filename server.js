@@ -1049,6 +1049,41 @@ async function handleManageAPI(req, res) {
     return;
   }
 
+  // GET /api/author-likers?limit=50 (職人ごとの、いいねしたユーザー名の人数集計)
+  if (req.method === "GET" && pathname === "/api/author-likers") {
+    try {
+      let limit = parseInt(url.searchParams.get("limit") || "50", 10);
+      if (!Number.isInteger(limit) || limit <= 0) limit = 50;
+      limit = Math.min(limit, 200);
+      const summary = await db.listAuthorLikerSummary(limit);
+      res.writeHead(200, { "Content-Type": "application/json" });
+      res.end(JSON.stringify({ ok: true, ...summary }));
+    } catch (e) {
+      res.writeHead(500, { "Content-Type": "application/json" });
+      res.end(JSON.stringify({ error: e.message }));
+    }
+    return;
+  }
+
+  // GET /api/author-likers-detail?author=xxx (指定した職人のコースにいいねしたユーザー名一覧)
+  if (req.method === "GET" && pathname === "/api/author-likers-detail") {
+    try {
+      const author = url.searchParams.get("author");
+      if (!isValidStr(author)) {
+        res.writeHead(400, { "Content-Type": "application/json" });
+        res.end(JSON.stringify({ error: "author は必須です" }));
+        return;
+      }
+      const likers = await db.listLikersForAuthor(author);
+      res.writeHead(200, { "Content-Type": "application/json" });
+      res.end(JSON.stringify({ ok: true, author, likers }));
+    } catch (e) {
+      res.writeHead(500, { "Content-Type": "application/json" });
+      res.end(JSON.stringify({ error: e.message }));
+    }
+    return;
+  }
+
   res.writeHead(404, { "Content-Type": "application/json" });
   res.end(JSON.stringify({ error: "not found" }));
 }

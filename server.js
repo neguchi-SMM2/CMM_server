@@ -11,6 +11,7 @@ const fs        = require("fs");
 const path      = require("path");
 
 const db = require("./database");
+const pwcrypt = require("./pwcrypt");
 const {
   encodeNum, decodeNum,
   encodeLen, decodeLen,
@@ -51,6 +52,7 @@ const CMD = {
   REGISTER_SUBMIT:         52,
   REGISTER_STATUS:         53,
   REGISTER_LOGIN:          54,
+  GET_NONCE:               55,   // パスワード暗号化用のノンスを発行する（基礎データのみ）
   LIKE:           20,
   PLAY:           21,
   ATTEMPT:        22,
@@ -62,16 +64,46 @@ const CMD = {
   BAN_USERNAME:  600,
   END_MARKER:   1000,
   DISABLED:     1001,   // 使用不可CMDを受信したときの返信
+  NOT_ENCRYPTED: 409,   // 暗号化されていないと思われるパスワードを受信したときの返信
 };
 
 // 管理ページで使用不可に設定できるCMD（返信専用コードは除外）
 const KNOWN_CMDS = Object.fromEntries(
-  Object.entries(CMD).filter(([k]) => k !== "END_MARKER" && k !== "DISABLED")
+  Object.entries(CMD).filter(([k]) => k !== "END_MARKER" && k !== "DISABLED" && k !== "NOT_ENCRYPTED")
 );
 
 const SEND_INTERVAL = 120;
 function sleep(ms) { return new Promise(r => setTimeout(r, ms)); }
 function randomCloud() { return CLOUD_VARS[Math.floor(Math.random() * CLOUD_VARS.length)]; }
+
+// ── パスワード暗号化用ノンス（CMD=55で発行 → CMD=52/54で1回だけ使える）──
+// ユーザー名ごとに1つ。再発行すると前のノンスは無効になる。
+const NONCE_TTL_MS = 60 * 1000;   // ノンスの有効時間（60秒）
+const nonceStore = new Map();     // username -> { nonce, expires }
+
+function issueNonce(username) {
+  const nonce = pwcrypt.generateNonce();
+  nonceStore.set(username, { nonce, expires: Date.now() + NONCE_TTL_MS });
+  return nonce;
+}
+
+/**
+ * そのユーザー名に発行済みのノンスで、暗号化されたパスワードを復号する。
+ * ノンスは成功・失敗にかかわらず1回使ったら破棄する（盗み見た暗号文の再送を防ぐ）。
+ * ノンスがない・期限切れ・復号できない場合は null。
+ */
+function decryptPasswordWithNonce(username, cipher) {
+  const entry = nonceStore.get(username);
+  if (!entry) return null;
+  nonceStore.delete(username);
+  if (Date.now() > entry.expires) return null;
+  return pwcrypt.decryptPassword(cipher, entry.nonce);
+}
+
+setInterval(() => {
+  const now = Date.now();
+  for (const [u, e] of nonceStore) if (now > e.expires) nonceStore.delete(u);
+}, 60 * 1000).unref();
 
 // ── CMD=54 成功の記録（CMD=2の認可用）──
 const LOGIN_VALID_MS = 5 * 60 * 1000;          // ログイン有効時間（5分）
@@ -332,6 +364,14 @@ async function handleRequest(s, setter, getOnlineUsers) {
     return;
   }
 
+  // CMD=55: パスワード暗号化用のノンスを発行して返す（リクエストは userId + cmd + username のみ）
+  // 返信: userId(LenLen) + cmd(Len) + nonce(alphabet、0-9a-zの8文字)
+  if (cmd === CMD.GET_NONCE) {
+    const nonce = issueNonce(username);
+    await sendCloud(setter, randomCloud(), encodeLenLen(parseInt(userId)) + encodeLen(CMD.GET_NONCE) + encodeAlphabet(nonce));
+    return;
+  }
+
   if (cmd === CMD.REGISTER_CHECK_AUTHOR) {
     const { value: targetAuthor } = decodeAlphabet(s, pos);
     if (!isValidStr(targetAuthor)) { console.warn("⚠️ 不正なauthor:", targetAuthor); return; }
@@ -356,10 +396,25 @@ async function handleRequest(s, setter, getOnlineUsers) {
 
   if (cmd === CMD.REGISTER_SUBMIT) {
     const { value: targetAuthor, next: q1 } = decodeAlphabet(s, pos);
-    const { value: password, next: q2 } = decodeAlphabet(s, q1);
+    const { value: encryptedPassword, next: q2 } = decodeAlphabet(s, q1);
     const { value: regType } = decodeLen(s, q2);
-    if (!isValidStr(targetAuthor) || !isValidStr(password) || !isValidNum(regType)) {
+    if (!isValidStr(targetAuthor) || !isValidStr(encryptedPassword) || !isValidNum(regType)) {
       console.warn("⚠️ 不正な登録リクエスト"); return;
+    }
+
+    // 暗号文の形式(0-9a-zの48文字)でなければ、暗号化されていないパスワードとみなして409を返す
+    if (!pwcrypt.isCipherFormat(encryptedPassword)) {
+      console.warn(`⚠️ 暗号化されていないパスワード(登録): ${username}`);
+      await sendCloud(setter, randomCloud(), encodeLenLen(parseInt(userId)) + encodeLen(CMD.NOT_ENCRYPTED));
+      return;
+    }
+
+    // パスワードは暗号化されて届く。CMD=55で発行したノンス（1回限り）で復号する
+    const password = decryptPasswordWithNonce(username, encryptedPassword);
+    if (password === null) {
+      console.warn(`⚠️ パスワード復号失敗(登録): ${username}`);
+      await sendCloud(setter, randomCloud(), encodeLenLen(parseInt(userId)) + encodeLen(CMD.REGISTER_SUBMIT) + encodeLen(0));
+      return;
     }
 
     if (regType === 0) {
@@ -413,8 +468,23 @@ async function handleRequest(s, setter, getOnlineUsers) {
 
   if (cmd === CMD.REGISTER_LOGIN) {
     const { value: targetAuthor, next: q1 } = decodeAlphabet(s, pos);
-    const { value: password } = decodeAlphabet(s, q1);
-    if (!isValidStr(targetAuthor) || !isValidStr(password)) { console.warn("⚠️ 不正なログイン要求"); return; }
+    const { value: encryptedPassword } = decodeAlphabet(s, q1);
+    if (!isValidStr(targetAuthor) || !isValidStr(encryptedPassword)) { console.warn("⚠️ 不正なログイン要求"); return; }
+
+    // 暗号文の形式(0-9a-zの48文字)でなければ、暗号化されていないパスワードとみなして409を返す
+    if (!pwcrypt.isCipherFormat(encryptedPassword)) {
+      console.warn(`⚠️ 暗号化されていないパスワード(ログイン): ${username}`);
+      await sendCloud(setter, randomCloud(), encodeLenLen(parseInt(userId)) + encodeLen(CMD.NOT_ENCRYPTED));
+      return;
+    }
+
+    // パスワードは暗号化されて届く。CMD=55で発行したノンス（1回限り）で復号してから照合する
+    const password = decryptPasswordWithNonce(username, encryptedPassword);
+    if (password === null) {
+      console.warn(`⚠️ パスワード復号失敗(ログイン): ${username}`);
+      await sendCloud(setter, randomCloud(), encodeLenLen(parseInt(userId)) + encodeLen(CMD.REGISTER_LOGIN) + encodeLen(0));
+      return;
+    }
     const ok = await db.verifyMakerPassword(targetAuthor, password);
     if (ok) recordLoginSuccess(username, targetAuthor); // CMD=2の認可用に記録（5分間有効）
     await sendCloud(setter, randomCloud(), encodeLenLen(parseInt(userId)) + encodeLen(CMD.REGISTER_LOGIN) + encodeLen(ok ? 1 : 0));
@@ -1797,6 +1867,7 @@ class CloudManager {
     process.on("unhandledRejection", e => {
       console.error("❌ unhandledRejection:", e);
     });
+    pwcrypt.loadKey(); // 鍵がない/不正ならここで例外 → 起動失敗（CMD=52/54が黙って失敗するのを防ぐ）
     await db.initDB();
     await Promise.allSettled([this.connectScratch(), Promise.resolve(this.connectTurboWarp())]);
     this.scheduleWeeklyReset();

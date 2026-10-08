@@ -496,9 +496,11 @@ async function handleRequest(s, setter, getOnlineUsers) {
     if (!isValidStr(courseId)) {
       console.warn("⚠️ 不正なcourseId:", courseId); return;
     }
-    if (cmd === CMD.PLAY)    { await db.incrementPlay(courseId); await db.incrementAttempt(courseId); return; }
-    if (cmd === CMD.ATTEMPT) { await db.incrementAttempt(courseId); return; }
-    if (cmd === CMD.CLEAR)   { await db.incrementClear(courseId);   return; }
+    // 自作コース（コースの投稿ユーザー名＝リクエストのusername）は加算しない。返信もしない。
+    // 判定はDB側のUPDATE条件(username <> 自分)で行うので、追加のクエリは発生しない。
+    if (cmd === CMD.PLAY)    { await db.incrementPlay(courseId, username); await db.incrementAttempt(courseId, username); return; }
+    if (cmd === CMD.ATTEMPT) { await db.incrementAttempt(courseId, username); return; }
+    if (cmd === CMD.CLEAR)   { await db.incrementClear(courseId, username);   return; }
     if (cmd === CMD.LIKE) {
       const banned = await db.isUserBanned(username);
       if (banned) {

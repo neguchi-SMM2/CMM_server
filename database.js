@@ -409,7 +409,7 @@ async function getRecommendedCourses(limit) {
             c.attempt_count, c.clear_count, c.posted_at, c.red
      FROM recommended_courses r
      JOIN courses c ON c.id = r.course_id
-     ORDER BY r.added_at ASC
+     ORDER BY r.added_at DESC
      LIMIT $1`,
     [limit]
   );
@@ -789,21 +789,26 @@ async function cleanupInactiveMakers() {
 // ─────────────────────────────────────────────
 // 統計更新
 // ─────────────────────────────────────────────
-async function incrementPlay(courseId) {
+// excludeUsername を渡すと、そのユーザー名が投稿したコース（courses.username が一致）には加算しない。
+// （自作コースを自分で遊んだぶんをカウントしないため。判定は1回のUPDATEで行う）
+async function incrementPlay(courseId, excludeUsername = null) {
   await pool.query(
-    "UPDATE courses SET play_count=play_count+1 WHERE id=$1", [courseId]
+    "UPDATE courses SET play_count=play_count+1 WHERE id=$1 AND ($2::text IS NULL OR username <> $2::text)",
+    [courseId, excludeUsername]
   );
 }
 
-async function incrementAttempt(courseId) {
+async function incrementAttempt(courseId, excludeUsername = null) {
   await pool.query(
-    "UPDATE courses SET attempt_count=attempt_count+1 WHERE id=$1", [courseId]
+    "UPDATE courses SET attempt_count=attempt_count+1 WHERE id=$1 AND ($2::text IS NULL OR username <> $2::text)",
+    [courseId, excludeUsername]
   );
 }
 
-async function incrementClear(courseId) {
+async function incrementClear(courseId, excludeUsername = null) {
   await pool.query(
-    "UPDATE courses SET clear_count=clear_count+1 WHERE id=$1", [courseId]
+    "UPDATE courses SET clear_count=clear_count+1 WHERE id=$1 AND ($2::text IS NULL OR username <> $2::text)",
+    [courseId, excludeUsername]
   );
 }
 

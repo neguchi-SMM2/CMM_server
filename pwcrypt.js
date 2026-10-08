@@ -4,7 +4,7 @@ const fs   = require("fs");
 const path = require("path");
 const crypto = require("crypto");
 
-const SYMBOLS   = "0123456789abcdefghijklmnopqrstuvwxyz-_";
+const SYMBOLS   = "0123456789abcdefghijklmnopqrstuvwxyz-_?";
 const B36       = "0123456789abcdefghijklmnopqrstuvwxyz";
 const MOD       = 1296;
 const BLOCK     = 24;

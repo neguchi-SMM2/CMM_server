@@ -409,7 +409,7 @@ async function getRecommendedCourses(limit) {
             c.attempt_count, c.clear_count, c.posted_at, c.red
      FROM recommended_courses r
      JOIN courses c ON c.id = r.course_id
-     ORDER BY r.added_at DESC
+     ORDER BY r.added_at ASC
      LIMIT $1`,
     [limit]
   );

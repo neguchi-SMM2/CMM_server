@@ -1156,23 +1156,30 @@ async function handleManageAPI(req, res) {
     return;
   }
 
-  // POST /api/purge-author-likes { author, dryRun }
+  // POST /api/purge-author-likes { author, dryRun, username? }
   // 指定職人のコースについた不正分いいね（その職人名で投稿したユーザー名 / 投稿履歴のないユーザー名）を削除する。
+  // username を指定すると、そのユーザー名のいいねだけを対象にする（削除対象でなければ何も削除しない）。
   // dryRun=true のときは件数だけ返して何も削除しない。
   if (req.method === "POST" && pathname === "/api/purge-author-likes") {
     let body = "";
     req.on("data", d => body += d);
     req.on("end", async () => {
       try {
-        const { author, dryRun } = JSON.parse(body);
+        const { author, dryRun, username } = JSON.parse(body);
         if (!isValidStr(author)) {
           res.writeHead(400, { "Content-Type": "application/json" });
           res.end(JSON.stringify({ error: "author は必須です" }));
           return;
         }
-        const result = await db.purgeSuspiciousLikesForAuthor(author, dryRun === true);
+        if (username !== undefined && username !== null && !isValidStr(username)) {
+          res.writeHead(400, { "Content-Type": "application/json" });
+          res.end(JSON.stringify({ error: "username は文字列で指定してください" }));
+          return;
+        }
+        const onlyUsername = isValidStr(username) ? username : null;
+        const result = await db.purgeSuspiciousLikesForAuthor(author, dryRun === true, onlyUsername);
         if (!result.dry_run) {
-          console.log(`🧹 手動で不正いいねを削除: author=${author} removed=${result.removed_count}`);
+          console.log(`🧹 手動で不正いいねを削除: author=${author}${onlyUsername ? " username=" + onlyUsername : ""} removed=${result.removed_count}`);
         }
         res.writeHead(200, { "Content-Type": "application/json" });
         res.end(JSON.stringify({ ok: true, result }));

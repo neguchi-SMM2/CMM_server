@@ -1881,10 +1881,12 @@ async function listLikersForAuthor(author, limit = 500) {
  *   ② どの職人名でも投稿履歴がない（coursesに一度も現れない）ユーザー名からのいいね
  * 削除したぶん、該当コースの courses.like_count も同じ件数だけ減らす（0未満にはしない）。
  * dryRun=true のときは件数だけ返し、何も削除しない。
+ * onlyUsername を渡すと、そのユーザー名のいいねだけを対象にする（ユーザー名ごとの削除）。
+ *   その場合も、そのユーザー名が上の①②のどちらにも当てはまらなければ何も削除されない（removed_count=0）。
  * ※対象はlikesテーブルに残っているいいね（約7日分）のみ。
  * ※投稿履歴は現在DBに残っているコースから判定する（削除済みコースの履歴は残らない）。
  */
-async function purgeSuspiciousLikesForAuthor(author, dryRun = false) {
+async function purgeSuspiciousLikesForAuthor(author, dryRun = false, onlyUsername = null) {
   const client = await pool.connect();
   try {
     await client.query("BEGIN");
@@ -1894,13 +1896,15 @@ async function purgeSuspiciousLikesForAuthor(author, dryRun = false) {
               NOT EXISTS (SELECT 1 FROM courses p WHERE p.username = l.username)               AS no_post_history
        FROM likes l
        JOIN courses c ON c.id = l.course_id
-       WHERE c.author = $1`,
-      [author]
+       WHERE c.author = $1
+         AND ($2::text IS NULL OR l.username = $2::text)`,
+      [author, onlyUsername]
     );
     const targets = rows.filter(r => r.posted_as_author || r.no_post_history);
 
     const stats = {
       author,
+      username: onlyUsername,
       dry_run: dryRun,
       total_likes: rows.length,                                              // この職人のコースについているいいね(likesテーブル内)
       removed_count: targets.length,                                         // 削除対象(削除した)件数

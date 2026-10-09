@@ -308,7 +308,7 @@
         <div class="table-wrap">
           <table>
             <thead>
-              <tr><th>ユーザー名</th><th>ラベル</th><th>いいねしたコース数</th><th>最後にいいねした日時</th><th>このユーザー名で投稿している職人名</th></tr>
+              <tr><th>ユーザー名</th><th>ラベル</th><th>いいねしたコース数</th><th>最後にいいねした日時</th><th>このユーザー名で投稿している職人名</th><th>操作</th></tr>
             </thead>
             <tbody id="liker-detail-tbody"></tbody>
           </table>
@@ -756,38 +756,46 @@
     let currentLikerAuthor = null; // 詳細表示中の職人名
 
     // 不正分いいねの削除: まず件数だけ確認(dryRun)し、確認ダイアログを出してから実行する
-    async function purgeAuthorLikes() {
-      const author = currentLikerAuthor;
+    //   username を省略 → この職人の削除対象すべて / 指定 → そのユーザー名の削除対象だけ
+    async function purgeLikes(author, username) {
       if (!author) { showMsg("liker-msg", "先に職人のユーザー名一覧を表示してください", false); return; }
+      const body = { author, _msgId: "liker-msg" };
+      if (username) body.username = username;
+      const target = username ? `${username} の（${author} のコースへの）` : `${author} のコースについた`;
 
-      const preview = await apiFetch("/api/purge-author-likes", { author, dryRun: true, _msgId: "liker-msg" });
+      const preview = await apiFetch("/api/purge-author-likes", { ...body, dryRun: true });
       if (!preview) return;
       if (!preview.ok) { showMsg("liker-msg", preview.error || "エラーが発生しました", false); return; }
       const p = preview.result;
       if (p.removed_count === 0) {
-        showMsg("liker-msg", `${author} に削除対象のいいねはありません（現在のいいね ${p.total_likes} 件）`, true);
+        showMsg("liker-msg", `${target}いいねに削除対象はありません（現在のいいね ${p.total_likes} 件）`, true);
         return;
       }
 
+      const reasons = username
+        ? (p.posted_as_author_count > 0 ? `理由: このユーザー名は ${author} の名前で投稿したことがあります` : "理由: このユーザー名には投稿履歴がありません")
+        : `・この職人名で投稿したユーザー名のいいね: ${p.posted_as_author_count} 件\n・投稿履歴がないユーザー名のいいね: ${p.no_history_count} 件`;
       const ok = confirm(
-        `${author} のコースについたいいね ${p.total_likes} 件のうち、${p.removed_count} 件（${p.user_count}ユーザー名 / ${p.course_count}コース）を削除します。\n\n` +
-        `・この職人名で投稿したユーザー名のいいね: ${p.posted_as_author_count} 件\n` +
-        `・投稿履歴がないユーザー名のいいね: ${p.no_history_count} 件\n\n` +
+        `${target}いいね ${p.total_likes} 件のうち、${p.removed_count} 件（${p.user_count}ユーザー名 / ${p.course_count}コース）を削除します。\n\n` +
+        `${reasons}\n\n` +
         `いいね数も同じ件数だけ減らします。この操作は取り消せません。実行しますか？`
       );
       if (!ok) return;
 
-      const data = await apiFetch("/api/purge-author-likes", { author, dryRun: false, _msgId: "liker-msg" });
+      const data = await apiFetch("/api/purge-author-likes", { ...body, dryRun: false });
       if (!data) return;
       if (data.ok) {
         // 再読み込みでメッセージ欄がリセットされるため、読み込み完了後に完了メッセージを表示する
         await loadLikersForAuthor(author);
         if (document.getElementById("liker-table").style.display !== "none") await loadAuthorLikers();
-        showMsg("liker-msg", `${author} の不正分いいねを ${data.result.removed_count} 件削除しました`, true);
+        showMsg("liker-msg", `${username ? username + " の" : author + " の不正分"}いいねを ${data.result.removed_count} 件削除しました`, true);
       } else {
         showMsg("liker-msg", data.error || "エラーが発生しました", false);
       }
     }
+
+    // 「この職人の不正分いいねを削除」ボタン（削除対象すべて）
+    function purgeAuthorLikes() { return purgeLikes(currentLikerAuthor, null); }
 
     async function loadAuthorLikers() {
       const limit = document.getElementById("liker-limit").value;
@@ -849,7 +857,7 @@
       detail.style.display = "block";
 
       if (!data.likers.length) {
-        tbody.innerHTML = `<tr><td colspan="5" style="color:#64748b;">該当するユーザーはいません</td></tr>`;
+        tbody.innerHTML = `<tr><td colspan="6" style="color:#64748b;">該当するユーザーはいません</td></tr>`;
         return;
       }
       for (const l of data.likers) {
@@ -873,6 +881,19 @@
           <td>${formatCreatedAt(l.last_liked_at)}</td>
           <td>${authorsCell}</td>
         `;
+        // 操作列: 削除対象のユーザー名だけ「削除」ボタンを出す（サーバー側でも削除対象かどうかを再判定する）
+        const opTd = document.createElement("td");
+        opTd.className = "actions";
+        if (isPurgeTarget) {
+          const btn = document.createElement("button");
+          btn.className = "btn-danger";
+          btn.textContent = "いいねを削除";
+          btn.addEventListener("click", () => purgeLikes(author, l.username));
+          opTd.appendChild(btn);
+        } else {
+          opTd.innerHTML = `<span style="color:#64748b;">-</span>`;
+        }
+        tr.appendChild(opTd);
         tbody.appendChild(tr);
       }
       detail.scrollIntoView({ behavior: "smooth", block: "nearest" });

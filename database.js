@@ -305,7 +305,7 @@ async function isOfficialMaker(name) {
 // 背景・スクロール情報、全セル数(エンコード時のノイズで少しずれる)は比較に使わない。
 // ※同じインデックス同士で比べるので、ずらしたコピーや左右反転したコピーは検出できない。
 // ─────────────────────────────────────────────
-const SIMILAR_THRESHOLD     = 0.9;              // small のセルのうち、これ以上が一致していたら「ほとんど同じ」
+const SIMILAR_THRESHOLD     = 0.8;              // small のセルのうち、これ以上が一致していたら「ほとんど同じ」
 const SIMILAR_MIN_CELLS     = 30;               // small の空気以外のセル数がこれ未満なら判定しない
 const SIMILAR_CACHE_SYNC_MS = 5 * 60 * 1000;    // DBとのキャッシュ同期の間隔（手動削除・他インスタンスの投稿を反映）
 const AIR_BLOCKS            = new Set([1, 259]); // 001, 259

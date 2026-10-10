@@ -290,129 +290,6 @@ async function isOfficialMaker(name) {
 }
 
 // ─────────────────────────────────────────────
-// ほとんど同じコースの検出（投稿時に弾く）
-//
-// stage_data の形式: 背景(Len) + スクロール情報(Len) + ブロックデータ(RLE: ブロックID3桁 + 個数3桁 の繰り返し)
-//   例: 1711259250266014… → 背景7, スクロール1, 259が250個, 266が14個
-// ブロックデータを展開したときの先頭からの位置が「インデックス」。
-// 空気ブロック(001, 259)はステージの大半を占めるので比較に含めず、
-// 「空気以外のセル = (インデックス, ブロックID)の組」だけを集めて比べる。
-//
-// 判定: 2つのコースのうち空気以外のセル数が少ない方(small)について、
-//       もう一方の同じインデックスに同じブロックがある割合が SIMILAR_THRESHOLD 以上なら「ほとんど同じ」。
-//       ただし small が SIMILAR_MIN_CELLS 未満のときは判定しない（小さなコース同士の誤判定を防ぐ）。
-//   → 少し足しただけの再投稿も、一部を削っただけのコピーも、どちらの向きでも検出できる。
-// 背景・スクロール情報、全セル数(エンコード時のノイズで少しずれる)は比較に使わない。
-// ※同じインデックス同士で比べるので、ずらしたコピーや左右反転したコピーは検出できない。
-// ─────────────────────────────────────────────
-const SIMILAR_THRESHOLD     = 0.87;              // small のセルのうち、これ以上が一致していたら「ほとんど同じ」
-const SIMILAR_MIN_CELLS     = 2;               // small の空気以外のセル数がこれ未満なら判定しない
-const SIMILAR_CACHE_SYNC_MS = 5 * 60 * 1000;    // DBとのキャッシュ同期の間隔（手動削除・他インスタンスの投稿を反映）
-const AIR_BLOCKS            = new Set([1, 259]); // 001, 259
-const MAX_STAGE_CELLS       = 4000000;          // 異常に長いデータは解析しない（key=index*1000+block がUint32に収まる範囲）
-
-/**
- * stage_data から、空気以外のセルを抽出する。
- * 戻り値: Uint32Array（各要素 = index*1000 + blockId、indexの昇順）。形式が不正なら null。
- */
-function parseStageCells(stageData) {
-  if (typeof stageData !== "string") return null;
-  let pos = 0;
-  for (let k = 0; k < 2; k++) {                 // 背景・スクロール情報（どちらもLen形式。値は使わない）
-    const n = parseInt(stageData[pos], 10);
-    if (!Number.isInteger(n)) return null;
-    pos += 1 + n;
-  }
-  if (pos > stageData.length) return null;
-  const body = stageData.slice(pos);
-  if (body.length % 6 !== 0 || !/^[0-9]*$/.test(body)) return null;
-
-  const keys = [];
-  let index = 0;
-  for (let i = 0; i < body.length; i += 6) {
-    const block = parseInt(body.slice(i, i + 3), 10);
-    const count = parseInt(body.slice(i + 3, i + 6), 10);
-    if (index + count > MAX_STAGE_CELLS) return null;
-    if (!AIR_BLOCKS.has(block)) {
-      for (let k = 0; k < count; k++) keys.push((index + k) * 1000 + block);
-    }
-    index += count;
-  }
-  return Uint32Array.from(keys);
-}
-
-/** 昇順の2配列に共通して含まれる要素数（= 同じインデックスに同じブロックがあるセルの数） */
-function countCommonCells(a, b) {
-  let i = 0, j = 0, common = 0;
-  while (i < a.length && j < b.length) {
-    if (a[i] === b[j]) { common++; i++; j++; }
-    else if (a[i] < b[j]) i++;
-    else j++;
-  }
-  return common;
-}
-
-// 既存コースの「空気以外のセル」をメモリに持つ: courseId -> Uint32Array
-const similarityCache = new Map();
-let similarityLastSync = 0;
-let similaritySyncPromise = null;
-
-/** DBの内容とキャッシュを同期する（初回は全コースを読み込み、以降は差分だけ） */
-async function syncSimilarityCache() {
-  const { rows } = await pool.query("SELECT id FROM courses");
-  const dbIds = new Set(rows.map(r => r.id));
-  for (const id of similarityCache.keys()) {
-    if (!dbIds.has(id)) similarityCache.delete(id);        // 削除されたコースを外す
-  }
-  const missing = rows.map(r => r.id).filter(id => !similarityCache.has(id));
-  for (let i = 0; i < missing.length; i += 200) {
-    const { rows: part } = await pool.query(
-      "SELECT id, stage_data FROM courses WHERE id = ANY($1::text[])", [missing.slice(i, i + 200)]
-    );
-    for (const row of part) {
-      // 解析できないコースは空配列で登録（毎回読み直さないため。空なので比較ではスキップされる）
-      similarityCache.set(row.id, parseStageCells(row.stage_data) || new Uint32Array(0));
-    }
-  }
-  similarityLastSync = Date.now();
-}
-
-async function ensureSimilarityCache() {
-  if (similaritySyncPromise) return similaritySyncPromise;
-  if (Date.now() - similarityLastSync < SIMILAR_CACHE_SYNC_MS) return;
-  similaritySyncPromise = syncSimilarityCache().finally(() => { similaritySyncPromise = null; });
-  return similaritySyncPromise;
-}
-
-/**
- * 既存コースの中に、stageData と「ほとんど同じ」ものがあれば { id, matched, small, ratio } を返す。なければ null。
- * 解析できない・DBエラーなど、判定できない場合は null（投稿は通す）。
- */
-async function findSimilarCourse(stageData, cells = null) {
-  try {
-    const a = cells || parseStageCells(stageData);
-    if (!a) { console.warn("⚠️ stage_dataを解析できないため、類似コースの判定をスキップします"); return null; }
-    if (a.length < SIMILAR_MIN_CELLS) return null;          // small <= a.length < 最小数 なので、どの相手とも判定しない
-
-    await ensureSimilarityCache();
-    for (const [id, b] of similarityCache) {
-      const small = Math.min(a.length, b.length);
-      if (small < SIMILAR_MIN_CELLS) continue;
-      const matched = countCommonCells(a, b);
-      if (matched / small < SIMILAR_THRESHOLD - 1e-9) continue;
-      // 手動でDBから消された場合などに備え、実在を確認してから弾く
-      const { rows } = await pool.query("SELECT 1 FROM courses WHERE id=$1", [id]);
-      if (!rows.length) { similarityCache.delete(id); continue; }
-      return { id, matched, small, ratio: matched / small };
-    }
-    return null;
-  } catch (e) {
-    console.error("類似コースの判定に失敗（判定をスキップして投稿を通します）:", e.message);
-    return null;
-  }
-}
-
-// ─────────────────────────────────────────────
 // コース保存
 // ─────────────────────────────────────────────
 async function saveCourse(title, author, username, stageData, ipAddress = null) {
@@ -420,15 +297,6 @@ async function saveCourse(title, author, username, stageData, ipAddress = null) 
     "SELECT 1 FROM courses WHERE stage_data=$1", [stageData]
   );
   if (dupRows.length) return { duplicate: true };
-
-  // ほとんど同じコースが既にあれば、完全一致と同じ扱いで弾く（返信は同じ duplicate → CMD=102）
-  const stageCells = parseStageCells(stageData);
-  const similar = await findSimilarCourse(stageData, stageCells);
-  if (similar) {
-    console.log(`🚫 ほとんど同じコースのため投稿を拒否: author=${author} username=${username} ` +
-      `似ているコース=${similar.id} 一致=${similar.matched}/${similar.small}(${(similar.ratio * 100).toFixed(1)}%)`);
-    return { duplicate: true, similarTo: similar.id };
-  }
 
   // 1職人あたり最大100コースまで
   const MAX_COURSES_PER_AUTHOR = 100;
@@ -466,7 +334,6 @@ async function saveCourse(title, author, username, stageData, ipAddress = null) 
      VALUES ($1, $2, $3, $4, $5, $6, $7, $8)`,
     [id, title, author, username, stageData, postedAt, ipAddress || null, red]
   );
-  if (stageCells) similarityCache.set(id, stageCells);   // 次の投稿との比較に使う
   return { id };
 }
 
@@ -1249,7 +1116,6 @@ async function deleteCourse(courseId) {
   const { rows } = await pool.query(
     "DELETE FROM courses WHERE id=$1 RETURNING username", [courseId]
   );
-  if (rows[0]) similarityCache.delete(courseId);
   return rows[0] || null;
 }
 

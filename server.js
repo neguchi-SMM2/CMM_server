@@ -402,6 +402,13 @@ async function handleRequest(s, setter, getOnlineUsers) {
       console.warn("⚠️ 不正な登録リクエスト"); return;
     }
 
+    // BANされているユーザー名は職人登録できない（本登録・仮登録とも）。LIKEのBANと同じくCMD=405を返す
+    if (await db.isUserBanned(username)) {
+      console.warn(`⚠️ BAN中のユーザー名の職人登録を拒否: ${username}`);
+      await sendCloud(setter, randomCloud(), encodeLenLen(parseInt(userId)) + encodeLen(405));
+      return;
+    }
+
     // 暗号文の形式(0-9a-zの48文字)でなければ、暗号化されていないパスワードとみなして409を返す
     if (!pwcrypt.isCipherFormat(encryptedPassword)) {
       console.warn(`⚠️ 暗号化されていないパスワード(登録): ${username}`);
@@ -1203,7 +1210,7 @@ async function handleManageAPI(req, res) {
 const chatLastSentAt = new Map();
 const CHAT_MIN_INTERVAL_MS = 60 * 1000; // 最短送信間隔（全体チャット・DM共通で1分）
 const CHAT_MAX_LENGTH = 100;            // 1メッセージの最大文字数
-const CHAT_DAILY_CHAR_LIMIT = 2000;     // 1職人が1日(JST)に送信できる合計文字数
+const CHAT_DAILY_CHAR_LIMIT = 5000;     // 1職人が1日(JST)に送信できる合計文字数
 const CHAT_NIGHT_START_HOUR = 1;        // この時刻(JST)から
 const CHAT_NIGHT_END_HOUR   = 6;        // この時刻(JST)までチャット送信を停止する
 

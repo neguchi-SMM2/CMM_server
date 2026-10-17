@@ -1826,8 +1826,8 @@ class CloudManager {
       } catch (e) {
         console.error("職人クリーンアップ失敗:", e);
       }
-    }, 24 * 60 * 60 * 1000);
-    console.log("📅 非アクティブ職人クリーンアップ: 1日ごとに実行");
+    }, 3 * 60 * 60 * 1000);
+    console.log("📅 非アクティブ職人クリーンアップ: 3時間ごとに実行");
   }
 
   scheduleLikeFraudDetection() {
@@ -1846,7 +1846,7 @@ class CloudManager {
 
   scheduleChatCleanup() {
     // DBの容量を圧迫しないよう、古いチャットデータを定期的に削除する（1日ごと）
-    const CHAT_RETENTION_DAYS = 90; // 全体チャット・DMの保存期間
+    const CHAT_RETENTION_DAYS = 40; // 全体チャット・DMの保存期間
     const DAU_RETENTION_DAYS  = 30; // 営業日ごとの訪問ユーザー記録の保存期間
     setInterval(async () => {
       try {
@@ -1856,8 +1856,8 @@ class CloudManager {
       } catch (e) {
         console.error("チャットデータクリーンアップ失敗:", e);
       }
-    }, 24 * 60 * 60 * 1000);
-    console.log(`📅 チャットデータクリーンアップ: 1日ごとに実行（保持期間 ${CHAT_RETENTION_DAYS}日）`);
+    }, 3 * 60 * 60 * 1000);
+    console.log(`📅 チャットデータクリーンアップ: 3時間ごとに実行（保持期間 ${CHAT_RETENTION_DAYS}日）`);
   }
 
   async start() {

@@ -870,9 +870,9 @@ async function resetWeeklyLikes() {
 // 不正いいね検知・自動修復
 // ─────────────────────────────────────────────
 
-const LIKE_FRAUD_BURST_GAP_SECONDS       = 120;  // この秒数以内の間隔で連続していれば同じ"塊(バースト)"とみなす
-const LIKE_FRAUD_MIN_BURST_SIZE          = 6;    // 通常、1つの塊がこの件数以上なら不正とみなす
-const LIKE_FRAUD_SUSPICIOUS_MIN_SIZE     = 3;    // 使い捨てユーザー名比率が高い場合、この件数まで閾値を下げる
+const LIKE_FRAUD_BURST_GAP_SECONDS       = 300;  // この秒数以内の間隔で連続していれば同じ"塊(バースト)"とみなす
+const LIKE_FRAUD_MIN_BURST_SIZE          = 12;    // 通常、1つの塊がこの件数以上なら不正とみなす
+const LIKE_FRAUD_SUSPICIOUS_MIN_SIZE     = 6;    // 使い捨てユーザー名比率が高い場合、この件数まで閾値を下げる
 const LIKE_FRAUD_DISPOSABLE_RATIO_THRESHOLD = 0.7; // 塊の中でこの割合以上が「使い捨てユーザー名」なら閾値緩和の対象にする
 const LIKE_FRAUD_LOOKBACK_HOURS          = 6;    // 直近何時間分のいいねを対象に検査するか
 const LIKE_FRAUD_REPEAT_WINDOW_DAYS      = 30;   // 常習犯判定に使う「過去何日以内の検知件数」

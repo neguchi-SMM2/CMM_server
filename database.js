@@ -1479,6 +1479,17 @@ async function deleteOldChatMessages(retentionDays = 90) {
   return { deletedMessages: msgCount, deletedDMs: dmCount };
 }
 
+/**
+ * DM（chat_dm）を全件削除する。あわせてDMの既読位置（chat_dm_reads）も削除する。
+ * 全体チャット（chat_messages）には一切触れない。
+ */
+async function deleteAllDMs() {
+  const { rowCount: dmCount } = await pool.query("DELETE FROM chat_dm");
+  await pool.query("DELETE FROM chat_dm_reads");
+  console.log(`🗑️ DMを全件削除しました（${dmCount}件）`);
+  return { deletedDMs: dmCount };
+}
+
 // ─────────────────────────────────────────────
 // チャットBAN・通報
 // ─────────────────────────────────────────────
@@ -1957,7 +1968,7 @@ module.exports = {
   chatLogin, getAuthorByToken, chatLogout,
   saveChatMessage, getChatMessages, getLatestChatMessages, getChatMessagesBefore,
   saveDM, getDMMessages, getLatestDMMessages, getDMMessagesBefore, getDMPartners, markDMRead,
-  getDailyCharCount, addDailyCharCount, cleanupOldDailyUsage, deleteOldChatMessages,
+  getDailyCharCount, addDailyCharCount, cleanupOldDailyUsage, deleteOldChatMessages, deleteAllDMs,
   getBusinessDayForRecording, getBusinessDayForDisplay,
   recordDailyActiveUser, countDailyActiveUsers, cleanupOldDailyActiveUsers,
   getRecentlyDeletedChatIds, getRecentlyDeletedDMIds,

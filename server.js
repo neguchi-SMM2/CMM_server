@@ -1883,6 +1883,29 @@ class CloudManager {
     console.log(`📅 チャットデータクリーンアップ: 1日ごとに実行（保持期間 ${CHAT_RETENTION_DAYS}日）`);
   }
 
+  scheduleDMPurge() {
+    // 2026/10/20 1:00(JST)を過ぎたら、DM(chat_dm)を全削除する（全体チャットは残す）
+    // 1:00以降に起動した場合も、起動直後に実行される。成功したら以降は実行しない。
+    const DM_PURGE_AT = Date.parse("2026-10-20T01:00:00+09:00");
+    let done = false;
+    let running = false;
+    const timer = setInterval(async () => {
+      if (done || running || Date.now() < DM_PURGE_AT) return;
+      running = true;
+      try {
+        await db.deleteAllDMs();
+        done = true;
+        clearInterval(timer);
+      } catch (e) {
+        console.error("DM全削除失敗（次回再試行します）:", e);
+      } finally {
+        running = false;
+      }
+    }, 60 * 1000);
+    timer.unref();
+    console.log("📅 DM全削除: 2026/10/20 1:00(JST)以降に実行");
+  }
+
   async start() {
     let lastUncaughtMsg = null;
     let uncaughtCount = 0;
@@ -1913,6 +1936,7 @@ class CloudManager {
     this.scheduleMakerCleanup();
     this.scheduleLikeFraudDetection();
     this.scheduleChatCleanup();
+    this.scheduleDMPurge();
 
     const server = http.createServer(async (req, res) => {
       const url = new URL(req.url, `http://localhost`);

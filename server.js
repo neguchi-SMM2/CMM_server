@@ -1210,13 +1210,34 @@ async function handleManageAPI(req, res) {
 const chatLastSentAt = new Map();
 const CHAT_MIN_INTERVAL_MS = 60 * 1000; // 最短送信間隔（全体チャット・DM共通で1分）
 const CHAT_MAX_LENGTH = 100;            // 1メッセージの最大文字数
-const CHAT_DAILY_CHAR_LIMIT = 2000;     // 1職人が1日(JST)に送信できる合計文字数
+const CHAT_DAILY_CHAR_LIMIT = 5000;     // 1職人が1日(JST)に送信できる合計文字数
 const CHAT_NIGHT_START_HOUR = 1;        // この時刻(JST)から
 const CHAT_NIGHT_END_HOUR   = 6;        // この時刻(JST)までチャット送信を停止する
 
 // 通報の連投対策: 通報者ごとに直近の通報時刻を記録し、最短間隔を強制する
 const chatReportLastAt = new Map();
 const CHAT_REPORT_COOLDOWN_MS = 10 * 60 * 1000; // 通報のクールダウン（10分）
+
+// ── サービス終了 ──
+// 2026年10月20日 午前3時(JST)以降は、全体チャット・DMの新規メッセージをすべて拒否する
+const CHAT_SERVICE_END_AT = Date.parse("2026-10-20T03:00:00+09:00");
+const CHAT_SERVICE_END_MESSAGE = "職人チャットは2026年10/20をもってサービスを終了しました。ご利用ありがとうございました。";
+
+/** サービス終了時刻(JST 2026/10/20 3:00)を過ぎているかどうか */
+function isChatServiceEnded() {
+  return Date.now() >= CHAT_SERVICE_END_AT;
+}
+
+/** 終了後は送信を拒否して終了メッセージを返す。拒否した場合 true */
+function rejectIfChatServiceEnded(res) {
+  if (!isChatServiceEnded()) return false;
+  sendJson(res, 403, {
+    error: CHAT_SERVICE_END_MESSAGE,
+    code: "service_ended",
+    message: CHAT_SERVICE_END_MESSAGE,
+  });
+  return true;
+}
 
 /** 現在が深夜停止時間帯(JST 1:00〜6:00)かどうか */
 function isChatNightMode() {
@@ -1341,6 +1362,7 @@ async function handleChatAPI(req, res) {
 
   // POST /api/chat/send  { text }  （ログイン必須）
   if (req.method === "POST" && pathname === "/api/chat/send") {
+    if (rejectIfChatServiceEnded(res)) return;
     const author = await requireChatAuth(req, res);
     if (!author) return;
     try {
@@ -1415,6 +1437,7 @@ async function handleChatAPI(req, res) {
 
   // POST /api/chat/dm/send  { to, text } （ログイン必須）
   if (req.method === "POST" && pathname === "/api/chat/dm/send") {
+    if (rejectIfChatServiceEnded(res)) return;
     const author = await requireChatAuth(req, res);
     if (!author) return;
     try {
@@ -1826,8 +1849,8 @@ class CloudManager {
       } catch (e) {
         console.error("職人クリーンアップ失敗:", e);
       }
-    }, 3 * 60 * 60 * 1000);
-    console.log("📅 非アクティブ職人クリーンアップ: 3時間ごとに実行");
+    }, 24 * 60 * 60 * 1000);
+    console.log("📅 非アクティブ職人クリーンアップ: 1日ごとに実行");
   }
 
   scheduleLikeFraudDetection() {
@@ -1846,7 +1869,7 @@ class CloudManager {
 
   scheduleChatCleanup() {
     // DBの容量を圧迫しないよう、古いチャットデータを定期的に削除する（1日ごと）
-    const CHAT_RETENTION_DAYS = 40; // 全体チャット・DMの保存期間
+    const CHAT_RETENTION_DAYS = 90; // 全体チャット・DMの保存期間
     const DAU_RETENTION_DAYS  = 30; // 営業日ごとの訪問ユーザー記録の保存期間
     setInterval(async () => {
       try {
@@ -1856,8 +1879,8 @@ class CloudManager {
       } catch (e) {
         console.error("チャットデータクリーンアップ失敗:", e);
       }
-    }, 3 * 60 * 60 * 1000);
-    console.log(`📅 チャットデータクリーンアップ: 3時間ごとに実行（保持期間 ${CHAT_RETENTION_DAYS}日）`);
+    }, 24 * 60 * 60 * 1000);
+    console.log(`📅 チャットデータクリーンアップ: 1日ごとに実行（保持期間 ${CHAT_RETENTION_DAYS}日）`);
   }
 
   async start() {

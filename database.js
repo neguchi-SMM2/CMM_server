@@ -897,7 +897,7 @@ function getEscalationLevel(priorCount) {
 async function countRecentFraudIncidents(author) {
   const since = Math.floor(Date.now() / 1000) - LIKE_FRAUD_REPEAT_WINDOW_DAYS * 24 * 60 * 60;
   const { rows } = await pool.query(
-    "SELECT COUNT(*) FROM like_fraud_incidents WHERE author=$1 AND detected_at >= $2",
+    "SELECT COUNT(*) FROM like_fraud_incidents WHERE author=$1 AND detected_at >= $2 AND action IN ('trim','reset_and_ban')",
     [author, since]
   );
   return parseInt(rows[0].count, 10);
@@ -1955,9 +1955,62 @@ async function purgeSuspiciousLikesForAuthor(author, dryRun = false, onlyUsernam
 // 「この職人の不正分いいねを削除」と同じ処理を自動実行する。
 //   ① その職人名でコース投稿履歴のあるusernameが、いいねしたユーザーの中に3つ以上いる
 //   ② その職人のコースについているいいね総数(likesテーブル内)が6を超えている
+// 削除が行われたら like_fraud_incidents（管理ページの検知履歴）に記録する。
+// さらに、繰り返し検知された職人には以下の措置を取る。
+//   ・全コースのいいね数・プレイ数を0にリセット（likesテーブルの該当いいねも削除）
+//   ・職人登録(maker_accounts)を 'pending' に戻し、チャットのセッションも無効化
+// 「繰り返し」= 過去AUTO_PURGE_REPEAT_WINDOW_DAYS日の間に、検知された日(JST)が
+//   AUTO_PURGE_ESCALATE_DAYS日以上（今回の日を含む）。同じ日に何回検知されても1日と数える。
 // ─────────────────────────────────────────────
-const AUTO_PURGE_POSTED_USERNAME_THRESHOLD = 3; // ①の閾値（以上）
-const AUTO_PURGE_TOTAL_LIKES_THRESHOLD     = 6; // ②の閾値（超えたら）
+const AUTO_PURGE_POSTED_USERNAME_THRESHOLD = 3;  // ①の閾値（以上）
+const AUTO_PURGE_TOTAL_LIKES_THRESHOLD     = 6;  // ②の閾値（超えたら）
+const AUTO_PURGE_REPEAT_WINDOW_DAYS        = 30; // 繰り返し判定の対象期間（日）
+const AUTO_PURGE_ESCALATE_DAYS             = 3;  // この日数以上検知されたら強い措置を取る
+const AUTO_PURGE_ACTION        = "auto_purge";        // 履歴のaction: 不正分の削除のみ
+const AUTO_PURGE_RESET_ACTION  = "auto_purge_reset";  // 履歴のaction: 削除＋リセット＋pending化
+const AUTO_PURGE_COURSE_LABEL  = "(職人単位)";         // 履歴のcourse_id（職人単位の処理のため）
+
+/** 過去AUTO_PURGE_REPEAT_WINDOW_DAYS日以内に、自動削除が検知された「日数」(JST、重複日は1日)を数える */
+async function countAutoPurgeIncidentDays(author) {
+  const since = Math.floor(Date.now() / 1000) - AUTO_PURGE_REPEAT_WINDOW_DAYS * 24 * 60 * 60;
+  const { rows } = await pool.query(
+    `SELECT COUNT(DISTINCT (to_timestamp(detected_at) AT TIME ZONE 'Asia/Tokyo')::date) AS days
+     FROM like_fraud_incidents
+     WHERE author = $1 AND action IN ($2, $3) AND detected_at >= $4`,
+    [author, AUTO_PURGE_ACTION, AUTO_PURGE_RESET_ACTION, since]
+  );
+  return parseInt(rows[0].days, 10);
+}
+
+/**
+ * 繰り返し検知された職人への措置（1トランザクション）:
+ *   ① その職人の全コースの like_count / play_count を0にし、likesテーブルの該当いいねも削除する
+ *   ② maker_accounts の本登録(confirmed)を 'pending' に戻す（職人名が使えなくなる）
+ *   ③ その職人のチャットセッションを削除する
+ */
+async function resetAuthorAndRevoke(author) {
+  const client = await pool.connect();
+  try {
+    await client.query("BEGIN");
+    const { rowCount: likesDeleted } = await client.query(
+      "DELETE FROM likes WHERE course_id IN (SELECT id FROM courses WHERE author = $1)", [author]
+    );
+    const { rowCount: coursesReset } = await client.query(
+      "UPDATE courses SET like_count = 0, play_count = 0 WHERE author = $1", [author]
+    );
+    const { rowCount: accountsRevoked } = await client.query(
+      "UPDATE maker_accounts SET status = 'pending' WHERE author = $1 AND status = 'confirmed'", [author]
+    );
+    await client.query("DELETE FROM chat_sessions WHERE author = $1", [author]);
+    await client.query("COMMIT");
+    return { likesDeleted, coursesReset, accountsRevoked };
+  } catch (e) {
+    await client.query("ROLLBACK").catch(() => {});
+    throw e;
+  } finally {
+    client.release();
+  }
+}
 
 async function autoPurgeSuspiciousLikes() {
   const { rows } = await pool.query(
@@ -1983,17 +2036,42 @@ async function autoPurgeSuspiciousLikes() {
   const results = [];
   for (const r of rows) {
     try {
+      const priorDays = await countAutoPurgeIncidentDays(r.author);
       const stats = await purgeSuspiciousLikesForAuthor(r.author, false, null);
-      if (stats.removed_count > 0) {
-        results.push({
-          author: r.author,
-          removedCount: stats.removed_count,
-          postedAsAuthorCount: stats.posted_as_author_count,
-          noHistoryCount: stats.no_history_count,
-          postedUsernameCount: parseInt(r.posted_username_count, 10),
-          totalLikes: parseInt(r.total_likes, 10),
-        });
+      if (stats.removed_count <= 0) continue;
+
+      // 検知履歴に保存する
+      const { rows: ins } = await pool.query(
+        `INSERT INTO like_fraud_incidents
+           (course_id, author, removed_count, action, disposable_ratio, prior_incident_count)
+         VALUES ($1, $2, $3, $4, NULL, $5)
+         RETURNING id`,
+        [AUTO_PURGE_COURSE_LABEL, r.author, stats.removed_count, AUTO_PURGE_ACTION, priorDays]
+      );
+      const incidentId = ins[0].id;
+
+      // 繰り返し検知された職人には、全コースのいいね・プレイ数リセットと職人名のpending化を行う
+      let escalation = null;
+      const days = await countAutoPurgeIncidentDays(r.author); // 今回の記録を含む
+      if (days >= AUTO_PURGE_ESCALATE_DAYS) {
+        escalation = await resetAuthorAndRevoke(r.author);
+        await pool.query(
+          "UPDATE like_fraud_incidents SET action = $1 WHERE id = $2",
+          [AUTO_PURGE_RESET_ACTION, incidentId]
+        );
       }
+
+      results.push({
+        author: r.author,
+        removedCount: stats.removed_count,
+        postedAsAuthorCount: stats.posted_as_author_count,
+        noHistoryCount: stats.no_history_count,
+        postedUsernameCount: parseInt(r.posted_username_count, 10),
+        totalLikes: parseInt(r.total_likes, 10),
+        incidentDays: days,
+        escalated: !!escalation,
+        escalation,
+      });
     } catch (e) {
       console.error(`不正分いいね自動削除失敗 (author=${r.author}):`, e.message);
     }

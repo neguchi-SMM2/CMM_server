@@ -1897,7 +1897,7 @@ async function listLikersForAuthor(author, limit = 500) {
  * ※対象はlikesテーブルに残っているいいね（約7日分）のみ。
  * ※投稿履歴は現在DBに残っているコースから判定する（削除済みコースの履歴は残らない）。
  */
-async function purgeSuspiciousLikesForAuthor(author, dryRun = false, onlyUsername = null) {
+async function purgeSuspiciousLikesForAuthor(author, dryRun = false, onlyUsername = null, includeNoHistory = true) {
   const client = await pool.connect();
   try {
     await client.query("BEGIN");
@@ -1911,7 +1911,8 @@ async function purgeSuspiciousLikesForAuthor(author, dryRun = false, onlyUsernam
          AND ($2::text IS NULL OR l.username = $2::text)`,
       [author, onlyUsername]
     );
-    const targets = rows.filter(r => r.posted_as_author || r.no_post_history);
+    // includeNoHistory=false のときは、②（投稿履歴のないユーザー名）を削除対象にしない（自動削除用）
+    const targets = rows.filter(r => r.posted_as_author || (includeNoHistory && r.no_post_history));
 
     const stats = {
       author,
@@ -1951,10 +1952,11 @@ async function purgeSuspiciousLikesForAuthor(author, dryRun = false, onlyUsernam
 
 // ─────────────────────────────────────────────
 // 不正分いいねの自動削除（職人単位）
-// 以下のどちらかを満たした職人に対し、管理ページの
-// 「この職人の不正分いいねを削除」と同じ処理を自動実行する。
+// 「その職人名で投稿履歴のあるユーザー名」のいいねについて、以下のどちらかを満たした職人を不正と判定し、
+// 管理ページの「この職人の不正分いいねを削除」と同じ処理（①②とも削除）を自動実行する。
+// ※不正の判定には、投稿履歴のないユーザー名の数・いいね数は一切使わない。
 //   ① その職人名でコース投稿履歴のあるusernameが、いいねしたユーザーの中に3つ以上いる
-//   ② その職人のコースについているいいね総数(likesテーブル内)が6を超えている
+//   ② その職人名でコース投稿履歴のあるusernameからの、いいね総数(likesテーブル内)が6を超えている
 // 削除が行われたら like_fraud_incidents（管理ページの検知履歴）に記録する。
 // さらに、繰り返し検知された職人には以下の措置を取る。
 //   ・全コースのいいね数・プレイ数を0にリセット（likesテーブルの該当いいねも削除）
@@ -2024,11 +2026,11 @@ async function autoPurgeSuspiciousLikes() {
        JOIN courses c ON c.id = l.course_id
      )
      SELECT author,
-            COUNT(*) AS total_likes,
+            COUNT(*) FILTER (WHERE posted_as_author)                 AS posted_like_count,
             COUNT(DISTINCT username) FILTER (WHERE posted_as_author) AS posted_username_count
      FROM l2
      GROUP BY author
-     HAVING COUNT(*) > $1
+     HAVING COUNT(*) FILTER (WHERE posted_as_author) > $1
          OR COUNT(DISTINCT username) FILTER (WHERE posted_as_author) >= $2`,
     [AUTO_PURGE_TOTAL_LIKES_THRESHOLD, AUTO_PURGE_POSTED_USERNAME_THRESHOLD]
   );
@@ -2037,6 +2039,7 @@ async function autoPurgeSuspiciousLikes() {
   for (const r of rows) {
     try {
       const priorDays = await countAutoPurgeIncidentDays(r.author);
+      // 不正と判定した後の削除は、手動ボタンと同じ（①投稿履歴ありユーザー名 と ②投稿履歴なしユーザー名 の両方）
       const stats = await purgeSuspiciousLikesForAuthor(r.author, false, null);
       if (stats.removed_count <= 0) continue;
 
@@ -2067,7 +2070,7 @@ async function autoPurgeSuspiciousLikes() {
         postedAsAuthorCount: stats.posted_as_author_count,
         noHistoryCount: stats.no_history_count,
         postedUsernameCount: parseInt(r.posted_username_count, 10),
-        totalLikes: parseInt(r.total_likes, 10),
+        postedLikeCount: parseInt(r.posted_like_count, 10),
         incidentDays: days,
         escalated: !!escalation,
         escalation,

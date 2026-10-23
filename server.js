@@ -1868,7 +1868,7 @@ class CloudManager {
       try {
         const purged = await db.autoPurgeSuspiciousLikes();
         for (const r of purged) {
-          console.log(`🧹 不正分いいね自動削除: author=${r.author} removed=${r.removedCount} (投稿履歴あり=${r.postedAsAuthorCount}, 履歴なし=${r.noHistoryCount}, 投稿者名数=${r.postedUsernameCount}, 総いいね=${r.totalLikes}, 検知日数=${r.incidentDays})`);
+          console.log(`🧹 不正分いいね自動削除: author=${r.author} removed=${r.removedCount} (投稿履歴あり=${r.postedAsAuthorCount}, 履歴なし=${r.noHistoryCount}, 投稿者名数=${r.postedUsernameCount}, 投稿履歴ありユーザーのいいね=${r.postedLikeCount}, 検知日数=${r.incidentDays})`);
           if (r.escalated) {
             console.log(`⛔ 繰り返し検知のため措置: author=${r.author} 全コースのいいね/プレイ数リセット(${r.escalation.coursesReset}コース, いいね${r.escalation.likesDeleted}件削除), 職人登録をpendingに(${r.escalation.accountsRevoked}件)`);
           }

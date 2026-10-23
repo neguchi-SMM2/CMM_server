@@ -1863,8 +1863,18 @@ class CloudManager {
       } catch (e) {
         console.error("不正いいね検知処理失敗:", e);
       }
+
+      // 職人別の不正分いいね自動削除（管理ページの「この職人の不正分いいねを削除」と同じ処理）
+      try {
+        const purged = await db.autoPurgeSuspiciousLikes();
+        for (const r of purged) {
+          console.log(`🧹 不正分いいね自動削除: author=${r.author} removed=${r.removedCount} (投稿履歴あり=${r.postedAsAuthorCount}, 履歴なし=${r.noHistoryCount}, 投稿者名数=${r.postedUsernameCount}, 総いいね=${r.totalLikes})`);
+        }
+      } catch (e) {
+        console.error("不正分いいね自動削除失敗:", e);
+      }
     }, 10 * 60 * 1000);
-    console.log("📅 不正いいね検知: 10分ごとに実行");
+    console.log("📅 不正いいね検知・不正分いいね自動削除: 10分ごとに実行");
   }
 
   scheduleChatCleanup() {

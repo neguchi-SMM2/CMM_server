@@ -1949,6 +1949,58 @@ async function purgeSuspiciousLikesForAuthor(author, dryRun = false, onlyUsernam
   }
 }
 
+// ─────────────────────────────────────────────
+// 不正分いいねの自動削除（職人単位）
+// 以下のどちらかを満たした職人に対し、管理ページの
+// 「この職人の不正分いいねを削除」と同じ処理を自動実行する。
+//   ① その職人名でコース投稿履歴のあるusernameが、いいねしたユーザーの中に3つ以上いる
+//   ② その職人のコースについているいいね総数(likesテーブル内)が6を超えている
+// ─────────────────────────────────────────────
+const AUTO_PURGE_POSTED_USERNAME_THRESHOLD = 3; // ①の閾値（以上）
+const AUTO_PURGE_TOTAL_LIKES_THRESHOLD     = 6; // ②の閾値（超えたら）
+
+async function autoPurgeSuspiciousLikes() {
+  const { rows } = await pool.query(
+    `WITH l2 AS (
+       SELECT c.author, l.username,
+              EXISTS (
+                SELECT 1 FROM courses o
+                WHERE o.author = c.author AND o.username = l.username
+              ) AS posted_as_author
+       FROM likes l
+       JOIN courses c ON c.id = l.course_id
+     )
+     SELECT author,
+            COUNT(*) AS total_likes,
+            COUNT(DISTINCT username) FILTER (WHERE posted_as_author) AS posted_username_count
+     FROM l2
+     GROUP BY author
+     HAVING COUNT(*) > $1
+         OR COUNT(DISTINCT username) FILTER (WHERE posted_as_author) >= $2`,
+    [AUTO_PURGE_TOTAL_LIKES_THRESHOLD, AUTO_PURGE_POSTED_USERNAME_THRESHOLD]
+  );
+
+  const results = [];
+  for (const r of rows) {
+    try {
+      const stats = await purgeSuspiciousLikesForAuthor(r.author, false, null);
+      if (stats.removed_count > 0) {
+        results.push({
+          author: r.author,
+          removedCount: stats.removed_count,
+          postedAsAuthorCount: stats.posted_as_author_count,
+          noHistoryCount: stats.no_history_count,
+          postedUsernameCount: parseInt(r.posted_username_count, 10),
+          totalLikes: parseInt(r.total_likes, 10),
+        });
+      }
+    } catch (e) {
+      console.error(`不正分いいね自動削除失敗 (author=${r.author}):`, e.message);
+    }
+  }
+  return results;
+}
+
 module.exports = {
   initDB, pool,
   saveCourse, getCourseById,
@@ -1982,4 +2034,5 @@ module.exports = {
   listCoursesByDisposableLikers,
   getRecommendedCourses,
   listAuthorLikerSummary, listLikersForAuthor, purgeSuspiciousLikesForAuthor,
+  autoPurgeSuspiciousLikes,
 };

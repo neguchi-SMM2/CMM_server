@@ -23,6 +23,8 @@
     .btn-warn:hover { background: #b45309; }
     .btn-neutral { background: #334155; color: #e2e8f0; }
     .btn-neutral:hover { background: #475569; }
+    .btn-ok { background: #15803d; color: #fff; }
+    .btn-ok:hover { background: #166534; }
     .msg { margin-top: 0.75rem; font-size: 0.85rem; padding: 0.5rem 0.75rem; border-radius: 6px; display: none; }
     .msg.ok  { background: #14532d; color: #86efac; display: block; }
     .msg.err { background: #7f1d1d; color: #fca5a5; display: block; }
@@ -31,6 +33,9 @@
     th { color: #94a3b8; font-weight: 600; white-space: nowrap; }
     td.actions { display: flex; gap: 0.5rem; }
     td.actions button { margin-top: 0; width: auto; padding: 0.4rem 0.8rem; font-size: 0.85rem; }
+    td button.small { margin-top: 0; width: auto; padding: 0.35rem 0.7rem; font-size: 0.8rem; }
+    tr.detail-row > td { background: #0f172a; padding: 0.75rem 1rem; }
+    tr.detail-row table { margin-top: 0.25rem; }
     .empty { color: #64748b; font-size: 0.9rem; margin-top: 1rem; }
     .table-wrap { overflow-x: auto; -webkit-overflow-scrolling: touch; }
   </style>
@@ -117,6 +122,11 @@
         重大判定の基準を厳しくし、BAN期間も長くします（1回目:50件以上で7日, 2回目:20件以上で14日,
         3回目以降:10件以上またはどんな規模でも即BAN・30日）。
       </p>
+      <p style="font-size:0.85rem;color:#94a3b8;margin-bottom:0.75rem;">
+        自動削除したいいねは30日間バックアップされ、「内訳・復元」から履歴ごと・ユーザー名ごとに復元できます。
+        復元したいいねは、以後の自動検知・自動削除の対象から外れます。
+        なお、職人への措置（全コースのいいね/プレイ数リセット・職人登録のpending化）は復元されません。
+      </p>
       <button class="btn-neutral" onclick="loadFraudIncidents()">履歴を読み込む</button>
       <button class="btn-warn" onclick="scanFraudNow()">今すぐ検知を実行</button>
       <div id="fraud-msg" class="msg"></div>
@@ -124,7 +134,7 @@
       <div class="table-wrap">
         <table id="fraud-table" style="display:none;">
           <thead>
-            <tr><th>コースID</th><th>職人</th><th>削除件数</th><th>使い捨て比率</th><th>通算回数</th><th>対応</th><th>BAN日数</th><th>検知日時</th></tr>
+            <tr><th>コースID</th><th>職人</th><th>削除件数</th><th>使い捨て比率</th><th>通算回数</th><th>対応</th><th>BAN日数</th><th>検知日時</th><th>復元</th></tr>
           </thead>
           <tbody id="fraud-tbody"></tbody>
         </table>
@@ -301,7 +311,8 @@
       <div id="liker-detail" style="display:none;margin-top:1.5rem;">
         <h2 id="liker-detail-title" style="margin-bottom:0.25rem;"></h2>
         <p style="font-size:0.85rem;color:#94a3b8;margin:0.5rem 0;">
-          「削除対象」は、①この職人名で投稿したことがあるユーザー名、②どの職人名でも投稿履歴がないユーザー名、のいずれかです。
+          「削除対象」は、①この職人名で投稿したことがあるユーザー名、②どの職人名でも投稿履歴がないユーザー名、
+          ③この職人名の持ち主（この職人名で投稿したユーザー名）と共通の職人名で投稿しているユーザー名（「関連」）、のいずれかです。
           ボタンを押すと、この職人のコースについた該当ユーザー名のいいねを削除し、いいね数も同じ件数だけ減らします（実行前に件数を確認できます）。
         </p>
         <button class="btn-danger" style="margin-top:0.5rem;width:auto;padding:0.6rem 1.2rem;" onclick="purgeAuthorLikes()">この職人の不正分いいねを削除</button>
@@ -486,9 +497,15 @@
     const FRAUD_ACTION_LABELS = {
       trim: "不正分のみ削除",
       reset_and_ban: "いいね数リセット＋職人BAN",
+      auto_purge: "不正分いいね自動削除（職人単位）",
+      auto_purge_reset: "不正分削除＋全コースいいね/プレイ数リセット＋職人登録をpending化",
+      auto_dup_like: "重複いいね自動削除（共通の職人名のユーザー名）",
     };
 
-    async function loadFraudIncidents() {
+    // 内訳を開いている履歴ID（再読み込み後も開いたままにする）
+    let openIncidentId = null;
+
+    async function loadFraudIncidents(reopenId) {
       const data = await apiGet("/api/like-fraud-incidents", "fraud-msg");
       if (!data) return;
       if (!data.ok) { showMsg("fraud-msg", data.error || "取得に失敗しました", false); return; }
@@ -509,10 +526,17 @@
 
       for (const inc of data.incidents) {
         const tr = document.createElement("tr");
+        tr.dataset.incidentId = inc.id;
         const ratioText = inc.disposable_ratio !== null && inc.disposable_ratio !== undefined
           ? Math.round(inc.disposable_ratio * 100) + "%"
           : "-";
         const banDaysText = inc.ban_days ? inc.ban_days + "日" : "-";
+        const backup = parseInt(inc.backup_count, 10) || 0;
+        const restored = parseInt(inc.restored_count, 10) || 0;
+        const restoreCell = backup > 0
+          ? `<span style="color:#94a3b8;font-size:0.8rem;white-space:nowrap;">復元済み ${restored}/${backup}</span>
+             <button class="btn-neutral small" data-detail="${inc.id}">内訳・復元</button>`
+          : `<span style="color:#64748b;font-size:0.8rem;">バックアップなし</span>`;
         tr.innerHTML = `
           <td>${escapeHtml(inc.course_id)}</td>
           <td>${escapeHtml(inc.author)}</td>
@@ -522,9 +546,86 @@
           <td>${FRAUD_ACTION_LABELS[inc.action] || escapeHtml(inc.action)}</td>
           <td>${banDaysText}</td>
           <td>${formatDetectedAt(inc.detected_at)}</td>
+          <td>${restoreCell}</td>
         `;
         tbody.appendChild(tr);
+        const detailBtn = tr.querySelector("button[data-detail]");
+        if (detailBtn) detailBtn.addEventListener("click", () => toggleIncidentDetail(inc.id, tr));
       }
+
+      if (reopenId) {
+        const tr = tbody.querySelector(`tr[data-incident-id="${reopenId}"]`);
+        if (tr) await toggleIncidentDetail(reopenId, tr, true);
+      }
+    }
+
+    // 履歴1件で削除したいいねの内訳（ユーザー名ごと）を、その行の下に開閉表示する
+    async function toggleIncidentDetail(incidentId, tr, forceOpen) {
+      const next = tr.nextElementSibling;
+      if (next && next.classList.contains("detail-row")) {
+        next.remove();
+        if (!forceOpen) { openIncidentId = null; return; }
+      }
+      const data = await apiGet("/api/like-fraud-incident-likes?id=" + encodeURIComponent(incidentId), "fraud-msg");
+      if (!data) return;
+      if (!data.ok) { showMsg("fraud-msg", data.error || "取得に失敗しました", false); return; }
+      openIncidentId = incidentId;
+
+      const detail = document.createElement("tr");
+      detail.className = "detail-row";
+      const td = document.createElement("td");
+      td.colSpan = 9;
+      const unrestored = data.users.reduce((sum, u) => sum + (u.total - u.restored), 0);
+      let html = `<div style="display:flex;justify-content:space-between;align-items:center;gap:1rem;flex-wrap:wrap;">
+          <span style="font-size:0.85rem;color:#94a3b8;">削除したいいね ${data.users.reduce((s, u) => s + u.total, 0)} 件のうち、未復元 ${unrestored} 件</span>
+          <button class="btn-ok small" id="restore-all-btn" ${unrestored === 0 ? "disabled" : ""}>すべて復元</button>
+        </div>
+        <table>
+          <thead><tr><th>ユーザー名</th><th>削除したいいね数</th><th>コース数</th><th>復元済み</th><th>操作</th></tr></thead>
+          <tbody>`;
+      for (const u of data.users) {
+        const left = u.total - u.restored;
+        html += `<tr>
+          <td>${escapeHtml(u.username)}</td>
+          <td>${u.total}</td>
+          <td>${u.courses}</td>
+          <td>${u.restored}/${u.total}</td>
+          <td>${left > 0 ? `<button class="btn-ok small" data-user="${escapeHtml(u.username)}">このユーザー名を復元</button>` : `<span style="color:#64748b;">-</span>`}</td>
+        </tr>`;
+      }
+      html += `</tbody></table>`;
+      td.innerHTML = html;
+      detail.appendChild(td);
+      tr.after(detail);
+
+      const allBtn = td.querySelector("#restore-all-btn");
+      if (allBtn) allBtn.addEventListener("click", () => restoreLikes(incidentId, null));
+      td.querySelectorAll("button[data-user]").forEach(btn => {
+        btn.addEventListener("click", () => restoreLikes(incidentId, btn.dataset.user));
+      });
+    }
+
+    // 自動削除したいいねを復元する（username 省略 = この履歴で削除したぶんすべて）
+    async function restoreLikes(incidentId, username) {
+      const target = username ? `${username} のいいね` : "この履歴で削除したいいねすべて";
+      const ok = confirm(
+        `${target}を復元します。\n\n` +
+        `・元のいいねを戻し、いいね数も戻した件数だけ増やします\n` +
+        `・復元したいいねは、今後の自動検知・自動削除の対象から外れます\n\n` +
+        `実行しますか？`
+      );
+      if (!ok) return;
+      const body = { incidentId, _msgId: "fraud-msg" };
+      if (username) body.username = username;
+      const data = await apiFetch("/api/restore-likes", body);
+      if (!data) return;
+      if (!data.ok) { showMsg("fraud-msg", data.error || "エラーが発生しました", false); return; }
+      const r = data.result;
+      await loadFraudIncidents(incidentId);
+      let text = `復元しました（${r.restored_count}件）`;
+      if (r.already_exists_count > 0) text += ` / 既に同じいいねがあったため戻さなかったもの ${r.already_exists_count}件`;
+      if (r.missing_course_count > 0) text += ` / コースが削除済みで戻せなかったもの ${r.missing_course_count}件`;
+      showMsg("fraud-msg", text, true);
     }
 
     async function scanFraudNow() {
@@ -772,13 +873,19 @@
         return;
       }
 
+      let reasonForUser;
+      if (p.posted_as_author_count > 0) reasonForUser = `理由: このユーザー名は ${author} の名前で投稿したことがあります`;
+      else if (p.linked_count > 0) reasonForUser = `理由: このユーザー名は ${author} の持ち主と共通の職人名で投稿しています`;
+      else reasonForUser = "理由: このユーザー名には投稿履歴がありません";
       const reasons = username
-        ? (p.posted_as_author_count > 0 ? `理由: このユーザー名は ${author} の名前で投稿したことがあります` : "理由: このユーザー名には投稿履歴がありません")
-        : `・この職人名で投稿したユーザー名のいいね: ${p.posted_as_author_count} 件\n・投稿履歴がないユーザー名のいいね: ${p.no_history_count} 件`;
+        ? reasonForUser
+        : `・この職人名で投稿したユーザー名のいいね: ${p.posted_as_author_count} 件\n` +
+          `・持ち主と共通の職人名で投稿しているユーザー名のいいね: ${p.linked_count || 0} 件\n` +
+          `・投稿履歴がないユーザー名のいいね: ${p.no_history_count} 件`;
       const ok = confirm(
         `${target}いいね ${p.total_likes} 件のうち、${p.removed_count} 件（${p.user_count}ユーザー名 / ${p.course_count}コース）を削除します。\n\n` +
         `${reasons}\n\n` +
-        `いいね数も同じ件数だけ減らします。この操作は取り消せません。実行しますか？`
+        `いいね数も同じ件数だけ減らします。この操作は取り消せません（手動削除は復元の対象外です）。実行しますか？`
       );
       if (!ok) return;
 
@@ -866,14 +973,22 @@
           ? `<span style="background:#7f1d1d;color:#fca5a5;padding:0.15rem 0.5rem;border-radius:999px;font-size:0.75rem;white-space:nowrap;">使い捨て</span>`
           : "";
         const posted = l.posted_authors || [];
-        const isPurgeTarget = posted.includes(author) || posted.length === 0;
+        // 関連: この職人名の持ち主と、共通の職人名で投稿している（本人が持ち主なら①なので関連とは表示しない）
+        const linked = !!l.linked_to_owner && !posted.includes(author);
+        const linkedBadge = linked
+          ? `<span style="background:#1e3a8a;color:#93c5fd;padding:0.15rem 0.5rem;border-radius:999px;font-size:0.75rem;white-space:nowrap;">関連</span>`
+          : "";
+        const isPurgeTarget = posted.includes(author) || posted.length === 0 || !!l.linked_to_owner;
         const purgeBadge = isPurgeTarget
           ? `<span style="background:#78350f;color:#fcd34d;padding:0.15rem 0.5rem;border-radius:999px;font-size:0.75rem;white-space:nowrap;">削除対象</span>`
           : "";
-        const label = `${disposableBadge} ${purgeBadge}`;
-        const authorsCell = l.posted_authors && l.posted_authors.length
+        const label = `${disposableBadge} ${linkedBadge} ${purgeBadge}`;
+        let authorsCell = l.posted_authors && l.posted_authors.length
           ? l.posted_authors.map(a => escapeHtml(a)).join(", ")
           : `<span style="color:#64748b;">-</span>`;
+        if (l.linked_via && l.linked_via.length) {
+          authorsCell += `<div style="color:#93c5fd;font-size:0.75rem;">持ち主と共通: ${l.linked_via.map(a => escapeHtml(a)).join(", ")}</div>`;
+        }
         tr.innerHTML = `
           <td>${escapeHtml(l.username)}</td>
           <td>${label}</td>

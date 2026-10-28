@@ -1198,6 +1198,51 @@ async function handleManageAPI(req, res) {
     return;
   }
 
+  // GET /api/like-fraud-incident-likes?id=N (検知履歴1件で削除したいいねの、ユーザー名ごとの内訳)
+  if (req.method === "GET" && pathname === "/api/like-fraud-incident-likes") {
+    try {
+      const id = parseInt(url.searchParams.get("id") || "", 10);
+      if (!Number.isInteger(id)) {
+        res.writeHead(400, { "Content-Type": "application/json" });
+        res.end(JSON.stringify({ error: "id は必須です" }));
+        return;
+      }
+      const users = await db.listIncidentDeletedLikes(id);
+      res.writeHead(200, { "Content-Type": "application/json" });
+      res.end(JSON.stringify({ ok: true, users }));
+    } catch (e) {
+      res.writeHead(500, { "Content-Type": "application/json" });
+      res.end(JSON.stringify({ error: e.message }));
+    }
+    return;
+  }
+
+  // POST /api/restore-likes { incidentId, username? }
+  // 自動削除したいいねを復元する。username を指定するとそのユーザー名のぶんだけ復元する。
+  if (req.method === "POST" && pathname === "/api/restore-likes") {
+    let body = "";
+    req.on("data", d => body += d);
+    req.on("end", async () => {
+      try {
+        const { incidentId, username } = JSON.parse(body);
+        if (!Number.isInteger(incidentId)) {
+          res.writeHead(400, { "Content-Type": "application/json" });
+          res.end(JSON.stringify({ error: "incidentId は必須です" }));
+          return;
+        }
+        const onlyUsername = isValidStr(username) ? username : null;
+        const result = await db.restoreDeletedLikes(incidentId, onlyUsername);
+        console.log(`♻️ 自動削除したいいねを復元: incident=${incidentId}${onlyUsername ? " username=" + onlyUsername : ""} restored=${result.restored_count}`);
+        res.writeHead(200, { "Content-Type": "application/json" });
+        res.end(JSON.stringify({ ok: true, result }));
+      } catch (e) {
+        res.writeHead(500, { "Content-Type": "application/json" });
+        res.end(JSON.stringify({ error: e.message }));
+      }
+    });
+    return;
+  }
+
   res.writeHead(404, { "Content-Type": "application/json" });
   res.end(JSON.stringify({ error: "not found" }));
 }
@@ -1868,13 +1913,23 @@ class CloudManager {
       try {
         const purged = await db.autoPurgeSuspiciousLikes();
         for (const r of purged) {
-          console.log(`🧹 不正分いいね自動削除: author=${r.author} removed=${r.removedCount} (投稿履歴あり=${r.postedAsAuthorCount}, 履歴なし=${r.noHistoryCount}, 投稿者名数=${r.postedUsernameCount}, 投稿履歴ありユーザーのいいね=${r.postedLikeCount}, 検知日数=${r.incidentDays})`);
+          console.log(`🧹 不正分いいね自動削除: author=${r.author} removed=${r.removedCount} (投稿履歴あり=${r.postedAsAuthorCount}, 関連ユーザー=${r.linkedCount}, 履歴なし=${r.noHistoryCount}, 不正判定ユーザー名数=${r.suspiciousUsernameCount}(投稿履歴あり${r.postedUsernameCount}+関連${r.linkedUsernameCount}), 不正判定ユーザーのいいね=${r.suspiciousLikeCount}, 検知日数=${r.incidentDays})`);
           if (r.escalated) {
             console.log(`⛔ 繰り返し検知のため措置: author=${r.author} 全コースのいいね/プレイ数リセット(${r.escalation.coursesReset}コース, いいね${r.escalation.likesDeleted}件削除), 職人登録をpendingに(${r.escalation.accountsRevoked}件)`);
           }
         }
       } catch (e) {
         console.error("不正分いいね自動削除失敗:", e);
+      }
+
+      // 重複いいね（共通の職人名で投稿しているユーザー名が、同じコースにいいね）の自動削除
+      try {
+        const dups = await db.autoPurgeDuplicateLikes();
+        for (const r of dups) {
+          console.log(`🧹 重複いいね自動削除: author=${r.author} removed=${r.removedCount} (${r.courseCount}コース / ${r.userCount}ユーザー名)`);
+        }
+      } catch (e) {
+        console.error("重複いいね自動削除失敗:", e);
       }
     }, 10 * 60 * 1000);
     console.log("📅 不正いいね検知・不正分いいね自動削除: 10分ごとに実行");
@@ -1884,11 +1939,13 @@ class CloudManager {
     // DBの容量を圧迫しないよう、古いチャットデータを定期的に削除する（1日ごと）
     const CHAT_RETENTION_DAYS = 90; // 全体チャット・DMの保存期間
     const DAU_RETENTION_DAYS  = 30; // 営業日ごとの訪問ユーザー記録の保存期間
+    const DELETED_LIKES_RETENTION_DAYS = 30; // 自動削除したいいねのバックアップ（復元できる期間）
     setInterval(async () => {
       try {
         await db.deleteOldChatMessages(CHAT_RETENTION_DAYS);
         await db.cleanupOldDailyUsage();
         await db.cleanupOldDailyActiveUsers(DAU_RETENTION_DAYS);
+        await db.cleanupOldDeletedLikes(DELETED_LIKES_RETENTION_DAYS);
       } catch (e) {
         console.error("チャットデータクリーンアップ失敗:", e);
       }

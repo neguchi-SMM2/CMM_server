@@ -46,6 +46,8 @@ async function initDB() {
     );
     ALTER TABLE likes ADD COLUMN IF NOT EXISTS
       created_at BIGINT NOT NULL DEFAULT EXTRACT(EPOCH FROM NOW())::BIGINT;
+    -- 管理者が復元したいいね。自動検知・自動削除の対象から外す
+    ALTER TABLE likes ADD COLUMN IF NOT EXISTS protected BOOLEAN NOT NULL DEFAULT FALSE;
 
     CREATE TABLE IF NOT EXISTS notifications (
       username   TEXT    PRIMARY KEY,
@@ -219,6 +221,22 @@ async function initDB() {
     ALTER TABLE like_fraud_incidents ADD COLUMN IF NOT EXISTS prior_incident_count INT NOT NULL DEFAULT 0;
     ALTER TABLE like_fraud_incidents ADD COLUMN IF NOT EXISTS ban_days INT;
     CREATE INDEX IF NOT EXISTS idx_fraud_detected ON like_fraud_incidents(detected_at DESC);
+
+    -- 自動削除したいいねのバックアップ（管理ページから復元できるようにする）
+    CREATE TABLE IF NOT EXISTS deleted_likes (
+      id          SERIAL  PRIMARY KEY,
+      incident_id INT,
+      author      TEXT    NOT NULL,
+      course_id   TEXT    NOT NULL,
+      username    TEXT    NOT NULL,
+      liked_at    BIGINT  NOT NULL,
+      deleted_at  BIGINT  NOT NULL DEFAULT EXTRACT(EPOCH FROM NOW())::BIGINT,
+      source      TEXT    NOT NULL,
+      restored    BOOLEAN NOT NULL DEFAULT FALSE,
+      restored_at BIGINT
+    );
+    CREATE INDEX IF NOT EXISTS idx_deleted_likes_incident ON deleted_likes(incident_id);
+    CREATE INDEX IF NOT EXISTS idx_deleted_likes_deleted_at ON deleted_likes(deleted_at);
 
     -- 管理ページで設定する「使用不可CMD」
     CREATE TABLE IF NOT EXISTS disabled_cmds (
@@ -938,7 +956,7 @@ async function detectAndCleanSuspiciousLikes() {
   const since = Math.floor(Date.now() / 1000) - LIKE_FRAUD_LOOKBACK_HOURS * 3600;
   const { rows } = await pool.query(
     `SELECT id, username, course_id, created_at FROM likes
-     WHERE created_at >= $1
+     WHERE created_at >= $1 AND NOT protected
      ORDER BY course_id, created_at ASC`,
     [since]
   );
@@ -1001,6 +1019,7 @@ async function detectAndCleanSuspiciousLikes() {
     const isExtreme = size >= escalation.extremeSize || escalation.alwaysBan;
 
     // 不正と判定したいいねを削除する
+    const backupIds = (await backupLikes(pool, ids, "burst")).map(b => b.id);
     await pool.query("DELETE FROM likes WHERE id = ANY($1::int[])", [ids]);
 
     // ②のため未計算だった場合（通常基準で確定した塊）も、記録用に比率を算出しておく
@@ -1021,12 +1040,14 @@ async function detectAndCleanSuspiciousLikes() {
         `不正いいね自動検知（${size}件、通算${priorCount + 1}回目の検知）`
       );
 
-      await pool.query(
+      const { rows: incRows } = await pool.query(
         `INSERT INTO like_fraud_incidents
            (course_id, author, removed_count, action, disposable_ratio, prior_incident_count, ban_days)
-         VALUES ($1, $2, $3, $4, $5, $6, $7)`,
+         VALUES ($1, $2, $3, $4, $5, $6, $7)
+         RETURNING id`,
         [courseId, author, size, "reset_and_ban", finalDisposableRatio, priorCount, banDays]
       );
+      await linkBackupsToIncident(incRows[0].id, backupIds);
       results.push({ courseId, author, removedCount: size, action: "reset_and_ban", priorCount, banDays });
     } else {
       // 通常の不正: 不正分だけ差し引く
@@ -1034,12 +1055,14 @@ async function detectAndCleanSuspiciousLikes() {
         "UPDATE courses SET like_count = GREATEST(like_count - $1, 0) WHERE id=$2",
         [size, courseId]
       );
-      await pool.query(
+      const { rows: incRows } = await pool.query(
         `INSERT INTO like_fraud_incidents
            (course_id, author, removed_count, action, disposable_ratio, prior_incident_count)
-         VALUES ($1, $2, $3, $4, $5, $6)`,
+         VALUES ($1, $2, $3, $4, $5, $6)
+         RETURNING id`,
         [courseId, author, size, "trim", finalDisposableRatio, priorCount]
       );
+      await linkBackupsToIncident(incRows[0].id, backupIds);
       results.push({ courseId, author, removedCount: size, action: "trim", priorCount, banDays: null });
     }
   }
@@ -1050,8 +1073,10 @@ async function detectAndCleanSuspiciousLikes() {
 /** 不正いいね検知の履歴一覧（管理ページ表示用） */
 async function listLikeFraudIncidents(limit = 100) {
   const { rows } = await pool.query(
-    `SELECT id, course_id, author, removed_count, action, disposable_ratio, prior_incident_count, ban_days, detected_at
-     FROM like_fraud_incidents ORDER BY detected_at DESC LIMIT $1`,
+    `SELECT i.id, i.course_id, i.author, i.removed_count, i.action, i.disposable_ratio, i.prior_incident_count, i.ban_days, i.detected_at,
+            (SELECT COUNT(*) FROM deleted_likes d WHERE d.incident_id = i.id)                  AS backup_count,
+            (SELECT COUNT(*) FROM deleted_likes d WHERE d.incident_id = i.id AND d.restored)   AS restored_count
+     FROM like_fraud_incidents i ORDER BY i.detected_at DESC LIMIT $1`,
     [limit]
   );
   return rows;
@@ -1870,7 +1895,12 @@ async function listLikersForAuthor(author, limit = 500) {
      SELECT k.username, k.course_count, k.last_liked_at,
             (SELECT COUNT(*) FROM likes x WHERE x.username = k.username) AS total_likes,
             (SELECT COALESCE(array_agg(DISTINCT c2.author ORDER BY c2.author), '{}')
-               FROM courses c2 WHERE c2.username = k.username)            AS posted_authors
+               FROM courses c2 WHERE c2.username = k.username)            AS posted_authors,
+            (SELECT COALESCE(array_agg(DISTINCT cu.author ORDER BY cu.author), '{}')
+               FROM courses cu
+               JOIN courses cv ON cv.author = cu.author AND cv.username <> cu.username
+               JOIN courses co ON co.username = cv.username AND co.author = $1
+              WHERE cu.username = k.username AND cu.author <> $1)             AS linked_via
      FROM likers k
      ORDER BY k.course_count DESC, k.last_liked_at DESC`,
     [author, limit]
@@ -1882,14 +1912,23 @@ async function listLikersForAuthor(author, limit = 500) {
     total_likes: parseInt(r.total_likes, 10),
     is_disposable: parseInt(r.total_likes, 10) === 1,
     posted_authors: r.posted_authors || [],
+    // 持ち主と共通で投稿している職人名（関連ユーザー判定の根拠）
+    linked_via: r.linked_via || [],
+    linked_to_owner: (r.linked_via || []).length >= AUTO_LINK_MIN_SHARED_AUTHORS,
   }));
 }
+
+// 「関連ユーザー」判定: いいねしたユーザー名Uが、その職人Aの持ち主（Aの名前でコースを投稿したユーザー名V、U以外）と
+// 「共通の職人名B（A以外）」で投稿していれば、UはAの持ち主と同一人物・グループの可能性が高いとみなす。
+// 共通の職人名が何個以上あれば関連とみなすか（1なら共通の職人名が1つでもあれば関連）
+const AUTO_LINK_MIN_SHARED_AUTHORS = 1;
 
 /**
  * 指定した職人のコースについた「不正分」のいいねを手動で削除する（管理ページ用）。
  * 削除対象:
  *   ① その職人名で投稿したことがあるユーザー名からのいいね（自作自演）
  *   ② どの職人名でも投稿履歴がない（coursesに一度も現れない）ユーザー名からのいいね
+ *   ③ 関連ユーザー: その職人名の持ち主と、共通の職人名で投稿しているユーザー名からのいいね
  * 削除したぶん、該当コースの courses.like_count も同じ件数だけ減らす（0未満にはしない）。
  * dryRun=true のときは件数だけ返し、何も削除しない。
  * onlyUsername を渡すと、そのユーザー名のいいねだけを対象にする（ユーザー名ごとの削除）。
@@ -1897,22 +1936,30 @@ async function listLikersForAuthor(author, limit = 500) {
  * ※対象はlikesテーブルに残っているいいね（約7日分）のみ。
  * ※投稿履歴は現在DBに残っているコースから判定する（削除済みコースの履歴は残らない）。
  */
-async function purgeSuspiciousLikesForAuthor(author, dryRun = false, onlyUsername = null, includeNoHistory = true) {
+async function purgeSuspiciousLikesForAuthor(author, dryRun = false, onlyUsername = null, includeNoHistory = true, options = {}) {
+  // options.source を指定したとき（自動削除）だけ、削除前にバックアップを取る。skipProtected=true なら復元済みいいねは対象外
+  const { source = null, skipProtected = false } = options;
   const client = await pool.connect();
   try {
     await client.query("BEGIN");
     const { rows } = await client.query(
       `SELECT l.id, l.course_id, l.username,
               EXISTS (SELECT 1 FROM courses o WHERE o.author = $1 AND o.username = l.username) AS posted_as_author,
-              NOT EXISTS (SELECT 1 FROM courses p WHERE p.username = l.username)               AS no_post_history
+              NOT EXISTS (SELECT 1 FROM courses p WHERE p.username = l.username)               AS no_post_history,
+              (SELECT COUNT(DISTINCT cu.author)
+                 FROM courses cu
+                 JOIN courses cv ON cv.author = cu.author AND cv.username <> cu.username
+                 JOIN courses co ON co.username = cv.username AND co.author = $1
+                WHERE cu.username = l.username AND cu.author <> $1) >= $3::int AS linked_to_owner
        FROM likes l
        JOIN courses c ON c.id = l.course_id
        WHERE c.author = $1
-         AND ($2::text IS NULL OR l.username = $2::text)`,
-      [author, onlyUsername]
+         AND ($2::text IS NULL OR l.username = $2::text)
+         AND (NOT $4::boolean OR NOT l.protected)`,
+      [author, onlyUsername, AUTO_LINK_MIN_SHARED_AUTHORS, skipProtected]
     );
     // includeNoHistory=false のときは、②（投稿履歴のないユーザー名）を削除対象にしない（自動削除用）
-    const targets = rows.filter(r => r.posted_as_author || (includeNoHistory && r.no_post_history));
+    const targets = rows.filter(r => r.posted_as_author || r.linked_to_owner || (includeNoHistory && r.no_post_history));
 
     const stats = {
       author,
@@ -1921,12 +1968,15 @@ async function purgeSuspiciousLikesForAuthor(author, dryRun = false, onlyUsernam
       total_likes: rows.length,                                              // この職人のコースについているいいね(likesテーブル内)
       removed_count: targets.length,                                         // 削除対象(削除した)件数
       posted_as_author_count: targets.filter(r => r.posted_as_author).length, // ①の件数
-      no_history_count: targets.filter(r => !r.posted_as_author).length,      // ②の件数
+      linked_count: targets.filter(r => !r.posted_as_author && r.linked_to_owner).length, // ③の件数
+      no_history_count: targets.filter(r => !r.posted_as_author && !r.linked_to_owner).length, // ②の件数
       user_count: new Set(targets.map(r => r.username)).size,
       course_count: new Set(targets.map(r => r.course_id)).size,
     };
 
+    let backupIds = [];
     if (!dryRun && targets.length > 0) {
+      if (source) backupIds = (await backupLikes(client, targets.map(r => r.id), source)).map(b => b.id);
       await client.query("DELETE FROM likes WHERE id = ANY($1::int[])", [targets.map(r => r.id)]);
 
       const perCourse = new Map();
@@ -1940,6 +1990,7 @@ async function purgeSuspiciousLikesForAuthor(author, dryRun = false, onlyUsernam
       );
     }
 
+    stats.backup_ids = backupIds;
     await client.query("COMMIT");
     return stats;
   } catch (e) {
@@ -1952,11 +2003,12 @@ async function purgeSuspiciousLikesForAuthor(author, dryRun = false, onlyUsernam
 
 // ─────────────────────────────────────────────
 // 不正分いいねの自動削除（職人単位）
-// 「その職人名で投稿履歴のあるユーザー名」のいいねについて、以下のどちらかを満たした職人を不正と判定し、
+// 「不正判定ユーザー名」（①その職人名で投稿履歴のあるユーザー名、③その職人名の持ち主と共通の職人名で投稿している関連ユーザー名）の
+// いいねについて、以下のどちらかを満たした職人を不正と判定し、
 // 管理ページの「この職人の不正分いいねを削除」と同じ処理（①②とも削除）を自動実行する。
 // ※不正の判定には、投稿履歴のないユーザー名の数・いいね数は一切使わない。
-//   ① その職人名でコース投稿履歴のあるusernameが、いいねしたユーザーの中に3つ以上いる
-//   ② その職人名でコース投稿履歴のあるusernameからの、いいね総数(likesテーブル内)が6を超えている
+//   ① 不正判定ユーザー名が、いいねしたユーザーの中に3つ以上いる
+//   ② 不正判定ユーザー名からの、いいね総数(likesテーブル内)が6を超えている
 // 削除が行われたら like_fraud_incidents（管理ページの検知履歴）に記録する。
 // さらに、繰り返し検知された職人には以下の措置を取る。
 //   ・全コースのいいね数・プレイ数を0にリセット（likesテーブルの該当いいねも削除）
@@ -2021,18 +2073,26 @@ async function autoPurgeSuspiciousLikes() {
               EXISTS (
                 SELECT 1 FROM courses o
                 WHERE o.author = c.author AND o.username = l.username
-              ) AS posted_as_author
+              ) AS posted_as_author,
+              (SELECT COUNT(DISTINCT cu.author)
+                 FROM courses cu
+                 JOIN courses cv ON cv.author = cu.author AND cv.username <> cu.username
+                 JOIN courses co ON co.username = cv.username AND co.author = c.author
+                WHERE cu.username = l.username AND cu.author <> c.author) >= $3::int AS linked_to_owner
        FROM likes l
        JOIN courses c ON c.id = l.course_id
+       WHERE NOT l.protected
      )
      SELECT author,
-            COUNT(*) FILTER (WHERE posted_as_author)                 AS posted_like_count,
-            COUNT(DISTINCT username) FILTER (WHERE posted_as_author) AS posted_username_count
+            COUNT(*) FILTER (WHERE posted_as_author OR linked_to_owner)                 AS suspicious_like_count,
+            COUNT(DISTINCT username) FILTER (WHERE posted_as_author OR linked_to_owner) AS suspicious_username_count,
+            COUNT(DISTINCT username) FILTER (WHERE posted_as_author)                    AS posted_username_count,
+            COUNT(DISTINCT username) FILTER (WHERE linked_to_owner AND NOT posted_as_author) AS linked_username_count
      FROM l2
      GROUP BY author
-     HAVING COUNT(*) FILTER (WHERE posted_as_author) > $1
-         OR COUNT(DISTINCT username) FILTER (WHERE posted_as_author) >= $2`,
-    [AUTO_PURGE_TOTAL_LIKES_THRESHOLD, AUTO_PURGE_POSTED_USERNAME_THRESHOLD]
+     HAVING COUNT(*) FILTER (WHERE posted_as_author OR linked_to_owner) > $1
+         OR COUNT(DISTINCT username) FILTER (WHERE posted_as_author OR linked_to_owner) >= $2`,
+    [AUTO_PURGE_TOTAL_LIKES_THRESHOLD, AUTO_PURGE_POSTED_USERNAME_THRESHOLD, AUTO_LINK_MIN_SHARED_AUTHORS]
   );
 
   const results = [];
@@ -2040,7 +2100,7 @@ async function autoPurgeSuspiciousLikes() {
     try {
       const priorDays = await countAutoPurgeIncidentDays(r.author);
       // 不正と判定した後の削除は、手動ボタンと同じ（①投稿履歴ありユーザー名 と ②投稿履歴なしユーザー名 の両方）
-      const stats = await purgeSuspiciousLikesForAuthor(r.author, false, null);
+      const stats = await purgeSuspiciousLikesForAuthor(r.author, false, null, true, { source: AUTO_PURGE_ACTION, skipProtected: true });
       if (stats.removed_count <= 0) continue;
 
       // 検知履歴に保存する
@@ -2052,6 +2112,7 @@ async function autoPurgeSuspiciousLikes() {
         [AUTO_PURGE_COURSE_LABEL, r.author, stats.removed_count, AUTO_PURGE_ACTION, priorDays]
       );
       const incidentId = ins[0].id;
+      await linkBackupsToIncident(incidentId, stats.backup_ids); // 復元できるよう、削除したいいねを履歴に紐付ける
 
       // 繰り返し検知された職人には、全コースのいいね・プレイ数リセットと職人名のpending化を行う
       let escalation = null;
@@ -2069,8 +2130,11 @@ async function autoPurgeSuspiciousLikes() {
         removedCount: stats.removed_count,
         postedAsAuthorCount: stats.posted_as_author_count,
         noHistoryCount: stats.no_history_count,
+        linkedCount: stats.linked_count,
         postedUsernameCount: parseInt(r.posted_username_count, 10),
-        postedLikeCount: parseInt(r.posted_like_count, 10),
+        linkedUsernameCount: parseInt(r.linked_username_count, 10),
+        suspiciousUsernameCount: parseInt(r.suspicious_username_count, 10),
+        suspiciousLikeCount: parseInt(r.suspicious_like_count, 10),
         incidentDays: days,
         escalated: !!escalation,
         escalation,
@@ -2080,6 +2144,227 @@ async function autoPurgeSuspiciousLikes() {
     }
   }
   return results;
+}
+
+// ─────────────────────────────────────────────
+// 重複いいねの自動削除
+// 同じコースに、「共通の職人名で投稿しているユーザー名」が2つ以上いいねしている場合
+// （同一人物・グループが複数のユーザー名で同じコースにいいねしているとみなす）、
+// そのコースについた該当ユーザー名のいいねを削除し、courses.like_count も同じ件数だけ減らす。
+// 片方のユーザー名しかいいねしていないコースのいいねは削除しない。
+// ─────────────────────────────────────────────
+const AUTO_DUP_MIN_SHARED_AUTHORS = 1;              // 共通の職人名が何個以上あれば同一人物とみなすか
+const AUTO_DUP_ACTION             = "auto_dup_like"; // 検知履歴のaction
+const AUTO_DUP_COURSE_LABEL       = "(重複いいね)";   // 検知履歴のcourse_id（職人単位の記録のため）
+
+/**
+ * 重複いいねを削除する。onlyAuthor を渡すとその職人のコースだけを対象にする。
+ * dryRun=true のときは件数だけ返し、何も削除しない。
+ * 戻り値: { dry_run, removed_count, authors: [{ author, removed_count, course_count, user_count }] }
+ */
+async function purgeDuplicateLikes(dryRun = false, onlyAuthor = null) {
+  const client = await pool.connect();
+  try {
+    await client.query("BEGIN");
+    const { rows } = await client.query(
+      `SELECT l1.id, l1.course_id, l1.username, c.author
+       FROM likes l1
+       JOIN courses c ON c.id = l1.course_id
+       WHERE ($2::text IS NULL OR c.author = $2::text)
+         AND NOT l1.protected
+         AND EXISTS (
+           SELECT 1 FROM likes l2
+           WHERE l2.course_id = l1.course_id
+             AND l2.username <> l1.username
+             AND NOT l2.protected
+             AND (SELECT COUNT(DISTINCT p1.author)
+                    FROM courses p1
+                    JOIN courses p2 ON p2.author = p1.author
+                   WHERE p1.username = l1.username AND p2.username = l2.username) >= $1::int
+         )`,
+      [AUTO_DUP_MIN_SHARED_AUTHORS, onlyAuthor]
+    );
+
+    const byAuthor = new Map();
+    for (const r of rows) {
+      if (!byAuthor.has(r.author)) byAuthor.set(r.author, { author: r.author, removed_count: 0, courses: new Set(), users: new Set(), backup_ids: [] });
+      const a = byAuthor.get(r.author);
+      a.removed_count++;
+      a.courses.add(r.course_id);
+      a.users.add(r.username);
+    }
+
+    if (!dryRun && rows.length > 0) {
+      const backups = await backupLikes(client, rows.map(r => r.id), AUTO_DUP_ACTION);
+      for (const b of backups) { const a = byAuthor.get(b.author); if (a) a.backup_ids.push(b.id); }
+      await client.query("DELETE FROM likes WHERE id = ANY($1::int[])", [rows.map(r => r.id)]);
+      const perCourse = new Map();
+      for (const r of rows) perCourse.set(r.course_id, (perCourse.get(r.course_id) || 0) + 1);
+      await client.query(
+        `UPDATE courses c
+         SET like_count = GREATEST(c.like_count - d.n, 0)
+         FROM (SELECT unnest($1::text[]) AS id, unnest($2::int[]) AS n) d
+         WHERE c.id = d.id`,
+        [[...perCourse.keys()], [...perCourse.values()]]
+      );
+    }
+
+    await client.query("COMMIT");
+    return {
+      dry_run: dryRun,
+      removed_count: rows.length,
+      authors: [...byAuthor.values()].map(a => ({
+        author: a.author, removed_count: a.removed_count,
+        course_count: a.courses.size, user_count: a.users.size,
+        backup_ids: a.backup_ids,
+      })),
+    };
+  } catch (e) {
+    await client.query("ROLLBACK").catch(() => {});
+    throw e;
+  } finally {
+    client.release();
+  }
+}
+
+/** 重複いいねを削除し、職人ごとに検知履歴(like_fraud_incidents)へ記録する */
+async function autoPurgeDuplicateLikes() {
+  const result = await purgeDuplicateLikes(false, null);
+  const out = [];
+  for (const a of result.authors) {
+    try {
+      const { rows: ins } = await pool.query(
+        `INSERT INTO like_fraud_incidents
+           (course_id, author, removed_count, action, disposable_ratio, prior_incident_count)
+         VALUES ($1, $2, $3, $4, NULL, 0)
+         RETURNING id`,
+        [AUTO_DUP_COURSE_LABEL, a.author, a.removed_count, AUTO_DUP_ACTION]
+      );
+      await linkBackupsToIncident(ins[0].id, a.backup_ids);
+    } catch (e) {
+      console.error(`重複いいね検知履歴の保存失敗 (author=${a.author}):`, e.message);
+    }
+    out.push({ author: a.author, removedCount: a.removed_count, courseCount: a.course_count, userCount: a.user_count });
+  }
+  return out;
+}
+
+// ─────────────────────────────────────────────
+// 自動削除したいいねのバックアップと復元
+// 自動削除（バースト検知 / 不正分いいね / 重複いいね）で消すいいねは、削除前に deleted_likes へ保存し、
+// 検知履歴(like_fraud_incidents)に紐付ける。管理ページの検知履歴から、履歴ごと・ユーザー名ごとに復元できる。
+// 復元したいいねは likes.protected = TRUE にし、以後の自動検知・自動削除の対象から外す（再び消されないように）。
+// ※職人への措置（全コースのいいね/プレイ数リセット・pending化）自体は、ここでは元に戻さない。
+// ─────────────────────────────────────────────
+
+/** 削除予定のいいね(likes.id の配列)を deleted_likes に保存し、[{id, author}] を返す。q は pool か client */
+async function backupLikes(q, likeIds, source) {
+  if (!likeIds.length) return [];
+  const { rows } = await q.query(
+    `INSERT INTO deleted_likes (author, course_id, username, liked_at, source)
+     SELECT c.author, l.course_id, l.username, l.created_at, $2
+     FROM likes l
+     JOIN courses c ON c.id = l.course_id
+     WHERE l.id = ANY($1::int[])
+     RETURNING id, author`,
+    [likeIds, source]
+  );
+  return rows;
+}
+
+/** バックアップ行を検知履歴に紐付ける */
+async function linkBackupsToIncident(incidentId, backupIds) {
+  if (!backupIds || !backupIds.length) return;
+  await pool.query("UPDATE deleted_likes SET incident_id = $1 WHERE id = ANY($2::int[])", [incidentId, backupIds]);
+}
+
+/** 検知履歴1件ぶんの削除いいねを、ユーザー名ごとに集計して返す（管理ページの内訳表示用） */
+async function listIncidentDeletedLikes(incidentId) {
+  const { rows } = await pool.query(
+    `SELECT username,
+            COUNT(*)                          AS total,
+            COUNT(*) FILTER (WHERE restored)  AS restored,
+            COUNT(DISTINCT course_id)         AS courses
+     FROM deleted_likes
+     WHERE incident_id = $1
+     GROUP BY username
+     ORDER BY total DESC, username`,
+    [incidentId]
+  );
+  return rows.map(r => ({
+    username: r.username,
+    total: parseInt(r.total, 10),
+    restored: parseInt(r.restored, 10),
+    courses: parseInt(r.courses, 10),
+  }));
+}
+
+/**
+ * 検知履歴の削除いいねを復元する。username を渡すとそのユーザー名のぶんだけ復元する。
+ *  - likes に元のいいね(created_atも元のまま)を戻し、protected=TRUE にする
+ *  - 戻したぶんだけ courses.like_count を増やす
+ *  - 既に同じいいねがある（削除後に押し直された）場合・コースが削除済みの場合は戻さない
+ */
+async function restoreDeletedLikes(incidentId, username = null) {
+  const client = await pool.connect();
+  try {
+    await client.query("BEGIN");
+    const { rows } = await client.query(
+      `SELECT d.id, d.course_id, d.username, d.liked_at,
+              EXISTS (SELECT 1 FROM courses c WHERE c.id = d.course_id) AS course_exists
+       FROM deleted_likes d
+       WHERE d.incident_id = $1 AND NOT d.restored
+         AND ($2::text IS NULL OR d.username = $2::text)
+       FOR UPDATE OF d`,
+      [incidentId, username]
+    );
+    const restorable = rows.filter(r => r.course_exists);
+    let insertedCount = 0;
+    if (restorable.length > 0) {
+      const ins = await client.query(
+        `INSERT INTO likes (username, course_id, created_at, protected)
+         SELECT x.u, x.c, x.t, TRUE
+         FROM unnest($1::text[], $2::text[], $3::bigint[]) AS x(u, c, t)
+         ON CONFLICT (username, course_id) DO NOTHING
+         RETURNING course_id`,
+        [restorable.map(r => r.username), restorable.map(r => r.course_id), restorable.map(r => r.liked_at)]
+      );
+      insertedCount = ins.rows.length;
+      const perCourse = new Map();
+      for (const r of ins.rows) perCourse.set(r.course_id, (perCourse.get(r.course_id) || 0) + 1);
+      if (perCourse.size > 0) {
+        await client.query(
+          `UPDATE courses c
+           SET like_count = c.like_count + d.n
+           FROM (SELECT unnest($1::text[]) AS id, unnest($2::int[]) AS n) d
+           WHERE c.id = d.id`,
+          [[...perCourse.keys()], [...perCourse.values()]]
+        );
+      }
+      await client.query(
+        "UPDATE deleted_likes SET restored = TRUE, restored_at = EXTRACT(EPOCH FROM NOW())::BIGINT WHERE id = ANY($1::int[])",
+        [restorable.map(r => r.id)]
+      );
+    }
+    await client.query("COMMIT");
+    return {
+      restored_count: insertedCount,                              // 実際に戻したいいね数
+      already_exists_count: restorable.length - insertedCount,    // 既に同じいいねがあったため戻さなかった数
+      missing_course_count: rows.length - restorable.length,      // コースが削除済みで戻せなかった数
+    };
+  } catch (e) {
+    await client.query("ROLLBACK").catch(() => {});
+    throw e;
+  } finally {
+    client.release();
+  }
+}
+
+/** 古いバックアップを削除する（DB容量対策。復元できる期間 = retentionDays） */
+async function cleanupOldDeletedLikes(retentionDays = 30) {
+  const cutoff = Math.floor(Date.now() / 1000) - retentionDays * 24 * 60 * 60;
+  const { rowCount } = await pool.query("DELETE FROM deleted_likes WHERE deleted_at < $1", [cutoff]);
+  if (rowCount > 0) console.log(`🗑️ 古い削除いいねのバックアップを ${rowCount} 件削除しました`);
 }
 
 module.exports = {
@@ -2116,4 +2401,6 @@ module.exports = {
   getRecommendedCourses,
   listAuthorLikerSummary, listLikersForAuthor, purgeSuspiciousLikesForAuthor,
   autoPurgeSuspiciousLikes,
+  purgeDuplicateLikes, autoPurgeDuplicateLikes,
+  listIncidentDeletedLikes, restoreDeletedLikes, cleanupOldDeletedLikes,
 };

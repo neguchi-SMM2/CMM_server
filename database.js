@@ -199,6 +199,13 @@ async function initDB() {
     );
     CREATE INDEX IF NOT EXISTS idx_dau_business_day ON daily_active_users(business_day);
 
+    -- 最大同接数（scope='all' が全期間、営業日の文字列 'YYYY-MM-DD' がその営業日の最大）
+    CREATE TABLE IF NOT EXISTS online_peaks (
+      scope   TEXT    PRIMARY KEY,
+      peak    INT     NOT NULL,
+      peak_at BIGINT  NOT NULL DEFAULT EXTRACT(EPOCH FROM NOW())::BIGINT
+    );
+
     CREATE INDEX IF NOT EXISTS idx_courses_likes   ON courses(like_count DESC);
     CREATE INDEX IF NOT EXISTS idx_courses_posted  ON courses(posted_at DESC);
     CREATE INDEX IF NOT EXISTS idx_courses_author  ON courses(author);
@@ -2367,6 +2374,95 @@ async function cleanupOldDeletedLikes(retentionDays = 30) {
   if (rowCount > 0) console.log(`🗑️ 古い削除いいねのバックアップを ${rowCount} 件削除しました`);
 }
 
+// ─────────────────────────────────────────────
+// CMD=90 用の統計: 最大同接数 / 週間アクティブユーザー / 登録職人数
+// ─────────────────────────────────────────────
+
+// ── 最大同接数 ──
+// 「同接数」は、直近5分以内にリクエストしたユーザー名の数（CMD=90のオンライン数と同じ定義）。
+// ユーザーが増える瞬間(trackUser)にだけ最大値を更新する。サーバーを再起動しても消えないようDBにも保存する。
+//   ・全期間の最大 : online_peaks の scope='all'
+//   ・営業日の最大 : online_peaks の scope=営業日('YYYY-MM-DD')。営業日は 6:00〜翌1:00
+const peakState = { all: 0, day: null, dayValue: 0 };
+
+async function getOnlinePeak(scope) {
+  const { rows } = await pool.query("SELECT peak FROM online_peaks WHERE scope=$1", [scope]);
+  return rows.length ? rows[0].peak : 0;
+}
+
+async function recordOnlinePeak(scope, value) {
+  await pool.query(
+    `INSERT INTO online_peaks (scope, peak, peak_at) VALUES ($1, $2, EXTRACT(EPOCH FROM NOW())::BIGINT)
+     ON CONFLICT (scope) DO UPDATE SET
+       peak    = GREATEST(online_peaks.peak, EXCLUDED.peak),
+       peak_at = CASE WHEN EXCLUDED.peak > online_peaks.peak THEN EXCLUDED.peak_at ELSE online_peaks.peak_at END`,
+    [scope, value]
+  );
+}
+
+/** 起動時に、DBに保存されている最大同接数をメモリへ読み込む */
+async function loadOnlinePeaks() {
+  peakState.all = await getOnlinePeak("all");
+  const bd = getBusinessDayForRecording();
+  if (bd) {
+    peakState.day = bd;
+    peakState.dayValue = await getOnlinePeak(bd);
+  }
+}
+
+/** 現在の同接数を渡す。最大値を超えたときだけメモリとDBを更新する */
+function trackOnlinePeak(online) {
+  if (online > peakState.all) {
+    peakState.all = online;
+    recordOnlinePeak("all", online).catch(e => console.error("最大同接数(全期間)の保存失敗:", e.message));
+  }
+  const bd = getBusinessDayForRecording();
+  if (!bd) return; // 1:00〜5:59は営業日に属さないため、営業日の最大は更新しない
+  if (bd !== peakState.day) { peakState.day = bd; peakState.dayValue = 0; } // 営業日が変わったらリセット
+  if (online > peakState.dayValue) {
+    peakState.dayValue = online;
+    recordOnlinePeak(bd, online).catch(e => console.error("最大同接数(営業日)の保存失敗:", e.message));
+  }
+}
+
+/** { dayPeak: 本日(表示用の営業日)の最大同接数, allPeak: 全期間の最大同接数 } */
+async function getOnlinePeaks() {
+  const bd = getBusinessDayForDisplay();
+  const dayPeak = bd === peakState.day ? peakState.dayValue : await getOnlinePeak(bd);
+  return { dayPeak, allPeak: peakState.all };
+}
+
+/** 古い営業日ごとの最大同接数を削除する（全期間の最大 scope='all' は残す） */
+async function cleanupOldOnlinePeaks(retentionDays = 30) {
+  const cutoff = Math.floor(Date.now() / 1000) - retentionDays * 24 * 60 * 60;
+  await pool.query("DELETE FROM online_peaks WHERE scope <> 'all' AND peak_at < $1", [cutoff]);
+}
+
+// ── 週間アクティブユーザー ──
+/** 'YYYY-MM-DD' の営業日文字列を deltaDays 日ずらす */
+function shiftBusinessDay(dayStr, deltaDays) {
+  const d = new Date(dayStr + "T00:00:00Z");
+  d.setUTCDate(d.getUTCDate() + deltaDays);
+  return jstDateToString(d.getUTCFullYear(), d.getUTCMonth(), d.getUTCDate());
+}
+
+/** endBusinessDay を含む直近7営業日に訪れたユーザーの人数（重複なし） */
+async function countWeeklyActiveUsers(endBusinessDay) {
+  const startDay = shiftBusinessDay(endBusinessDay, -6);
+  const { rows } = await pool.query(
+    "SELECT COUNT(DISTINCT username) FROM daily_active_users WHERE business_day >= $1 AND business_day <= $2",
+    [startDay, endBusinessDay]
+  );
+  return parseInt(rows[0].count, 10);
+}
+
+// ── 登録職人数 ──
+/** 本登録(confirmed)済みの職人の人数 */
+async function countRegisteredMakers() {
+  const { rows } = await pool.query("SELECT COUNT(*) FROM maker_accounts WHERE status='confirmed'");
+  return parseInt(rows[0].count, 10);
+}
+
 module.exports = {
   initDB, pool,
   saveCourse, getCourseById,
@@ -2403,4 +2499,6 @@ module.exports = {
   autoPurgeSuspiciousLikes,
   purgeDuplicateLikes, autoPurgeDuplicateLikes,
   listIncidentDeletedLikes, restoreDeletedLikes, cleanupOldDeletedLikes,
+  loadOnlinePeaks, trackOnlinePeak, getOnlinePeaks, cleanupOldOnlinePeaks,
+  countWeeklyActiveUsers, countRegisteredMakers,
 };

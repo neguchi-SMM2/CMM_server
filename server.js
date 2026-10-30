@@ -560,6 +560,10 @@ async function handleRequest(s, setter, getOnlineUsers) {
     const stats = await db.getStats();
     const businessDay = db.getBusinessDayForDisplay();
     const dailyActiveUsers = await db.countDailyActiveUsers(businessDay).catch(() => 0);
+    const onlineNow = getOnlineUsers();
+    const peaks = await db.getOnlinePeaks().catch(() => ({ dayPeak: 0, allPeak: 0 }));
+    const weeklyActiveUsers = await db.countWeeklyActiveUsers(businessDay).catch(() => 0);
+    const registeredMakers = await db.countRegisteredMakers().catch(() => 0);
     const payload = encodeLenLen(parseInt(userId))
       + encodeLen(CMD.GET_STATS)
       + encodeLen(parseInt(stats.total_courses))
@@ -569,7 +573,12 @@ async function handleRequest(s, setter, getOnlineUsers) {
       + encodeLen(parseInt(stats.total_attempts))
       + encodeLen(parseInt(stats.weekly_courses))
       + encodeLen(getOnlineUsers())
-      + encodeLen(dailyActiveUsers || 0);
+      + encodeLen(dailyActiveUsers || 0)
+      // ここから追加分（既存の項目の後ろに続けて送る）
+      + encodeLen(Math.max(peaks.dayPeak || 0, onlineNow))   // 本日(営業日)の最大同接数
+      + encodeLen(Math.max(peaks.allPeak || 0, onlineNow))   // 全期間の最大同接数
+      + encodeLen(weeklyActiveUsers || 0)                     // 週間アクティブユーザー数（直近7営業日）
+      + encodeLen(registeredMakers || 0);                     // 登録職人数
     await sendCloud(setter, randomCloud(), payload);
     return;
   }
@@ -1709,6 +1718,7 @@ class CloudManager {
         if (isValidStr(username)) {
           this.recentUsers.set(username, Math.floor(Date.now() / 1000));
           this.recordDailyVisit(username);
+          db.trackOnlinePeak(this.getOnlineUsers());
         }
         return;
       }
@@ -1716,6 +1726,7 @@ class CloudManager {
       if (isValidStr(username)) {
         this.recentUsers.set(username, Math.floor(Date.now() / 1000));
         this.recordDailyVisit(username);
+        db.trackOnlinePeak(this.getOnlineUsers());
       }
     } catch (_) {}
   }
@@ -1946,6 +1957,7 @@ class CloudManager {
         await db.cleanupOldDailyUsage();
         await db.cleanupOldDailyActiveUsers(DAU_RETENTION_DAYS);
         await db.cleanupOldDeletedLikes(DELETED_LIKES_RETENTION_DAYS);
+        await db.cleanupOldOnlinePeaks(DAU_RETENTION_DAYS);
       } catch (e) {
         console.error("チャットデータクリーンアップ失敗:", e);
       }
@@ -2001,6 +2013,7 @@ class CloudManager {
     });
     pwcrypt.loadKey(); // 鍵がない/不正ならここで例外 → 起動失敗（CMD=52/54が黙って失敗するのを防ぐ）
     await db.initDB();
+    await db.loadOnlinePeaks().catch(e => console.error("最大同接数の読み込み失敗:", e.message));
     await Promise.allSettled([this.connectScratch(), Promise.resolve(this.connectTurboWarp())]);
     this.scheduleWeeklyReset();
     this.scheduleMakerCleanup();

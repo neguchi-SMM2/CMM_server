@@ -1905,8 +1905,8 @@ class CloudManager {
       } catch (e) {
         console.error("職人クリーンアップ失敗:", e);
       }
-    }, 24 * 60 * 60 * 1000);
-    console.log("📅 非アクティブ職人クリーンアップ: 1日ごとに実行");
+    }, 1 * 60 * 60 * 1000);
+    console.log("📅 非アクティブ職人クリーンアップ: 1時間ごとに実行");
   }
 
   scheduleLikeFraudDetection() {

@@ -53,6 +53,7 @@ const CMD = {
   REGISTER_STATUS:         53,
   REGISTER_LOGIN:          54,
   GET_NONCE:               55,   // パスワード暗号化用のノンスを発行する（基礎データのみ）
+  GET_ONLINE_MAKER_INFO:   80,   // オンライン対戦(通信であそぶ)の職人のバトル情報
   LIKE:           20,
   PLAY:           21,
   ATTEMPT:        22,
@@ -352,6 +353,30 @@ async function handleRequest(s, setter, getOnlineUsers) {
     const payload = encodeLenLen(parseInt(userId)) + encodeLen(CMD.MAKER_INFO) + encodeMakerInfo(info);
     await sendCloud(setter, randomCloud(), payload);
     await sendEndMarker(setter, userId);
+    return;
+  }
+
+  // CMD=80: オンライン対戦の職人情報
+  // リクエスト: 基礎データ(userId + cmd + username) + 職人名(alphabet)
+  // 返信: userId(LenLen) + cmd(Len) + バトルレート(Len) + 週間バトルランキング順位(Len)
+  //        + 全週間バトルランキング順位(Len) + 総試合数(Len) + 勝利回数(Len)
+  // 対象の職人が存在しない場合は CMD=300 を返す（CMD=18と同じ）
+  if (cmd === CMD.GET_ONLINE_MAKER_INFO) {
+    const { value: targetAuthor } = decodeAlphabet(s, pos);
+    if (!isValidStr(targetAuthor)) { console.warn("⚠️ 不正なauthor:", targetAuthor); return; }
+    const info = await db.getOnlineMakerInfo(targetAuthor);
+    if (!info) {
+      await sendCloud(setter, randomCloud(), encodeLenLen(parseInt(userId)) + encodeLen(300));
+      return;
+    }
+    const payload = encodeLenLen(parseInt(userId))
+      + encodeLen(CMD.GET_ONLINE_MAKER_INFO)
+      + encodeLen(info.rating)
+      + encodeLen(info.weekly_rank)
+      + encodeLen(info.all_rank)
+      + encodeLen(info.matches)
+      + encodeLen(info.wins);
+    await sendCloud(setter, randomCloud(), payload);
     return;
   }
 
@@ -1895,20 +1920,6 @@ class CloudManager {
     console.log("📅 いいねクリーンアップ: 1時間ごとに実行");
   }
 
-  scheduleMakerCleanup() {
-    setInterval(async () => {
-      try {
-        const removed = await db.cleanupInactiveMakers();
-        if (removed.length > 0) {
-          console.log(`🗑️ 非アクティブ職人を削除しました: ${removed.join(", ")}`);
-        }
-      } catch (e) {
-        console.error("職人クリーンアップ失敗:", e);
-      }
-    }, 1 * 60 * 60 * 1000);
-    console.log("📅 非アクティブ職人クリーンアップ: 1時間ごとに実行");
-  }
-
   scheduleLikeFraudDetection() {
     setInterval(async () => {
       try {
@@ -2016,7 +2027,6 @@ class CloudManager {
     await db.loadOnlinePeaks().catch(e => console.error("最大同接数の読み込み失敗:", e.message));
     await Promise.allSettled([this.connectScratch(), Promise.resolve(this.connectTurboWarp())]);
     this.scheduleWeeklyReset();
-    this.scheduleMakerCleanup();
     this.scheduleLikeFraudDetection();
     this.scheduleChatCleanup();
     this.scheduleDMPurge();

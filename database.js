@@ -199,6 +199,17 @@ async function initDB() {
     );
     CREATE INDEX IF NOT EXISTS idx_dau_business_day ON daily_active_users(business_day);
 
+    -- オンライン対戦（通信であそぶ）の職人ごとの成績
+    CREATE TABLE IF NOT EXISTS battle_stats (
+      author         TEXT    PRIMARY KEY,
+      rating         INT     NOT NULL DEFAULT 0,
+      matches        INT     NOT NULL DEFAULT 0,
+      wins           INT     NOT NULL DEFAULT 0,
+      last_played_at BIGINT  NOT NULL DEFAULT 0
+    );
+    ALTER TABLE battle_stats ALTER COLUMN rating SET DEFAULT 0;
+    CREATE INDEX IF NOT EXISTS idx_battle_rating ON battle_stats(rating DESC);
+
     -- 最大同接数（scope='all' が全期間、営業日の文字列 'YYYY-MM-DD' がその営業日の最大）
     CREATE TABLE IF NOT EXISTS online_peaks (
       scope   TEXT    PRIMARY KEY,
@@ -796,19 +807,6 @@ async function rejectPendingMaker(id) {
     "DELETE FROM maker_accounts WHERE id=$1 AND status='pending'", [id]
   );
   return rowCount > 0;
-}
-
-async function cleanupInactiveMakers() {
-  const cutoff = Math.floor(Date.now() / 1000) - 30 * 24 * 60 * 60;
-  const { rows } = await pool.query(
-    `DELETE FROM maker_accounts
-     WHERE status = 'confirmed'
-       AND created_at <= $1
-       AND author NOT IN (SELECT DISTINCT author FROM courses)
-     RETURNING author`,
-    [cutoff]
-  );
-  return rows.map(r => r.author);
 }
 
 // ─────────────────────────────────────────────
@@ -2463,6 +2461,133 @@ async function countRegisteredMakers() {
   return parseInt(rows[0].count, 10);
 }
 
+// ─────────────────────────────────────────────
+// オンライン対戦（通信であそぶ）: バトルレート・ランキング・戦績
+// ─────────────────────────────────────────────
+const BATTLE_INITIAL_RATING = 0;          // 初めて対戦する職人のレート
+const BATTLE_MIN_RATING     = 0;          // レートの下限
+const BATTLE_MAX_RATING     = 9999;       // レートの上限
+const BATTLE_WEEK_SECONDS   = 7 * 24 * 60 * 60; // 「週間」の対象期間
+
+// ── レート計算（Elo式をベースに、レートの範囲0〜9999に合わせて調整）──
+// 勝ったときの上がり幅 = K(勝者のレート) × (1 − 勝者の勝つ確率)
+//   ・K(r) は、レートが低いほど大きく、高いほど小さい（低レートは上がりやすく、高レートは上がりにくい）
+//   ・勝つ確率は、レートの差 BATTLE_ELO_SCALE で決まる（差が大きいほど、レートの高い側が勝つ確率が高い）
+//     → 格下に勝っても少ししか上がらず、格上に勝つと大きく上がる
+// 負けたときの下がり幅 = BATTLE_K_LOSS × (1 − 勝者の勝つ確率)（レートによらず一定。0未満にはならない）
+const BATTLE_ELO_SCALE = 1000; // この差があると、レートの高い側が勝つ確率は約91%
+const BATTLE_K_WIN_MAX = 200;  // 勝者のレートが0のときのK（上がりやすさの最大）
+const BATTLE_K_WIN_MIN = 10;   // 勝者のレートが9999のときのK（上がりにくさの最大）
+const BATTLE_K_LOSS    = 40;   // 負けたときのK
+
+/** 勝者のレートに応じたK。0 → BATTLE_K_WIN_MAX、9999 → BATTLE_K_WIN_MIN。高レートほど急に小さくなる */
+function battleWinK(rating) {
+  const remain = 1 - rating / BATTLE_MAX_RATING; // 1(最低) → 0(最高)
+  return BATTLE_K_WIN_MIN + (BATTLE_K_WIN_MAX - BATTLE_K_WIN_MIN) * remain * remain;
+}
+
+/** 試合結果から、勝者・敗者の新しいレートを計算する（DBには触らない） */
+function calcBattleRatings(winnerRating, loserRating) {
+  const expectedWin = 1 / (1 + Math.pow(10, (loserRating - winnerRating) / BATTLE_ELO_SCALE));
+  const gain = Math.max(1, Math.round(battleWinK(winnerRating) * (1 - expectedWin)));
+  const loss = Math.max(1, Math.round(BATTLE_K_LOSS * (1 - expectedWin)));
+  const clamp = r => Math.min(BATTLE_MAX_RATING, Math.max(BATTLE_MIN_RATING, r));
+  return { winner: clamp(winnerRating + gain), loser: clamp(loserRating - loss) };
+}
+
+// 順位の並び: レートが高い → 勝利数が多い → 職人名（同じ成績でも順位が毎回同じになるように）
+const BATTLE_RANK_ORDER = "rating DESC, wins DESC, author ASC";
+
+/**
+ * その職人の順位を返す。sinceSeconds を渡すと、その時刻以降に試合をした職人だけを対象にした順位（週間）。
+ * 対象の中にいない（まだ対戦していない／今週は対戦していない）場合は「対象人数 + 1」位として返す。
+ */
+async function getBattleRank(author, sinceSeconds = null) {
+  const { rows } = await pool.query(
+    `WITH ranked AS (
+       SELECT author, ROW_NUMBER() OVER (ORDER BY ${BATTLE_RANK_ORDER}) AS rank
+       FROM battle_stats
+       WHERE matches > 0 AND ($1::bigint IS NULL OR last_played_at >= $1::bigint)
+     )
+     SELECT (SELECT rank FROM ranked WHERE author = $2) AS rank,
+            (SELECT COUNT(*) FROM ranked)               AS total`,
+    [sinceSeconds, author]
+  );
+  const rank  = rows[0].rank !== null ? parseInt(rows[0].rank, 10) : null;
+  const total = parseInt(rows[0].total, 10);
+  return rank !== null ? rank : total + 1;
+}
+
+/**
+ * CMD=80: 職人のバトル情報。
+ * まだ対戦していなくても、職人登録(maker_accounts)済み、またはコース投稿実績がある職人なら初期値で返す。
+ * どちらでもない職人名は null（CMD=18と同じく、呼び出し側でCMD=300を返す）。
+ */
+async function getOnlineMakerInfo(author) {
+  const { rows } = await pool.query(
+    "SELECT rating, matches, wins FROM battle_stats WHERE author = $1", [author]
+  );
+  let rating, matches, wins;
+  if (rows.length) {
+    rating = rows[0].rating; matches = rows[0].matches; wins = rows[0].wins;
+  } else {
+    const { rows: known } = await pool.query(
+      `SELECT 1 WHERE EXISTS (SELECT 1 FROM maker_accounts WHERE author = $1 AND status = 'confirmed')
+                   OR EXISTS (SELECT 1 FROM courses WHERE author = $1)`,
+      [author]
+    );
+    if (!known.length) return null;
+    rating = BATTLE_INITIAL_RATING; matches = 0; wins = 0;
+  }
+  const since = Math.floor(Date.now() / 1000) - BATTLE_WEEK_SECONDS;
+  const [weeklyRank, allRank] = await Promise.all([
+    getBattleRank(author, since),
+    getBattleRank(author, null),
+  ]);
+  return { author, rating, weekly_rank: weeklyRank, all_rank: allRank, matches, wins };
+}
+
+/**
+ * 試合結果を記録し、レートを更新する（勝者は上がり、敗者は下がる。計算方法は calcBattleRatings を参照）。
+ * ※この関数を呼ぶCMD（試合結果の報告）は未実装。結果をどう信頼するか（不正対策）は別途設計が必要。
+ * 戻り値: { winner: {author, rating}, loser: {author, rating}, delta }
+ */
+async function recordBattleResult(winnerAuthor, loserAuthor) {
+  if (winnerAuthor === loserAuthor) throw new Error("勝者と敗者が同じ職人です");
+  const client = await pool.connect();
+  try {
+    await client.query("BEGIN");
+    for (const a of [winnerAuthor, loserAuthor]) {
+      await client.query("INSERT INTO battle_stats (author, rating) VALUES ($1, $2) ON CONFLICT (author) DO NOTHING", [a, BATTLE_INITIAL_RATING]);
+    }
+    // デッドロック防止のため、職人名の順で固定してロックする
+    const { rows } = await client.query(
+      "SELECT author, rating FROM battle_stats WHERE author = ANY($1::text[]) ORDER BY author FOR UPDATE",
+      [[winnerAuthor, loserAuthor]]
+    );
+    const rw = rows.find(r => r.author === winnerAuthor).rating;
+    const rl = rows.find(r => r.author === loserAuthor).rating;
+    const { winner: newWinner, loser: newLoser } = calcBattleRatings(rw, rl);
+    const delta = newWinner - rw; // 勝者の上がり幅（上限9999で頭打ちの場合は実際に上がった分）
+    const now = Math.floor(Date.now() / 1000);
+    await client.query(
+      "UPDATE battle_stats SET rating = $2, matches = matches + 1, wins = wins + 1, last_played_at = $3 WHERE author = $1",
+      [winnerAuthor, newWinner, now]
+    );
+    await client.query(
+      "UPDATE battle_stats SET rating = $2, matches = matches + 1, last_played_at = $3 WHERE author = $1",
+      [loserAuthor, newLoser, now]
+    );
+    await client.query("COMMIT");
+    return { winner: { author: winnerAuthor, rating: newWinner }, loser: { author: loserAuthor, rating: newLoser }, delta };
+  } catch (e) {
+    await client.query("ROLLBACK").catch(() => {});
+    throw e;
+  } finally {
+    client.release();
+  }
+}
+
 module.exports = {
   initDB, pool,
   saveCourse, getCourseById,
@@ -2477,7 +2602,7 @@ module.exports = {
   getLatestAnnouncement,
   isAuthorConfirmed, isAuthorUsedBeforeCutoff, hasUsernameUsedAuthorBeforeCutoff,
   getMakerStatus, registerMakerConfirmed, registerMakerPending, verifyMakerPassword, hasRegisteredToday,
-  listPendingMakers, approvePendingMaker, rejectPendingMaker, cleanupInactiveMakers,
+  listPendingMakers, approvePendingMaker, rejectPendingMaker,
   calcMakerPointAllTime, calcMakerPointWeekly,
   chatLogin, getAuthorByToken, chatLogout,
   saveChatMessage, getChatMessages, getLatestChatMessages, getChatMessagesBefore,
@@ -2501,4 +2626,5 @@ module.exports = {
   listIncidentDeletedLikes, restoreDeletedLikes, cleanupOldDeletedLikes,
   loadOnlinePeaks, trackOnlinePeak, getOnlinePeaks, cleanupOldOnlinePeaks,
   countWeeklyActiveUsers, countRegisteredMakers,
+  getBattleRank, getOnlineMakerInfo, recordBattleResult, calcBattleRatings,
 };

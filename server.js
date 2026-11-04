@@ -54,6 +54,7 @@ const CMD = {
   REGISTER_LOGIN:          54,
   GET_NONCE:               55,   // パスワード暗号化用のノンスを発行する（基礎データのみ）
   GET_ONLINE_MAKER_INFO:   80,   // オンライン対戦(通信であそぶ)の職人のバトル情報
+  GET_BATTLE_COURSE:       81,   // オンライン対戦で遊ぶコースを、世界のコースからランダムに選んで返す
   LIKE:           20,
   PLAY:           21,
   ATTEMPT:        22,
@@ -377,6 +378,24 @@ async function handleRequest(s, setter, getOnlineUsers) {
       + encodeLen(info.matches)
       + encodeLen(info.wins);
     await sendCloud(setter, randomCloud(), payload);
+    return;
+  }
+
+  // CMD=81: オンライン対戦で遊ぶコースの選出
+  // リクエスト: 基礎データ(userId + cmd + username) + ルーム識別ID(Len)
+  // 返信: userId(LenLen) + cmd(Len) + course_id(alphabet)
+  // 同じルーム識別IDには、一定時間は同じコースを返す（ルームの2人が同じコースで遊べるように）。
+  // 選出対象は、空気以外のブロック数が基準を超えているコース（あらかじめ5分ごとに判定済み）。
+  // 選出できるコースが1つもない場合は CMD=300 を返す。
+  if (cmd === CMD.GET_BATTLE_COURSE) {
+    const { value: roomId } = decodeLen(s, pos);
+    if (!isValidNum(roomId)) { console.warn("⚠️ 不正なルーム識別ID:", roomId); return; }
+    const courseId = await db.getBattleRoomCourse(roomId);
+    if (!courseId) {
+      await sendCloud(setter, randomCloud(), encodeLenLen(parseInt(userId)) + encodeLen(300));
+      return;
+    }
+    await sendCloud(setter, randomCloud(), encodeLenLen(parseInt(userId)) + encodeLen(CMD.GET_BATTLE_COURSE) + encodeAlphabet(courseId));
     return;
   }
 
@@ -1920,6 +1939,28 @@ class CloudManager {
     console.log("📅 いいねクリーンアップ: 1時間ごとに実行");
   }
 
+  // オンライン対戦で選出できるコースの判定（未判定のコースだけを5分ごとに判定する）
+  scheduleCourseSelectableJudging() {
+    let running = false;
+    const run = async () => {
+      if (running) return;
+      running = true;
+      try {
+        const { judged, selectable } = await db.judgeUnjudgedCourses();
+        if (judged > 0) console.log(`🎯 選出可能コースを判定: ${judged}件（うち選出可能 ${selectable}件）`);
+        db.pruneBattleRoomCourses();
+      } catch (e) {
+        console.error("選出可能コースの判定失敗:", e);
+      } finally {
+        running = false;
+      }
+    };
+    // 起動直後に1回（すでにあるコースを判定）、その後は5分ごと
+    db.applySelectableThreshold().catch(e => console.error("選出基準の反映失敗:", e)).finally(run);
+    setInterval(run, 5 * 60 * 1000);
+    console.log("📅 選出可能コースの判定: 5分ごとに実行（未判定のコースのみ）");
+  }
+
   scheduleLikeFraudDetection() {
     setInterval(async () => {
       try {
@@ -2028,6 +2069,7 @@ class CloudManager {
     await Promise.allSettled([this.connectScratch(), Promise.resolve(this.connectTurboWarp())]);
     this.scheduleWeeklyReset();
     this.scheduleLikeFraudDetection();
+    this.scheduleCourseSelectableJudging();
     this.scheduleChatCleanup();
     this.scheduleDMPurge();
 

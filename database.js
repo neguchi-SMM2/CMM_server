@@ -36,6 +36,11 @@ async function initDB() {
     ALTER TABLE courses ADD COLUMN IF NOT EXISTS username TEXT NOT NULL DEFAULT '';
     ALTER TABLE courses ADD COLUMN IF NOT EXISTS ip_address TEXT;
     ALTER TABLE courses ADD COLUMN IF NOT EXISTS red INT NOT NULL DEFAULT 0;
+    -- オンライン対戦で選出できるコースか（NULL=未判定 / TRUE=選出可能 / FALSE=選出不可）と、判定に使った空気以外のブロック数
+    ALTER TABLE courses ADD COLUMN IF NOT EXISTS block_count INT;
+    ALTER TABLE courses ADD COLUMN IF NOT EXISTS selectable BOOLEAN;
+    CREATE INDEX IF NOT EXISTS idx_courses_unjudged   ON courses(posted_at) WHERE selectable IS NULL;
+    CREATE INDEX IF NOT EXISTS idx_courses_selectable ON courses(id)        WHERE selectable;
 
     CREATE TABLE IF NOT EXISTS likes (
       id         SERIAL  PRIMARY KEY,
@@ -2588,6 +2593,116 @@ async function recordBattleResult(winnerAuthor, loserAuthor) {
   }
 }
 
+// ─────────────────────────────────────────────
+// オンライン対戦のコース選出（CMD=81）
+// ステージデータの構成:
+//   先頭から 背景情報(Len) → スクロール情報(Len) → ステージ情報
+//   ステージ情報はランレングス圧縮で、3文字のブロックID + 3文字の個数 の繰り返し
+//   （例: "1710259100307013" → 背景7, スクロール0, ブロック259が100個, ブロック307が13個）
+// ブロックID 001 と 259 は空気。空気以外のブロック数が SELECTABLE_MIN_BLOCKS を超えるコースだけを選出対象にする。
+// 判定はCMD=81を受けるたびに行うと重いので、あらかじめ計算して courses.selectable / block_count に保持する。
+//   ・投稿時は未判定(NULL)で保存される
+//   ・judgeUnjudgedCourses() を5分ごとに呼んで、未判定のコースだけを判定する
+// ─────────────────────────────────────────────
+const SELECTABLE_MIN_BLOCKS = parseInt(process.env.SELECTABLE_MIN_BLOCKS || "300", 10); // 「超えている」コースが選出対象
+const AIR_BLOCK_IDS = new Set(["001", "259"]);
+
+/**
+ * ステージデータの、空気以外のブロック数を数える。形式が不正なら null を返す。
+ */
+function countNonAirBlocks(stageData) {
+  if (typeof stageData !== "string") return null;
+  let pos = 0;
+  for (let i = 0; i < 2; i++) { // 背景情報(Len)・スクロール情報(Len)を読み飛ばす
+    const len = parseInt(stageData[pos], 10);
+    if (!Number.isInteger(len) || len < 1) return null;
+    pos += 1 + len;
+  }
+  const body = stageData.slice(pos);
+  if (!/^[0-9]*$/.test(body) || body.length % 6 !== 0) return null;
+  let total = 0;
+  for (let i = 0; i < body.length; i += 6) {
+    if (AIR_BLOCK_IDS.has(body.slice(i, i + 3))) continue;
+    total += parseInt(body.slice(i + 3, i + 6), 10);
+  }
+  return total;
+}
+
+/** 未判定(selectable IS NULL)のコースだけを判定して保存する。戻り値: { judged, selectable } */
+async function judgeUnjudgedCourses(batchSize = 200) {
+  let judged = 0, selectable = 0;
+  for (;;) {
+    const { rows } = await pool.query(
+      "SELECT id, stage_data FROM courses WHERE selectable IS NULL ORDER BY posted_at ASC LIMIT $1", [batchSize]
+    );
+    if (!rows.length) break;
+    const ids = [], counts = [], flags = [];
+    for (const r of rows) {
+      const n = countNonAirBlocks(r.stage_data); // 形式が不正なら null（選出不可として判定済みにする）
+      ids.push(r.id);
+      counts.push(n);
+      flags.push(n !== null && n > SELECTABLE_MIN_BLOCKS);
+    }
+    await pool.query(
+      `UPDATE courses c SET block_count = d.n, selectable = d.f
+       FROM (SELECT unnest($1::text[]) AS id, unnest($2::int[]) AS n, unnest($3::boolean[]) AS f) d
+       WHERE c.id = d.id`,
+      [ids, counts, flags]
+    );
+    judged += rows.length;
+    selectable += flags.filter(Boolean).length;
+    await new Promise(r => setImmediate(r)); // 大量にあっても他の処理を止めないよう、バッチごとに譲る
+  }
+  return { judged, selectable };
+}
+
+/** 基準数(SELECTABLE_MIN_BLOCKS)を変えた場合に、判定済みのコースの selectable を保存済みのブロック数から更新し直す */
+async function applySelectableThreshold() {
+  const { rowCount } = await pool.query(
+    `UPDATE courses SET selectable = (block_count > $1)
+     WHERE block_count IS NOT NULL AND selectable IS DISTINCT FROM (block_count > $1)`,
+    [SELECTABLE_MIN_BLOCKS]
+  );
+  return rowCount;
+}
+
+/** 選出可能なコースからランダムに1つ選んでコースIDを返す（なければ null） */
+async function pickRandomSelectableCourse() {
+  const { rows } = await pool.query("SELECT id FROM courses WHERE selectable ORDER BY RANDOM() LIMIT 1");
+  return rows.length ? rows[0].id : null;
+}
+
+async function courseExists(courseId) {
+  const { rows } = await pool.query("SELECT 1 FROM courses WHERE id = $1", [courseId]);
+  return rows.length > 0;
+}
+
+// ── ルームごとのコース（CMD=81）──
+// 同じルームの2人に同じコースを返すため、ルーム識別IDごとに選んだコースを一定時間覚えておく。
+const BATTLE_ROOM_TTL_MS = 30 * 60 * 1000; // 同じルームIDには、この時間は同じコースを返す
+const BATTLE_ROOM_MAX    = 20000;          // 覚えておくルーム数の上限（超えたら古いものから忘れる）
+const battleRoomCourses  = new Map();      // roomId -> { courseId, expires }
+
+/** ルームのコースIDを返す。なければ選出して覚える。選出できるコースがなければ null */
+async function getBattleRoomCourse(roomId) {
+  const key = String(roomId);
+  const now = Date.now();
+  const entry = battleRoomCourses.get(key);
+  if (entry && now < entry.expires && await courseExists(entry.courseId)) return entry.courseId;
+  const courseId = await pickRandomSelectableCourse();
+  if (!courseId) return null;
+  battleRoomCourses.delete(key); // 入れ直して、新しい順に並べ直す
+  battleRoomCourses.set(key, { courseId, expires: now + BATTLE_ROOM_TTL_MS });
+  while (battleRoomCourses.size > BATTLE_ROOM_MAX) battleRoomCourses.delete(battleRoomCourses.keys().next().value);
+  return courseId;
+}
+
+/** 期限切れのルームを忘れる */
+function pruneBattleRoomCourses() {
+  const now = Date.now();
+  for (const [k, e] of battleRoomCourses) if (now >= e.expires) battleRoomCourses.delete(k);
+}
+
 module.exports = {
   initDB, pool,
   saveCourse, getCourseById,
@@ -2627,4 +2742,6 @@ module.exports = {
   loadOnlinePeaks, trackOnlinePeak, getOnlinePeaks, cleanupOldOnlinePeaks,
   countWeeklyActiveUsers, countRegisteredMakers,
   getBattleRank, getOnlineMakerInfo, recordBattleResult, calcBattleRatings,
+  countNonAirBlocks, judgeUnjudgedCourses, applySelectableThreshold,
+  pickRandomSelectableCourse, getBattleRoomCourse, pruneBattleRoomCourses,
 };

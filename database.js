@@ -213,6 +213,17 @@ async function initDB() {
       last_played_at BIGINT  NOT NULL DEFAULT 0
     );
     ALTER TABLE battle_stats ALTER COLUMN rating SET DEFAULT 0;
+
+    -- 1試合ごとの結果（週間バトルランキングの「週間勝利回数」を数えるために使う）
+    CREATE TABLE IF NOT EXISTS battle_matches (
+      id            SERIAL  PRIMARY KEY,
+      winner        TEXT    NOT NULL,
+      loser         TEXT    NOT NULL,
+      winner_rating INT     NOT NULL,
+      loser_rating  INT     NOT NULL,
+      played_at     BIGINT  NOT NULL DEFAULT EXTRACT(EPOCH FROM NOW())::BIGINT
+    );
+    CREATE INDEX IF NOT EXISTS idx_battle_matches_played ON battle_matches(played_at DESC);
     CREATE INDEX IF NOT EXISTS idx_battle_rating ON battle_stats(rating DESC);
 
     -- 最大同接数（scope='all' が全期間、営業日の文字列 'YYYY-MM-DD' がその営業日の最大）
@@ -2504,23 +2515,72 @@ function calcBattleRatings(winnerRating, loserRating) {
 const BATTLE_RANK_ORDER = "rating DESC, wins DESC, author ASC";
 
 /**
- * その職人の順位を返す。sinceSeconds を渡すと、その時刻以降に試合をした職人だけを対象にした順位（週間）。
- * 対象の中にいない（まだ対戦していない／今週は対戦していない）場合は「対象人数 + 1」位として返す。
+ * その職人の順位を返す。
+ *   ・sinceSeconds なし: 全期間の順位（レート順。CMD=83と同じ並び）
+ *   ・sinceSeconds あり: その時刻以降の週間順位（週間勝利回数順。CMD=82と同じ並び）。1勝以上した職人だけが対象
+ * 対象の中にいない（まだ対戦していない／週間では今週1勝もしていない）場合は「対象人数 + 1」位として返す。
  */
 async function getBattleRank(author, sinceSeconds = null) {
-  const { rows } = await pool.query(
-    `WITH ranked AS (
-       SELECT author, ROW_NUMBER() OVER (ORDER BY ${BATTLE_RANK_ORDER}) AS rank
-       FROM battle_stats
-       WHERE matches > 0 AND ($1::bigint IS NULL OR last_played_at >= $1::bigint)
-     )
-     SELECT (SELECT rank FROM ranked WHERE author = $2) AS rank,
-            (SELECT COUNT(*) FROM ranked)               AS total`,
-    [sinceSeconds, author]
-  );
+  const sql = sinceSeconds === null
+    ? `WITH ranked AS (
+         SELECT author, ROW_NUMBER() OVER (ORDER BY ${BATTLE_RANK_ORDER}) AS rank
+         FROM battle_stats
+         WHERE matches > 0
+       )
+       SELECT (SELECT rank FROM ranked WHERE author = $1) AS rank,
+              (SELECT COUNT(*) FROM ranked)               AS total`
+    : `WITH weekly AS (
+         SELECT winner AS author, COUNT(*) AS wins
+         FROM battle_matches WHERE played_at >= $1::bigint
+         GROUP BY winner
+       ),
+       ranked AS (
+         SELECT w.author,
+                ROW_NUMBER() OVER (ORDER BY w.wins DESC, COALESCE(s.rating, 0) DESC, w.author ASC) AS rank
+         FROM weekly w LEFT JOIN battle_stats s ON s.author = w.author
+       )
+       SELECT (SELECT rank FROM ranked WHERE author = $2) AS rank,
+              (SELECT COUNT(*) FROM ranked)               AS total`;
+  const { rows } = await pool.query(sql, sinceSeconds === null ? [author] : [sinceSeconds, author]);
   const rank  = rows[0].rank !== null ? parseInt(rows[0].rank, 10) : null;
   const total = parseInt(rows[0].total, 10);
   return rank !== null ? rank : total + 1;
+}
+
+// CMD=82: 週間バトルランキング（直近7日の勝利回数が多い順。同じなら、レートが高い順 → 職人名順）
+// 1勝以上した職人だけが対象。勝利数は「週間の勝利数」。
+async function getBattleRankingWeek(limit) {
+  const since = Math.floor(Date.now() / 1000) - BATTLE_WEEK_SECONDS;
+  const { rows } = await pool.query(
+    `SELECT w.author, w.wins, COALESCE(s.rating, 0) AS rating
+     FROM (SELECT winner AS author, COUNT(*) AS wins
+           FROM battle_matches WHERE played_at >= $1
+           GROUP BY winner) w
+     LEFT JOIN battle_stats s ON s.author = w.author
+     ORDER BY w.wins DESC, COALESCE(s.rating, 0) DESC, w.author ASC
+     LIMIT $2`,
+    [since, limit]
+  );
+  return rows.map(r => ({ author: r.author, wins: parseInt(r.wins, 10), rating: r.rating }));
+}
+
+// CMD=83: 全期間バトルランキング（レートが高い順。同じなら、勝利数が多い順 → 職人名順）
+// 1試合以上した職人だけが対象。勝利数は「全期間の勝利数」。
+async function getBattleRankingAll(limit) {
+  const { rows } = await pool.query(
+    `SELECT author, wins, rating FROM battle_stats
+     WHERE matches > 0
+     ORDER BY ${BATTLE_RANK_ORDER}
+     LIMIT $1`,
+    [limit]
+  );
+  return rows.map(r => ({ author: r.author, wins: r.wins, rating: r.rating }));
+}
+
+/** 古い試合履歴を削除する（週間ランキングには7日分あればよい。DB容量対策） */
+async function cleanupOldBattleMatches(retentionDays = 30) {
+  const cutoff = Math.floor(Date.now() / 1000) - retentionDays * 24 * 60 * 60;
+  await pool.query("DELETE FROM battle_matches WHERE played_at < $1", [cutoff]);
 }
 
 /**
@@ -2582,6 +2642,10 @@ async function recordBattleResult(winnerAuthor, loserAuthor) {
     await client.query(
       "UPDATE battle_stats SET rating = $2, matches = matches + 1, last_played_at = $3 WHERE author = $1",
       [loserAuthor, newLoser, now]
+    );
+    await client.query(
+      "INSERT INTO battle_matches (winner, loser, winner_rating, loser_rating, played_at) VALUES ($1, $2, $3, $4, $5)",
+      [winnerAuthor, loserAuthor, newWinner, newLoser, now]
     );
     await client.query("COMMIT");
     return { winner: { author: winnerAuthor, rating: newWinner }, loser: { author: loserAuthor, rating: newLoser }, delta };
@@ -2742,6 +2806,7 @@ module.exports = {
   loadOnlinePeaks, trackOnlinePeak, getOnlinePeaks, cleanupOldOnlinePeaks,
   countWeeklyActiveUsers, countRegisteredMakers,
   getBattleRank, getOnlineMakerInfo, recordBattleResult, calcBattleRatings,
+  getBattleRankingWeek, getBattleRankingAll, cleanupOldBattleMatches,
   countNonAirBlocks, judgeUnjudgedCourses, applySelectableThreshold,
   pickRandomSelectableCourse, getBattleRoomCourse, pruneBattleRoomCourses,
 };

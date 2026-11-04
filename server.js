@@ -55,6 +55,8 @@ const CMD = {
   GET_NONCE:               55,   // パスワード暗号化用のノンスを発行する（基礎データのみ）
   GET_ONLINE_MAKER_INFO:   80,   // オンライン対戦(通信であそぶ)の職人のバトル情報
   GET_BATTLE_COURSE:       81,   // オンライン対戦で遊ぶコースを、世界のコースからランダムに選んで返す
+  BATTLE_RANK_WEEK:        82,   // 週間バトルランキング（週間勝利回数順）
+  BATTLE_RANK_ALL:         83,   // 全期間バトルランキング（レート順）
   LIKE:           20,
   PLAY:           21,
   ATTEMPT:        22,
@@ -193,6 +195,20 @@ function encodeMakerRankRow(row, index) {
     + encodeLen(Math.round(row.point))
     + encodeLenLen(minutesToDateTimeInt(row.latest_posted_at))
     + encodeLen(row.is_official ? 1 : 0);
+}
+
+// CMD=82,83共通: 順位(Len) + author(alphabet) + 勝利数(Len) + レート(Len)
+//   CMD=82の勝利数は週間の勝利数、CMD=83の勝利数は全期間の勝利数
+function encodeBattleRankRow(row, index) {
+  return encodeLen(index)
+    + encodeAlphabet(row.author)
+    + encodeLen(row.wins)
+    + encodeLen(row.rating);
+}
+
+async function sendBattleRankingList(setter, userId, cmd, rows) {
+  const items = rows.map((row, i) => encodeBattleRankRow(row, i + 1));
+  await sendEncodedItems(setter, userId, cmd, items);
 }
 
 async function sendMakerRankingList(setter, userId, cmd, rows) {
@@ -396,6 +412,20 @@ async function handleRequest(s, setter, getOnlineUsers) {
       return;
     }
     await sendCloud(setter, randomCloud(), encodeLenLen(parseInt(userId)) + encodeLen(CMD.GET_BATTLE_COURSE) + encodeAlphabet(courseId));
+    return;
+  }
+
+  // CMD=82: 週間バトルランキング / CMD=83: 全期間バトルランキング
+  // リクエスト: 基礎データ + 最大件数(Len)
+  // 返信: CMD=16と同じく、1行ごとに 順位(Len) + 職人名(alphabet) + 勝利数(Len) + レート(Len) を並べて送り、最後にCMD=1000を送る
+  if (cmd === CMD.BATTLE_RANK_WEEK || cmd === CMD.BATTLE_RANK_ALL) {
+    const { value: limit } = decodeLen(s, pos);
+    if (!isValidNum(limit) || limit <= 0) { console.warn("⚠️ 不正なlimit:", limit); return; }
+    const rows = cmd === CMD.BATTLE_RANK_WEEK
+      ? await db.getBattleRankingWeek(limit)
+      : await db.getBattleRankingAll(limit);
+    await sendBattleRankingList(setter, userId, cmd, rows);
+    await sendEndMarker(setter, userId);
     return;
   }
 
@@ -2010,6 +2040,7 @@ class CloudManager {
         await db.cleanupOldDailyActiveUsers(DAU_RETENTION_DAYS);
         await db.cleanupOldDeletedLikes(DELETED_LIKES_RETENTION_DAYS);
         await db.cleanupOldOnlinePeaks(DAU_RETENTION_DAYS);
+        await db.cleanupOldBattleMatches(30);
       } catch (e) {
         console.error("チャットデータクリーンアップ失敗:", e);
       }

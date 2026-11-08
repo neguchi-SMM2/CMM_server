@@ -54,9 +54,10 @@ const CMD = {
   REGISTER_LOGIN:          54,
   GET_NONCE:               55,   // パスワード暗号化用のノンスを発行する（基礎データのみ）
   GET_ONLINE_MAKER_INFO:   80,   // オンライン対戦(通信であそぶ)の職人のバトル情報
-  GET_BATTLE_COURSE:       81,   // オンライン対戦で遊ぶコースを、世界のコースからランダムに選んで返す
+  START_COURSE_LOADING:    81,   // オンライン対戦: ルームホストの要求で、ルームのコースデータをルーム全員へ一斉送信する
   BATTLE_RANK_WEEK:        82,   // 週間バトルランキング（週間勝利回数順）
   BATTLE_RANK_ALL:         83,   // 全期間バトルランキング（レート順）
+  GET_ONLINECOURSE_INFO:   84,   // オンライン対戦: ルームのコースの基本情報（タイトル・職人名）をルーム全員へ一斉送信する
   LIKE:           20,
   PLAY:           21,
   ATTEMPT:        22,
@@ -397,21 +398,41 @@ async function handleRequest(s, setter, getOnlineUsers) {
     return;
   }
 
-  // CMD=81: オンライン対戦で遊ぶコースの選出
-  // リクエスト: 基礎データ(userId + cmd + username) + ルーム識別ID(Len)
-  // 返信: userId(LenLen) + cmd(Len) + course_id(alphabet)
-  // 同じルーム識別IDには、一定時間は同じコースを返す（ルームの2人が同じコースで遊べるように）。
-  // 選出対象は、空気以外のブロック数が基準を超えているコース（あらかじめ5分ごとに判定済み）。
-  // 選出できるコースが1つもない場合は CMD=300 を返す。
-  if (cmd === CMD.GET_BATTLE_COURSE) {
+  // CMD=81 start_course-loading: ルームのコースデータを、ルーム全員へ一斉送信する
+  // リクエスト: 基礎データ(userId + cmd + username) + ルームID(Len)。ルームホスト（最初にルームを立ち上げたユーザー）が送る。
+  // 返信: CMD=30(GET_COURSE)と同じ形式のコースデータ。ただし userId の部分を「ルームID」にして送る。
+  //       （ルームIDあてに送るので、ホスト以外の参加者も同時に受信できる）
+  // コースは、ルームIDごとに世界のコースからランダムに選出して一定時間覚えておく（CMD=84と同じコースになる）。
+  // 選出できるコースがない／コースが見つからない場合は、ルームIDあてに CMD=300 を送る。
+  if (cmd === CMD.START_COURSE_LOADING) {
     const { value: roomId } = decodeLen(s, pos);
-    if (!isValidNum(roomId)) { console.warn("⚠️ 不正なルーム識別ID:", roomId); return; }
+    if (!isValidNum(roomId)) { console.warn("⚠️ 不正なルームID:", roomId); return; }
     const courseId = await db.getBattleRoomCourse(roomId);
-    if (!courseId) {
-      await sendCloud(setter, randomCloud(), encodeLenLen(parseInt(userId)) + encodeLen(300));
+    const row = courseId ? await db.getCourseById(courseId) : null;
+    if (!row) {
+      await sendCloud(setter, randomCloud(), encodeLenLen(roomId) + encodeLen(300));
       return;
     }
-    await sendCloud(setter, randomCloud(), encodeLenLen(parseInt(userId)) + encodeLen(CMD.GET_BATTLE_COURSE) + encodeAlphabet(courseId));
+    await sendCourseData(setter, roomId, row.stage_data);
+    return;
+  }
+
+  // CMD=84 get_onlinecourse_info: ルームのコースの基本情報を、ルーム全員へ一斉送信する
+  // リクエスト: 基礎データ + ルームID(Len)。ルームホストが送る。
+  // 返信: roomId(LenLen) + cmd(Len) + コースのタイトル(text) + コースを作った職人名(alphabet)
+  //       （userId の部分を「ルームID」にして送る。コースはCMD=81と同じルームのコース）
+  // 選出できるコースがない／コースが見つからない場合は、ルームIDあてに CMD=300 を送る。
+  if (cmd === CMD.GET_ONLINECOURSE_INFO) {
+    const { value: roomId } = decodeLen(s, pos);
+    if (!isValidNum(roomId)) { console.warn("⚠️ 不正なルームID:", roomId); return; }
+    const courseId = await db.getBattleRoomCourse(roomId);
+    const info = courseId ? await db.getCourseBasicInfo(courseId) : null;
+    if (!info) {
+      await sendCloud(setter, randomCloud(), encodeLenLen(roomId) + encodeLen(300));
+      return;
+    }
+    await sendCloud(setter, randomCloud(),
+      encodeLenLen(roomId) + encodeLen(CMD.GET_ONLINECOURSE_INFO) + encodeText(info.title) + encodeAlphabet(info.author));
     return;
   }
 

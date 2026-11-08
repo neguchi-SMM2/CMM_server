@@ -397,6 +397,12 @@ async function getCourseById(id) {
   return rows[0] || null;
 }
 
+/** コースの基本情報（タイトル・職人名）だけを返す。ステージデータは読まない */
+async function getCourseBasicInfo(id) {
+  const { rows } = await pool.query("SELECT title, author FROM courses WHERE id=$1", [id]);
+  return rows[0] || null;
+}
+
 // ─────────────────────────────────────────────
 // ランキング・検索
 // ─────────────────────────────────────────────
@@ -2769,7 +2775,7 @@ function pruneBattleRoomCourses() {
 
 module.exports = {
   initDB, pool,
-  saveCourse, getCourseById,
+  saveCourse, getCourseById, getCourseBasicInfo,
   getRandomCourses, getWeeklyRanking, getAllTimeRanking,
   searchByCourseId, searchByAuthor, getNewArrivalCourses,
   incrementPlay, incrementAttempt, incrementClear, addLike,
